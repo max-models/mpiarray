@@ -11,62 +11,81 @@ analysis](https://github.com/max-models/mpiarray/actions/workflows/static_analys
 [![PyPI](https://img.shields.io/pypi/v/mpiarray.png)](https://pypi.org/project/mpiarray/)
 [![Python](https://img.shields.io/pypi/pyversions/mpiarray.png)](https://pypi.org/project/mpiarray/)
 
-Template repository for Python projects: a `src/` package with a console
-entry point, `pytest` tests, GitHub Actions for tests, static analysis,
-tutorials, documentation and PyPI publishing, and an
-[Astro](https://astro.build/) +
-[Starlight](https://starlight.astro.build/) documentation site.
+MPI domain decomposition and distributed arrays for NumPy and CuPy, with
+halo exchange.
+
+- `DomainDecomposition` splits a Cartesian grid over the ranks of an MPI
+  communicator: the process grid, the neighbour ranks (periodic or not),
+  the index range and the physical subdomain each rank owns, and which
+  rank owns a position.
+- `DistributedArray` is an array decomposed that way, with optional
+  ghost (halo) cells: halo fills for stencils, halo accumulation for
+  particle deposition, gathers, global reductions (`sum`, `max`, `norm`,
+  `vdot`, …) and NumPy operators and ufuncs.
+
+Arrays are created through
+[cunumpy](https://github.com/max-models/cunumpy), so the same code runs
+on NumPy or on CuPy (GPU). Without a CUDA-aware MPI, device buffers are
+copied through host memory.
 
 Documentation: <https://max-models.github.io/mpiarray/>
 
-## Use the template
+## Example
 
-Create a repository from this template, then rename the package:
+``` python
+from mpi4py import MPI
 
-``` bash
-bash setup_project.sh my-app
-rm setup_project.sh
+from mpiarray import DistributedArray
+
+comm = MPI.COMM_WORLD
+
+# a 64 x 48 grid split over the ranks, one ghost layer, periodic in x
+rho = DistributedArray.zeros(
+    shape=(64, 48), comm=comm, num_ghostpoints=1, periodic=(True, False)
+)
+print(rho.proc_sizes, rho.proc_index_bounds)  # this rank's block
+
+rho.local[...] = comm.rank + 1.0  # write this rank's interior
+rho.fill_halos()  # ghost cells <- neighbours' boundary values
+
+total = rho.sum()  # global reductions are collective
+full = rho.to_ndarray()  # gather the whole array on every rank
+if comm.rank == 0:
+    print(total, full.shape)
 ```
 
-This replaces `mpiarray` with `my-app` everywhere, moves
-`src/app` to `src/my_app`, and points the entry point, tests and docs at
-it.
+``` bash
+mpiexec -n 4 python example.py
+```
+
+On the CuPy backend (`CUNUMPY_BACKEND=cupy`), tell cunumpy once whether
+MPI can take device buffers, with `xp.mpi.mpi_is_cuda_aware(comm)` (a
+collective probe) or `xp.mpi.set_mpi_cuda_aware(False)`.
 
 ## Install
 
-With [uv](https://docs.astral.sh/uv/):
+mpiarray needs an MPI library for
+[mpi4py](https://mpi4py.readthedocs.io/), e.g. `brew install open-mpi`
+or `sudo apt-get install libopenmpi-dev openmpi-bin`.
+
+``` bash
+pip install mpiarray
+```
+
+For development, with [uv](https://docs.astral.sh/uv/):
 
 ``` bash
 make install    # uv sync --extra dev, plus the pre-commit hooks
-uv run mpiarray
 ```
 
-Or create and activate a Python environment (3.10 or newer):
-
-``` bash
-python -m venv env
-source env/bin/activate
-pip install --upgrade pip
-```
-
-Install the code and requirements with pip:
-
-``` bash
-pip install -e .
-```
-
-Run the code with:
-
-``` bash
-mpiarray
-```
-
-The `test`, `docs` and `dev` extras install the test runner, the
-documentation tooling and the linters:
+or with pip, in a Python 3.10+ environment:
 
 ``` bash
 pip install -e ".[dev]"
 ```
+
+The `test`, `docs` and `dev` extras install the test runner, the
+documentation tooling and the linters.
 
 ## Development
 
@@ -77,6 +96,13 @@ checking [pyright](https://microsoft.github.io/pyright/), run by
 ``` bash
 make lint     # ruff check, ruff format --check, pyright
 make test     # pytest with coverage
+```
+
+The tests run serially and under MPI; some only run on 2 or 6 ranks:
+
+``` bash
+mpiexec -n 2 .venv/bin/python -m pytest
+mpiexec -n 6 .venv/bin/python -m pytest
 ```
 
 Commit messages follow [Conventional

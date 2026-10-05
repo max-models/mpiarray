@@ -1,36 +1,36 @@
 ---
 title: Installation
-description: Create a Python environment and install mpiarray.
+description: Install mpiarray and an MPI library.
 ---
 
-Create and activate a Python environment:
+mpiarray uses [mpi4py](https://mpi4py.readthedocs.io/), which needs an MPI library:
 
 ```bash
-python -m venv env
-source env/bin/activate
-pip install --upgrade pip
+brew install open-mpi                              # macOS
+sudo apt-get install libopenmpi-dev openmpi-bin    # Debian/Ubuntu
 ```
 
-Install the package and its requirements with pip:
+Then, in a Python 3.10+ environment:
 
 ```bash
-pip install -e .
+pip install mpiarray
 ```
 
-Run the code with:
+For GPU arrays, also install the CuPy package for your CUDA version (e.g. `cupy-cuda12x`);
+see [cunumpy](https://github.com/max-models/cunumpy) for selecting the backend.
+
+## From a checkout
 
 ```bash
-mpiarray
+make install          # uv sync --extra dev, plus the pre-commit hooks
+# or
+pip install -e ".[dev]"
 ```
 
 ## Optional extras
 
-| Extra  | Installs                                                |
-| ------ | ------------------------------------------------------- |
-| `test` | `pytest` and `coverage`                                 |
-| `docs` | the notebook runner and griffe for the API reference    |
+| Extra  | Installs                                                  |
+| ------ | --------------------------------------------------------- |
+| `test` | `pytest` and `coverage`                                   |
+| `docs` | the notebook runner and griffe for the API reference      |
 | `dev`  | formatters and linters, plus the `test` and `docs` extras |
-
-```bash
-pip install -e ".[dev]"
-```

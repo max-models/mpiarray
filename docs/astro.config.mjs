@@ -23,7 +23,7 @@ export default defineConfig({
 	integrations: [
 		starlight({
 			title: 'mpiarray',
-			description: 'Template repository for Python projects.',
+			description: 'MPI domain decomposition and distributed NumPy/CuPy arrays with halo exchange.',
 			customCss: ['katex/dist/katex.min.css', './src/styles/custom.css'],
 			components: {
 				Header: './src/components/Header.astro',
