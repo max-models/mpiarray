@@ -4,6 +4,8 @@ PYTHON ?= .venv/bin/python
 NOTEBOOKS = $(PYTHON) docs/tools/notebooks.py
 DOCS_ENV = DOCS_PYTHON=$(shell $(PYTHON) -c "import sys; print(sys.executable)")
 FORCE ?=
+# Open MPI needs --oversubscribe for more ranks than cores; with MPICH: make coverage MPIEXEC=mpiexec
+MPIEXEC ?= mpiexec --oversubscribe
 
 .PHONY: help install test coverage lint readme readme-check docs-install docs-notebooks docs-dev docs-build docs-preview docs-clean
 
@@ -21,7 +23,7 @@ coverage:  ## coverage of the serial and the MPI runs combined, which must be 10
 	rm -f .coverage .coverage.*
 	.venv/bin/python -m coverage run -m pytest -q -p no:cacheprovider
 	for n in 2 3 4 6; do \
-		mpiexec -n $$n --oversubscribe .venv/bin/python -m coverage run -m pytest -q -p no:cacheprovider || exit 1; \
+		$(MPIEXEC) -n $$n .venv/bin/python -m coverage run -m pytest -q -p no:cacheprovider || exit 1; \
 	done
 	.venv/bin/python -m coverage combine -q
 	.venv/bin/python -m coverage report --fail-under=100
