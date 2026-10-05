@@ -1465,7 +1465,6 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "cunumpy" },
-    { name = "mpi4py" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
@@ -1477,6 +1476,7 @@ dev = [
     { name = "ipykernel", version = "7.3.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "ipykernel", version = "7.4.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "jupyterlab" },
+    { name = "mpi4py" },
     { name = "nbclient" },
     { name = "nbformat" },
     { name = "pre-commit" },
@@ -1493,6 +1493,9 @@ docs = [
     { name = "nbclient" },
     { name = "nbformat" },
 ]
+mpi = [
+    { name = "mpi4py" },
+]
 test = [
     { name = "pytest" },
     { name = "pytest-cov" },
@@ -1504,8 +1507,8 @@ requires-dist = [
     { name = "griffe", marker = "extra == 'docs'" },
     { name = "ipykernel", marker = "extra == 'docs'" },
     { name = "jupyterlab", marker = "extra == 'dev'" },
-    { name = "mpi4py" },
-    { name = "mpiarray", extras = ["test", "docs"], marker = "extra == 'dev'" },
+    { name = "mpi4py", marker = "extra == 'mpi'" },
+    { name = "mpiarray", extras = ["test", "docs", "mpi"], marker = "extra == 'dev'" },
     { name = "nbclient", marker = "extra == 'docs'", specifier = ">=0.10" },
     { name = "nbformat", marker = "extra == 'docs'", specifier = ">=5.10" },
     { name = "numpy" },
@@ -1516,7 +1519,7 @@ requires-dist = [
     { name = "pytest-cov", marker = "extra == 'test'" },
     { name = "ruff", marker = "extra == 'dev'" },
 ]
-provides-extras = ["dev", "docs", "test"]
+provides-extras = ["dev", "docs", "mpi", "test"]
 
 [[package]]
 name = "nbclient"

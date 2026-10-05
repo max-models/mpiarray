@@ -70,13 +70,17 @@ collective probe) or `xp.mpi.set_mpi_cuda_aware(False)`.
 
 ## Install
 
-mpiarray needs an MPI library for
-[mpi4py](https://mpi4py.readthedocs.io/), e.g. `brew install open-mpi`
-or `sudo apt-get install libopenmpi-dev openmpi-bin`.
-
 ``` bash
-pip install mpiarray
+pip install "mpiarray[mpi]"   # with mpi4py, for runs under mpiexec
+pip install mpiarray          # serial only, no MPI library needed
 ```
+
+The `mpi` extra installs [mpi4py](https://mpi4py.readthedocs.io/), which
+needs an MPI library, e.g. `brew install open-mpi` or
+`sudo apt-get install libopenmpi-dev openmpi-bin`. Without it, mpiarray
+runs on cunumpy’s serial stand-in for `mpi4py.MPI`, as one rank holding
+the whole array. Starting such an installation with `mpiexec` gives a
+warning, and every process then computes the whole problem on its own.
 
 For development, with [uv](https://docs.astral.sh/uv/):
 
@@ -91,7 +95,7 @@ pip install -e ".[dev]"
 ```
 
 The `test`, `docs` and `dev` extras install the test runner, the
-documentation tooling and the linters.
+documentation tooling and the linters; `dev` includes `mpi`.
 
 ## Development
 
