@@ -26,7 +26,7 @@ comm = MPI.COMM_WORLD
 a = DistributedArray.zeros((64, 48), comm)
 b = DistributedArray.ones((64, 48), comm, dtype=np.float32)
 c = DistributedArray.full((64, 48), 3.5, comm)
-d = DistributedArray.empty((64, 48), comm)        # uninitialised
+d = DistributedArray.empty((64, 48), comm)  # uninitialised
 e = DistributedArray.from_array(np.random.rand(64, 48), comm)
 ```
 
@@ -84,7 +84,8 @@ the component axis either:
 
 ```python
 E = DistributedArray.zeros(
-    (64, 48, 3), comm,
+    (64, 48, 3),
+    comm,
     num_ghostpoints=2,
     ghost_axes=[True, True, False],
     decompose=[True, True, False],
@@ -105,10 +106,10 @@ There are three ways to write data, which differ in what each rank must pass:
 a.local[...] = my_function(np.arange(x0, x1)[:, None], np.arange(y0, y1))
 
 # 2. Every rank passes the same global array; each keeps its block, halos are zeroed.
-a.fill(global_array)          # or: a.data = global_array
+a.fill(global_array)  # or: a.data = global_array
 
 # 3. Each rank passes its whole local storage, halos included.
-a.fill_local(local_storage)   # shape must be shape_with_halos
+a.fill_local(local_storage)  # shape must be shape_with_halos
 ```
 
 `fill` and `fill_local` check that the dtype matches the array's; convert with
@@ -121,10 +122,10 @@ reading the ghost cells.
 ## Getting the data back
 
 ```python
-full = a.to_ndarray()   # the global array on every rank (NumPy or CuPy)
-full = a.to_numpy()     # the global array as numpy.ndarray
-full = a.to_cupy()      # the global array as cupy.ndarray
-full = np.asarray(a)    # the same as to_ndarray()
+full = a.to_ndarray()  # the global array on every rank (NumPy or CuPy)
+full = a.to_numpy()  # the global array as numpy.ndarray
+full = a.to_cupy()  # the global array as cupy.ndarray
+full = np.asarray(a)  # the same as to_ndarray()
 ```
 
 Each of these is a collective `Allgatherv`: every rank must call it, and every rank receives

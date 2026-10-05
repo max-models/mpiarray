@@ -26,7 +26,7 @@ comm = MPI.COMM_WORLD
 
 a = DistributedArray.from_array(np.arange(12.0).reshape(4, 3), comm)
 b = 2 * a + 1
-mask = a > 5          # a boolean DistributedArray
+mask = a > 5  # a boolean DistributedArray
 a /= 3
 ```
 
@@ -35,7 +35,7 @@ NumPy (and CuPy) ufuncs also work and return a `DistributedArray`:
 ```python
 np.sqrt(a)
 np.maximum(a, b)
-np.multiply(a, 2.0, out=a)   # in place, allocates nothing
+np.multiply(a, 2.0, out=a)  # in place, allocates nothing
 np.add(a, b, where=mask, out=a)
 ```
 
@@ -58,8 +58,8 @@ For case 4 every rank must pass the same array. Each rank cuts out the part that
 its block, so the result equals NumPy's on the gathered arrays:
 
 ```python
-a * np.array([1.0, 10.0, 100.0])           # scales the last axis
-a * np.arange(12.0).reshape(4, 3)          # a full global array
+a * np.array([1.0, 10.0, 100.0])  # scales the last axis
+a * np.arange(12.0).reshape(4, 3)  # a full global array
 ```
 
 An operand that varies only along undivided axes (no ranks, no ghost cells) is applied
@@ -76,18 +76,18 @@ pass full global arrays only when they fit in memory on every rank.
 | `a.global_to_local((i, j))`   | the index into `a.data`, or `None` if not owned | none            |
 
 ```python
-v = a[3, 2]                     # a number on one rank, None on the rest
+v = a[3, 2]  # a number on one rank, None on the rest
 v = a.get_global_value((3, 2))  # a number on rank 0
-row = a[0, :]                   # gathers the whole array first
+row = a[0, :]  # gathers the whole array first
 ```
 
 Assignment works the other way round: every rank passes the same value and writes the part
 it owns.
 
 ```python
-a[0, :] = -1.0                  # no communication
-a[:, 1] = np.arange(4.0)        # value broadcasts to the selection
-a[np.array([1, 2]), 0] = 7.0    # advanced index: gathers, assigns, refills
+a[0, :] = -1.0  # no communication
+a[:, 1] = np.arange(4.0)  # value broadcasts to the selection
+a[np.array([1, 2]), 0] = 7.0  # advanced index: gathers, assigns, refills
 ```
 
 Integers, slices and `...` are written locally without communication. Index arrays and
@@ -110,7 +110,7 @@ With `axis=...` the array is gathered and reduced with NumPy, so the result is a
 array on every rank:
 
 ```python
-a.sum(axis=0)        # numpy/cupy array of shape (3,)
+a.sum(axis=0)  # numpy/cupy array of shape (3,)
 ```
 
 All reductions are collective: every rank must call them, even ranks that own no cells.
@@ -119,10 +119,10 @@ All reductions are collective: every rank must call them, even ranks that own no
 ## Inner products and norms
 
 ```python
-a.vdot(b)            # sum(conj(a) * b) over the whole array
-a.norm()             # Euclidean norm
-a.norm(1)            # sum of absolute values
-a.norm(np.inf)       # largest absolute value
+a.vdot(b)  # sum(conj(a) * b) over the whole array
+a.norm()  # Euclidean norm
+a.norm(1)  # sum of absolute values
+a.norm(np.inf)  # largest absolute value
 ```
 
 These skip the ghost cells and return the same value on every rank, which makes them
@@ -137,7 +137,7 @@ or an array created with `comm=None`) and has deposited only its own particles,
 ```python
 rho = DistributedArray.zeros((128, 128), None, num_ghostpoints=2)
 deposit(my_particles, rho.local_with_halos)
-rho.reduce_across_ranks(comm)        # op=MPI.SUM by default
+rho.reduce_across_ranks(comm)  # op=MPI.SUM by default
 ```
 
 It raises if the array is decomposed over the same communicator, where the blocks are
