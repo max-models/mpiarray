@@ -15,58 +15,46 @@ format:
 [![PyPI](https://img.shields.io/pypi/v/mpiarray)](https://pypi.org/project/mpiarray/)
 [![Python](https://img.shields.io/pypi/pyversions/mpiarray)](https://pypi.org/project/mpiarray/)
 
-MPI domain decomposition and distributed arrays for NumPy and CuPy, with halo exchange.
-
-- `DomainDecomposition` splits a Cartesian grid over the ranks of an MPI communicator:
-  the process grid, the neighbour ranks (periodic or not), the index range and the
-  physical subdomain each rank owns, and which rank owns a position.
-- `DistributedArray` is an array decomposed that way, with optional ghost (halo) cells:
-  halo fills for stencils, halo accumulation for particle deposition, gathers, global
-  reductions (`sum`, `max`, `norm`, `vdot`, ...) and NumPy operators and ufuncs.
-
-Arrays are created through [cunumpy](https://github.com/max-models/cunumpy), so the same
-code runs on NumPy or on CuPy (GPU). Without a CUDA-aware MPI, device buffers are copied
-through host memory.
-
-Documentation: <https://max-models.github.io/mpiarray/>
-
-## Example
+Distributed NumPy/CuPy arrays over MPI, with halo exchange, that you create like NumPy
+arrays:
 
 ```python
-import cunumpy as xp
+import numpy as np
 
-from mpiarray import DistributedArray
+import mpiarray as mpa
 
-# mpi4py.MPI under mpiexec, otherwise a serial stand-in (no MPI needed)
-MPI = xp.mpi.get_mpi()
-comm = MPI.COMM_WORLD
+a = mpa.array([1, 2, 3, 4])  # mpiexec -n 2: rank 0 holds [1, 2], rank 1 holds [3, 4]
+b = mpa.zeros((64, 48), split=(0, 1), halo=1, periodic=(True, False))
+c = 2 * a + np.sin(a)  # elementwise: no communication
 
-# a 64 x 48 grid split over the ranks, one ghost layer, periodic in x
-rho = DistributedArray.zeros(
-    shape=(64, 48), comm=comm, num_ghostpoints=1, periodic=(True, False)
-)
-print(rho.proc_sizes, rho.proc_index_bounds)  # this rank's block
-
-rho.local[...] = comm.rank + 1.0  # write this rank's interior
-rho.fill_halos()  # ghost cells <- neighbours' boundary values
-
-total = rho.sum()  # global reductions are collective
-full = rho.to_ndarray()  # gather the whole array on every rank
-if comm.rank == 0:
-    print(total, full.shape)
+total = c.sum()  # collective: the same value on every rank
+full = c.gather()  # collective: the whole array on every rank
+print(c)  # this rank's block; printing never communicates
 ```
 
 ```bash
-mpiexec -n 4 python example.py
+mpiexec -n 2 python example.py   # or just: python example.py
 ```
 
-`xp.mpi.get_mpi()` returns `mpi4py.MPI` under an MPI launcher and cunumpy's serial
-stand-in otherwise, so `python example.py` runs on one rank without starting MPI. mpiarray
-uses the same switch internally.
+- **Creation** like NumPy: `array`, `zeros`, `ones`, `full`, `empty`, the `*_like`
+  versions, `arange`, `linspace` and `fromfunction`, which compute only the local block.
+  Arrays are split along their first axis by default; `split=` chooses other axes,
+  `split=None` gives every rank the whole array.
+- **Halo cells** per axis: `update_halos()` before a stencil, `accumulate_halos()` after
+  depositing particles near block edges.
+- **Operators, ufuncs and reductions** as in NumPy (`sum`, `max`, `mean`, `norm`,
+  `vdot`, ...); global reductions return the same host scalar on every rank.
+- **NumPy or CuPy:** arrays come from [cunumpy](https://github.com/max-models/cunumpy), so
+  the same code runs on the GPU. Without a CUDA-aware MPI, device buffers are copied
+  through host memory; tell cunumpy once with `xp.mpi.mpi_is_cuda_aware(comm)` or
+  `xp.mpi.set_mpi_cuda_aware(False)`.
+- **With or without MPI:** without an MPI launcher the script runs as one rank on
+  cunumpy's stand-in for `mpi4py.MPI`, without importing mpi4py.
 
-On the CuPy backend (`CUNUMPY_BACKEND=cupy`), tell cunumpy once whether MPI can take
-device buffers, with `xp.mpi.mpi_is_cuda_aware(comm)` (a collective probe) or
-`xp.mpi.set_mpi_cuda_aware(False)`.
+Each array has a `layout` (a `mpa.Layout`) with its process grid, neighbours and owned
+index ranges; most code only reads it.
+
+Documentation: <https://max-models.github.io/mpiarray/>
 
 ## Install
 
