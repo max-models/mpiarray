@@ -1464,7 +1464,6 @@ name = "mpiarray"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
-    { name = "array-api-compat" },
     { name = "cunumpy" },
     { name = "mpi4py" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -1501,7 +1500,6 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "array-api-compat" },
     { name = "cunumpy", specifier = ">=0.5" },
     { name = "griffe", marker = "extra == 'docs'" },
     { name = "ipykernel", marker = "extra == 'docs'" },

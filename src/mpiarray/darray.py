@@ -6,7 +6,6 @@ import math
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
-import array_api_compat
 import cunumpy as xp
 import numpy as np
 from mpi4py import MPI
@@ -663,7 +662,7 @@ class DistributedArray(DomainDecomposition):
         """Combine a per-rank value across all ranks."""
         if not self.is_distributed:
             return local_value
-        if array_api_compat.is_cupy_array(local_value):
+        if xp.is_gpu(local_value):
             # pickle-based MPI calls need a host value
             local_value = xp.to_numpy(local_value)[()]
         return self._distributed_comm.allreduce(local_value, op=mpi_op)

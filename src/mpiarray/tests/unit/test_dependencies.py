@@ -8,7 +8,6 @@ import pytest
 
 PACKAGE = Path(__file__).resolve().parents[2]
 ALLOWED = {
-    "array_api_compat",
     "cunumpy",
     "mpi4py",
     "numpy",
