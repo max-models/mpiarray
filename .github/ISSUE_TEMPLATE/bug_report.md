@@ -22,7 +22,7 @@ assignees: ""
 
 **Environment**
 
-- template-python version:
+- mpiarray version:
 - Python version:
 - OS:
 

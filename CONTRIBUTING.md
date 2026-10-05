@@ -5,8 +5,8 @@ Thanks for taking the time to contribute.
 ## Set up
 
 ```bash
-git clone https://github.com/max-models/template-python.git
-cd template-python
+git clone https://github.com/max-models/mpiarray.git
+cd mpiarray
 make install          # uv sync with the dev extra and the pre-commit hooks
 ```
 
@@ -26,7 +26,7 @@ pre-commit install
 - Every public module, class and function needs a Google-style docstring. They are rendered
   in the API reference and checked by ruff's `D` rules.
 - Preview the documentation with `make docs-dev`; see the
-  [docs guide](https://max-models.github.io/template-python/development/docs/).
+  [docs guide](https://max-models.github.io/mpiarray/development/docs/).
 
 ## Commit messages
 
