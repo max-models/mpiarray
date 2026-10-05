@@ -113,6 +113,7 @@ The tests run serially and under MPI; some only run on 2 or 6 ranks:
 ``` bash
 mpiexec -n 2 .venv/bin/python -m pytest
 mpiexec -n 6 .venv/bin/python -m pytest
+make coverage   # serial and 2, 3, 4, 6 ranks, combined; fails below 100% line coverage
 ```
 
 Commit messages follow [Conventional

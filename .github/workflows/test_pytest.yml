@@ -43,14 +43,16 @@ jobs:
         run: uv run python -c "import importlib.util as u; assert u.find_spec('mpi4py') is None"
 
       - name: Run tests with coverage
+        if: ${{ !matrix.mpi }}
         run: uv run pytest --cov --cov-report=xml --cov-report=term .
 
-      # some tests only run on exactly 2 or 6 ranks; the staging test starts its own 2-rank job
-      - name: Run tests under MPI
+      # serially and on 2, 3, 4 and 6 ranks (some tests need exactly 2 or 6), with the
+      # coverage of all runs combined, which must be 100%
+      - name: Run tests serially and under MPI with coverage
         if: matrix.mpi
         run: |
-          mpiexec -n 2 --oversubscribe .venv/bin/python -m pytest -q -p no:cacheprovider .
-          mpiexec -n 6 --oversubscribe .venv/bin/python -m pytest -q -p no:cacheprovider .
+          make coverage
+          .venv/bin/python -m coverage xml
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7
