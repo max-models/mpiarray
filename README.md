@@ -33,10 +33,12 @@ Documentation: <https://max-models.github.io/mpiarray/>
 ## Example
 
 ``` python
-from mpi4py import MPI
+import cunumpy as xp
 
 from mpiarray import DistributedArray
 
+# mpi4py.MPI under mpiexec, otherwise a serial stand-in (no MPI needed)
+MPI = xp.mpi.get_mpi()
 comm = MPI.COMM_WORLD
 
 # a 64 x 48 grid split over the ranks, one ghost layer, periodic in x
@@ -57,6 +59,10 @@ if comm.rank == 0:
 ``` bash
 mpiexec -n 4 python example.py
 ```
+
+`xp.mpi.get_mpi()` returns `mpi4py.MPI` under an MPI launcher and
+cunumpy’s serial stand-in otherwise, so `python example.py` runs on one
+rank without starting MPI. mpiarray uses the same switch internally.
 
 On the CuPy backend (`CUNUMPY_BACKEND=cupy`), tell cunumpy once whether
 MPI can take device buffers, with `xp.mpi.mpi_is_cuda_aware(comm)` (a
