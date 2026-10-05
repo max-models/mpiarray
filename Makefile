@@ -28,10 +28,11 @@ coverage:  ## coverage of the serial and the MPI runs combined, which must be 10
 	.venv/bin/python -m coverage combine -q
 	.venv/bin/python -m coverage report --fail-under=100
 
-lint:  ## ruff and pyright
+lint:  ## ruff, pyright and ty
 	uv run ruff check .
 	uv run ruff format --check .
 	uv run pyright src/
+	uv run ty check
 
 readme:  ## render README.md from README.qmd with quarto
 	quarto render README.qmd --to gfm

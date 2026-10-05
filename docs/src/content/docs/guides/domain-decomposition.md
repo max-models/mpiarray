@@ -46,10 +46,10 @@ calculate_proc_sizes(15, [True, True, True])  # [1, 3, 5]
 calculate_proc_sizes(7, [True, True])  # [1, 7]
 ```
 
-The algorithm aims for the same number of ranks along every flagged axis (the $d$-th root
-of the number of ranks for $d$ flagged axes), rounded down to a divisor. If that does not
-use all the ranks, it drops the last flagged axis and tries again. A prime number of ranks
-therefore always ends up on a single axis. Choose a rank count with small factors (4, 8,
+The flagged axes are filled in order. Each gets the $d$-th root of the ranks still to
+place ($d$ being the number of flagged axes left), rounded to the nearest whole number and
+then lowered to a divisor; the last flagged axis takes what is left. A prime number of ranks
+therefore always ends up on the last flagged axis. Choose a rank count with small factors (4, 8,
 12, 16, …) to get a balanced grid.
 
 Axes with `decompose=False` always have one rank. Use this for axes that are short, or that
@@ -95,8 +95,8 @@ same rank). Along axis 1 a rank at the wall has `MPI.PROC_NULL` as its neighbour
 calls with `PROC_NULL` do nothing, so halo code needs no special case for walls.
 
 :::note
-The module-level `calculate_neighbor_ranks(proc_sizes, rank)` ignores periodicity. Use
-`DomainDecomposition.neighbour_ranks` when an axis is periodic.
+The same neighbours are available without a communicator from
+`calculate_neighbor_ranks(proc_sizes, rank, periodic)`.
 :::
 
 ## Owned index ranges
