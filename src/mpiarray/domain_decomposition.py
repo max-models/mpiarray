@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
+from typing import TYPE_CHECKING
 
+import cunumpy as xp
 import numpy as np
-from mpi4py import MPI
+
+if TYPE_CHECKING:
+    from mpi4py import MPI
+else:
+    # mpi4py.MPI under an MPI launcher, otherwise cunumpy's serial stand-in
+    MPI = xp.mpi.get_mpi()
 
 
 def split_array(array_length: int, num_procs: int) -> np.ndarray:

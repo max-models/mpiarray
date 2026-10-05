@@ -8,10 +8,10 @@ from typing import Any
 import cunumpy as xp
 import numpy as np
 import pytest
-from mpi4py import MPI
 
 from mpiarray import DistributedArray
 
+MPI = xp.mpi.get_mpi()
 xp.set_printoptions(precision=2, suppress=True)
 
 comm = MPI.COMM_WORLD
@@ -1038,13 +1038,14 @@ _STAGING_SCRIPT = """
 import sys
 
 import numpy as np
-from mpi4py import MPI
 
 import cunumpy as xp
 
 sys.path.insert(0, sys.argv[2])
 from mpiarray import DistributedArray
 
+MPI = xp.mpi.get_mpi()
+assert not isinstance(MPI, xp.mpi.SerialMPI), "expected a real MPI run"
 comm = MPI.COMM_WORLD
 xp.mpi.set_mpi_cuda_aware(False)
 global_data = np.arange(8 * 6 * 2, dtype=float).reshape(8, 6, 2)

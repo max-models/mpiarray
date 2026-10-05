@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import cunumpy as xp
 import pytest
-from mpi4py import MPI
 
 from mpiarray import DomainDecomposition
+
+MPI = xp.mpi.get_mpi()
 
 size = MPI.COMM_WORLD.Get_size()
 
