@@ -6,9 +6,9 @@ requires = [ "setuptools", "wheel" ]
 [project]
 name = "mpiarray"
 version = "0.1.0"
-description = "Template python repository."
+description = "MPI domain decomposition and distributed NumPy/CuPy arrays with halo exchange."
 readme = "README.md"
-keywords = [ "python" ]
+keywords = [ "array", "cupy", "domain decomposition", "halo exchange", "mpi", "numpy" ]
 license = { file = "LICENSE.txt" }
 authors = [ { name = "Max" } ]
 requires-python = ">=3.10"
@@ -21,6 +21,9 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
+  "array-api-compat",
+  "cunumpy>=0.5",
+  "mpi4py",
   "numpy",
 ]
 
@@ -40,7 +43,6 @@ optional-dependencies.docs = [
 ]
 optional-dependencies.test = [ "pytest", "pytest-cov" ]
 urls."Source" = "https://github.com/max-models/mpiarray"
-scripts.mpiarray = "mpiarray.main:main"
 
 [tool.setuptools.packages.find]
 where = [ "src" ]
@@ -64,6 +66,8 @@ per-file-ignores."docs/tools/*" = [ "D" ]
 
 [tool.pyright]
 include = [ "src" ]
+venvPath = "."
+venv = ".venv"
 exclude = [ "**/tests" ]
 pythonVersion = "3.10"
 typeCheckingMode = "standard"
