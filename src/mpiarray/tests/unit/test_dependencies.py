@@ -42,15 +42,14 @@ import sys
 
 import cunumpy as xp
 
-from mpiarray import DistributedArray, darray, domain_decomposition
+import mpiarray as mpa
+from mpiarray import _mpi, distributed_array, layout
 
-assert isinstance(darray.MPI, xp.mpi.SerialMPI)
-assert domain_decomposition.MPI is darray.MPI
-a = DistributedArray.from_array(
-    xp.arange(6.0), comm=darray.MPI.COMM_WORLD, num_ghostpoints=1, periodic=(True,)
-)
-a.fill_halos()
-assert float(a.sum()) == 15.0
+assert isinstance(_mpi.MPI, xp.mpi.SerialMPI)
+assert layout.MPI is distributed_array.MPI is _mpi.MPI
+a = mpa.arange(6.0, halo=1, periodic=True)
+a.update_halos()
+assert a.sum() == 15.0
 assert xp.to_numpy(a.local_with_halos).tolist() == [5, 0, 1, 2, 3, 4, 5, 0]
 assert "mpi4py" not in sys.modules, "a serial run imported mpi4py"
 """

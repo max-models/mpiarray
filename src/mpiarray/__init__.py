@@ -1,37 +1,59 @@
-"""MPI domain decomposition and distributed NumPy/CuPy arrays.
+"""Distributed NumPy/CuPy arrays over MPI, with halo exchange.
 
 ::
 
-    from mpiarray import DistributedArray, DomainDecomposition
+    import mpiarray as mpa
 
-`DomainDecomposition` splits a Cartesian grid over the ranks of a
-communicator (process grid, neighbour ranks, owned index ranges and physical
-subdomains). `DistributedArray` is a decomposed array with optional halo
-cells, halo fill/accumulate exchanges, global reductions and NumPy operators.
+    a = mpa.array([1, 2, 3, 4])   # under mpiexec -n 2: [1, 2] on rank 0, [3, 4] on rank 1
+    b = mpa.zeros((64, 48), halo=1, periodic=(True, False))
+    total = (2 * a).sum()          # collective: the same value on every rank
 
-Arrays come from cunumpy, so the same code runs on NumPy or CuPy. Device
-arrays go to MPI through `cunumpy.mpi.mpi_buffer`, so on the CuPy backend
-call ``xp.mpi.mpi_is_cuda_aware(comm)`` or ``xp.mpi.set_mpi_cuda_aware(...)``
-once at startup.
+The creation functions (`array`, `zeros`, `arange`, `fromfunction`, ...)
+split the array along ``split`` (default: the first axis) over the ranks of
+``comm`` (default: ``MPI.COMM_WORLD``). Without an MPI launcher, mpiarray runs
+serially on cunumpy's stand-in for mpi4py, as one rank holding everything.
+Arrays come from cunumpy, so the same code runs on NumPy or CuPy; on the CuPy
+backend call ``xp.mpi.mpi_is_cuda_aware(comm)`` or
+``xp.mpi.set_mpi_cuda_aware(...)`` once at startup.
 """
 
-from mpiarray.darray import DistributedArray
-from mpiarray.domain_decomposition import (
-    DomainDecomposition,
-    calculate_neighbor_ranks,
-    calculate_proc_sizes,
-    get_proc_bounds,
-    split_array,
+from mpiarray.creation import (
+    arange,
+    array,
+    asarray,
+    empty,
+    empty_like,
+    fromfunction,
+    full,
+    full_like,
+    linspace,
+    ones,
+    ones_like,
+    zeros,
+    zeros_like,
 )
+from mpiarray.distributed_array import DistributedArray
+from mpiarray.layout import Layout, chunk_bounds, process_grid
 
 __version__ = "0.1.0"  # x-release-please-version
 
 __all__ = [
     "DistributedArray",
-    "DomainDecomposition",
+    "Layout",
     "__version__",
-    "calculate_neighbor_ranks",
-    "calculate_proc_sizes",
-    "get_proc_bounds",
-    "split_array",
+    "arange",
+    "array",
+    "asarray",
+    "chunk_bounds",
+    "empty",
+    "empty_like",
+    "fromfunction",
+    "full",
+    "full_like",
+    "linspace",
+    "ones",
+    "ones_like",
+    "process_grid",
+    "zeros",
+    "zeros_like",
 ]
