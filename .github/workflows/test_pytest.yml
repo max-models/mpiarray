@@ -12,11 +12,14 @@ on:
 
 jobs:
   pytest:
+    name: pytest (Python ${{ matrix.python-version }}, ${{ matrix.mpi && 'with' || 'without' }} mpi4py)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13"]
+        # without mpi4py, mpiarray runs on cunumpy's serial stand-in for mpi4py.MPI
+        mpi: [false, true]
 
     steps:
       - name: Checkout code
@@ -29,16 +32,22 @@ jobs:
           enable-cache: true
 
       - name: Install MPI
+        if: matrix.mpi
         run: sudo apt-get update && sudo apt-get install -y libopenmpi-dev openmpi-bin
 
       - name: Install project
-        run: uv sync --extra test
+        run: uv sync --extra test ${{ matrix.mpi && '--extra mpi' || '' }}
+
+      - name: Check that mpi4py is not installed
+        if: ${{ !matrix.mpi }}
+        run: uv run python -c "import importlib.util as u; assert u.find_spec('mpi4py') is None"
 
       - name: Run tests with coverage
         run: uv run pytest --cov --cov-report=xml --cov-report=term .
 
       # some tests only run on exactly 2 or 6 ranks; the staging test starts its own 2-rank job
       - name: Run tests under MPI
+        if: matrix.mpi
         run: |
           mpiexec -n 2 --oversubscribe .venv/bin/python -m pytest -q -p no:cacheprovider .
           mpiexec -n 6 --oversubscribe .venv/bin/python -m pytest -q -p no:cacheprovider .
@@ -48,5 +57,5 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.xml
-          flags: python-${{ matrix.python-version }}
+          flags: python-${{ matrix.python-version }}-${{ matrix.mpi && 'mpi' || 'serial' }}
           fail_ci_if_error: false

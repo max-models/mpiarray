@@ -39,9 +39,6 @@ jobs:
           cache: npm
           cache-dependency-path: docs/package-lock.json
 
-      - name: Install MPI
-        run: sudo apt-get update && sudo apt-get install -y libopenmpi-dev openmpi-bin
-
       - name: Install the package with the docs extra
         run: |
           uv sync --extra docs

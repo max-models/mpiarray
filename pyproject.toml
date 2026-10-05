@@ -22,7 +22,6 @@ classifiers = [
 ]
 dependencies = [
   "cunumpy>=0.5",
-  "mpi4py",
   "numpy",
 ]
 
@@ -32,7 +31,7 @@ optional-dependencies.dev = [
   "pyproject-fmt",
   "pyright",
   "ruff",
-  "mpiarray[test,docs]",
+  "mpiarray[test,docs,mpi]",
 ]
 optional-dependencies.docs = [
   "griffe",
@@ -40,6 +39,8 @@ optional-dependencies.docs = [
   "nbclient>=0.10",
   "nbformat>=5.10",
 ]
+# without mpi4py, mpiarray runs serially on cunumpy's stand-in for mpi4py.MPI
+optional-dependencies.mpi = [ "mpi4py" ]
 optional-dependencies.test = [ "pytest", "pytest-cov" ]
 urls."Source" = "https://github.com/max-models/mpiarray"
 
@@ -79,6 +80,9 @@ addopts = "-ra"
 [tool.coverage.run]
 source = [ "mpiarray" ]
 omit = [ "*/tests/*" ]
+# one data file per process (every MPI rank, and the jobs tests start), for `coverage combine`
+parallel = true
+patch = [ "subprocess" ]
 
 [tool.coverage.report]
 show_missing = true
