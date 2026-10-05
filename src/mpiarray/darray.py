@@ -8,13 +8,16 @@ from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 import cunumpy as xp
 import numpy as np
-from mpi4py import MPI
 from numpy.typing import DTypeLike
 
 from mpiarray.domain_decomposition import DomainDecomposition
 
 if TYPE_CHECKING:
+    from mpi4py import MPI
     from typing_extensions import Self  # typing.Self needs Python 3.11
+else:
+    # mpi4py.MPI under an MPI launcher, otherwise cunumpy's serial stand-in
+    MPI = xp.mpi.get_mpi()
 
 # A NumPy or CuPy array.
 Array: TypeAlias = Any
@@ -1037,9 +1040,8 @@ class DistributedArray(DomainDecomposition):
         items = index if isinstance(index, tuple) else (index,)
 
         def is_int(item: Any) -> bool:
-            return isinstance(item, (int, np.integer)) and not isinstance(
-                item,
-                (bool, np.bool_),
+            return isinstance(item, int | np.integer) and not isinstance(
+                item, bool | np.bool_
             )
 
         if not all(
