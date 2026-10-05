@@ -1,11 +1,11 @@
 ---
 title: Operations and reductions
-description: Arithmetic, NumPy ufuncs and broadcasting, indexing, global reductions and norms on a DistributedArray, and which of them communicate.
+description: Arithmetic, NumPy ufuncs and broadcasting, indexing, global reductions and norms on a distributed array, and which of them communicate.
 sidebar:
   order: 4
 ---
 
-A `DistributedArray` behaves like a NumPy array for elementwise arithmetic and reductions.
+A distributed array behaves like a NumPy array for elementwise arithmetic and reductions.
 Elementwise operations run on each rank's block without communication; reductions combine
 the blocks with one `allreduce`.
 
@@ -16,21 +16,17 @@ return a new array with the same layout. The in-place forms `+= -= *= /=` write 
 existing storage.
 
 ```python
-import cunumpy as xp
 import numpy as np
 
-from mpiarray import DistributedArray
+import mpiarray as mpa
 
-MPI = xp.mpi.get_mpi()
-comm = MPI.COMM_WORLD
-
-a = DistributedArray.from_array(np.arange(12.0).reshape(4, 3), comm)
+a = mpa.array(np.arange(12.0).reshape(4, 3))
 b = 2 * a + 1
-mask = a > 5  # a boolean DistributedArray
+mask = a > 5  # a boolean distributed array
 a /= 3
 ```
 
-NumPy (and CuPy) ufuncs also work and return a `DistributedArray`:
+NumPy (and CuPy) ufuncs work too and return a distributed array:
 
 ```python
 np.sqrt(a)
@@ -39,19 +35,19 @@ np.multiply(a, 2.0, out=a)  # in place, allocates nothing
 np.add(a, b, where=mask, out=a)
 ```
 
-`out=` must be a `DistributedArray` with the same layout. Ufunc methods such as
+`out=` must be a distributed array with the same layout. Ufunc methods such as
 `np.add.reduce` or `np.add.at` are not supported; use the reductions below.
 
-Elementwise operations also act on the ghost cells; see
+Elementwise operations also act on the halo cells; see
 [Halo cells and other operations](/mpiarray/guides/halo-exchange/#halo-cells-and-other-operations).
 
 ### Broadcasting
 
 The other operand can be:
 
-1. a `DistributedArray` with the same layout,
+1. a distributed array with the same layout,
 2. a scalar,
-3. an array with the local storage shape (`shape_with_halos`), used as is on each rank,
+3. an array with the storage shape (`a.layout.storage_shape`), used as is on each rank,
 4. any array that broadcasts against the *global* shape, as in NumPy.
 
 For case 4 every rank must pass the same array. Each rank cuts out the part that matches
@@ -62,48 +58,48 @@ a * np.array([1.0, 10.0, 100.0])  # scales the last axis
 a * np.arange(12.0).reshape(4, 3)  # a full global array
 ```
 
-An operand that varies only along undivided axes (no ranks, no ghost cells) is applied
-directly without slicing. Otherwise it is expanded to the global shape before slicing, so
-pass full global arrays only when they fit in memory on every rank.
+An operand that varies only along axes each rank holds whole (not split, no halo cells) is
+applied directly. Otherwise it is expanded to the global shape before slicing, so pass
+full global arrays only when they fit in memory on every rank.
 
 ## Indexing
 
-| Expression                    | Result                                   | Communication          |
-| ----------------------------- | ---------------------------------------- | ---------------------- |
-| `a[i, j]` (one int per axis)  | the value on the owning rank, `None` on the others | none          |
-| `a[1:3, :]`, `a[mask]`, …     | the selection of the gathered array, on every rank | collective gather |
-| `a.get_global_value((i, j), root=0)` | the value on `root`, `None` on the others | collective gather |
-| `a.global_to_local((i, j))`   | the index into `a.data`, or `None` if not owned | none            |
+Reading with global indices is collective and returns the same result on every rank:
 
-```python
-v = a[3, 2]  # a number on one rank, None on the rest
-v = a.get_global_value((3, 2))  # a number on rank 0
-row = a[0, :]  # gathers the whole array first
-```
+| Expression                    | Result                                    |
+| ----------------------------- | ----------------------------------------- |
+| `a[i, j]`, `a.get((i, j))`    | the element, broadcast from its owner     |
+| `a[1:3, :]`, `a[mask]`, …     | the selection of the gathered array       |
+| `a.local_index((i, j))`       | the index into `a.local_with_halos`, or `None` if this rank does not own it (no communication) |
 
 Assignment works the other way round: every rank passes the same value and writes the part
 it owns.
 
 ```python
 a[0, :] = -1.0  # no communication
-a[:, 1] = np.arange(4.0)  # value broadcasts to the selection
-a[np.array([1, 2]), 0] = 7.0  # advanced index: gathers, assigns, refills
+a[:, 1] = np.arange(4.0)  # the value broadcasts to the selection
+a[np.array([1, 2]), 0] = 7.0  # advanced index: gathers, assigns, redistributes
 ```
 
 Integers, slices and `...` are written locally without communication. Index arrays and
-masks gather the whole array, assign, and redistribute it (collective; the ghost cells are
+masks gather the whole array, assign, and redistribute it (collective; the halo cells are
 zeroed).
+
+`len(a)`, iteration over the first axis (which gathers) and `bool(a)` for a one-element
+array work as in NumPy.
 
 ## Reductions
 
 `sum`, `prod`, `min`, `max`, `mean`, `var`, `std`, `all` and `any` reduce over the whole
-array and return the same scalar on every rank. Only the interior cells count.
+array and return the same host scalar on every rank, also on the GPU backend. Only the
+blocks count, not the halo cells.
 
 ```python
 a.sum()
 a.mean()
 a.std(ddof=1)
 (a > 0).all()
+np.sum(a)  # NumPy's functions call the methods
 ```
 
 With `axis=...` the array is gathered and reduced with NumPy, so the result is a regular
@@ -125,35 +121,32 @@ a.norm(1)  # sum of absolute values
 a.norm(np.inf)  # largest absolute value
 ```
 
-These skip the ghost cells and return the same value on every rank, which makes them
+These skip the halo cells and return the same value on every rank, which makes them
 suitable for convergence checks in iterative solvers.
 
 ## Combining replicated copies
 
-When every rank holds the whole grid (a [replicated layout](/mpiarray/guides/domain-decomposition/#replicated-layouts),
-or an array created with `comm=None`) and has deposited only its own particles,
-`reduce_across_ranks` sums the copies in place, halo cells included:
+When every rank holds the whole grid (`split=None`) and has deposited only its own
+particles, `allreduce_replicated` sums the copies in place, halo cells included:
 
 ```python
-rho = DistributedArray.zeros((128, 128), None, num_ghostpoints=2)
+rho = mpa.zeros((128, 128), split=None, halo=2)
 deposit(my_particles, rho.local_with_halos)
-rho.reduce_across_ranks(comm)  # op=MPI.SUM by default
+rho.allreduce_replicated()  # op=MPI.SUM by default
 ```
 
-It raises if the array is decomposed over the same communicator, where the blocks are
-different parts of the grid and summing them would be wrong.
+It raises for a split array, whose blocks are different parts of the grid.
 
 ## Which calls communicate
 
-Calls marked collective must be made by every rank of the communicator, in the same order,
-or the program hangs.
+Collective calls must be made by every rank of the communicator, in the same order, or
+the program hangs. A collective call inside `if rank == 0:` is the classic mistake.
 
-| No communication                                           | Collective                                  |
-| ---------------------------------------------------------- | ------------------------------------------- |
-| constructors, `copy`, `astype`                             | `fill_halos`, `exchange_halos` (and per-axis) |
-| `fill`, `fill_local`, writes to `local`                    | `to_ndarray`, `to_numpy`, `to_cupy`, `np.asarray(a)`, `a.T` |
-| operators and ufuncs                                       | reductions without `axis`, and with `axis` (gather) |
-| `a[i, j]` with one int per axis                            | `vdot`, `norm`                              |
-| `a[...] = v` with ints and slices                          | `a[...]` with slices, arrays or masks       |
-| layout queries (`proc_index_bounds`, `neighbour_ranks`, …) | `a[...] = v` with arrays or masks           |
-|                                                            | `get_global_value`, `reduce_across_ranks`   |
+| No communication                                           | Collective                                    |
+| ---------------------------------------------------------- | --------------------------------------------- |
+| creation functions (`zeros`, `array`, `arange`, …)          | `update_halos`, `accumulate_halos`            |
+| `copy`, `astype`, writes to `local`                         | `gather`, `to_numpy`, `np.asarray(a)`, iteration |
+| operators and ufuncs                                        | reductions, `vdot`, `norm`                    |
+| `a[...] = v` with ints and slices                           | `a[...]`, `get`, `bool(a)`                    |
+| `repr(a)`, `print(a)`, `a.layout`, `local_index`, `clear_halos` | `a[...] = v` with arrays or masks         |
+|                                                             | `allreduce_replicated`                        |

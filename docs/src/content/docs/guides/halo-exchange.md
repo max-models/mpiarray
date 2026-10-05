@@ -1,30 +1,29 @@
 ---
 title: Halo exchange
-description: Filling ghost cells before a stencil with fill_halos, and accumulating deposited values into neighbours with exchange_halos.
+description: Copying neighbour values into the halo cells before a stencil with update_halos, and adding deposited values into the neighbours with accumulate_halos.
 sidebar:
   order: 3
 ---
 
-Ghost cells hold copies of, or contributions to, cells that belong to a neighbouring rank.
-mpiarray has two exchanges that move data in opposite directions:
+Halo cells hold copies of, or contributions to, cells that belong to a neighbouring rank.
+mpiarray moves data through them in both directions:
 
-|                     | `fill_halos()`                         | `exchange_halos()`                          |
+|                     | `update_halos()`                       | `accumulate_halos()`                        |
 | ------------------- | -------------------------------------- | ------------------------------------------- |
-| direction           | neighbour's interior → my ghost cells  | my ghost cells → neighbour's interior       |
-| operation           | copy (overwrite)                       | add, then zero my ghost cells               |
-| use it              | before reading neighbours (stencils, interpolation) | after writing into ghost cells (particle deposition) |
-| at a wall           | ghost cells left unchanged             | ghost values discarded                      |
+| direction           | neighbour's block → my halo cells      | my halo cells → neighbour's block           |
+| operation           | copy (overwrite)                       | add, then zero my halo cells                |
+| use it              | before reading neighbours (stencils, interpolation) | after writing into halo cells (particle deposition) |
+| at a wall           | halo cells left unchanged              | halo values dropped                         |
 
-Both are collective over the array's communicator and work axis by axis (`fill_halo(dim)`,
-`exchange_halo(dim)`). The per-axis versions are useful when a stencil only reaches along
-some axes. With `num_ghostpoints=0`, or on an axis with `ghost_axes[dim] = False`, they do
-nothing.
+Both are collective. They work on every axis, or on one with `axis=`, which is useful when
+a stencil only reaches along some axes. On an axis with no halo cells they do nothing.
+`clear_halos()` sets the halo cells to zero without communicating.
 
-## Filling ghost cells
+## Updating halo cells
 
-After `fill_halos()`, the ghost cells of each rank equal the boundary cells of its
-neighbours. For an 8-point periodic axis on four ranks, with each rank's interior set to
-`rank + 1` and one ghost point:
+After `update_halos()`, the halo cells of each rank equal the boundary cells of its
+neighbours. For an 8-element periodic axis on four ranks, with each rank's block set to
+`rank + 1` and one halo cell:
 
 ```text
 rank 0: [4 | 1 1 | 2]
@@ -33,65 +32,59 @@ rank 2: [2 | 3 3 | 4]
 rank 3: [3 | 4 4 | 1]
 ```
 
-Without periodicity the outer ghost cells of rank 0 and rank 3 keep their previous value
-(`0` for a new array). Zero ghost cells at a wall act as a homogeneous Dirichlet boundary
-for a stencil; write other boundary values into them yourself after `fill_halos()`.
+Without periodicity the outer halo cells of rank 0 and rank 3 keep their previous value
+(`0` for a new array). Zero halo cells at a wall act as a homogeneous Dirichlet boundary
+for a stencil; write other boundary values into them yourself after `update_halos()`.
 
 ### Example: a Laplacian
 
 ```python
-import cunumpy as xp
 import numpy as np
 
-from mpiarray import DistributedArray
-
-MPI = xp.mpi.get_mpi()
-comm = MPI.COMM_WORLD
+import mpiarray as mpa
 
 n = 64
-x = np.linspace(0, 2 * np.pi, n, endpoint=False)
-h = x[1] - x[0]
+h = 2 * np.pi / n
+u = mpa.fromfunction(lambda i: np.sin(i * h), (n,), halo=1, periodic=True)
+lap = mpa.zeros_like(u)
 
-u = DistributedArray.from_array(np.sin(x), comm, num_ghostpoints=1, periodic=(True,))
-lap = DistributedArray.zeros(u.shape, comm, num_ghostpoints=1, periodic=(True,))
-
-u.fill_halos()
+u.update_halos()
 v = u.local_with_halos
 lap.local[...] = (v[2:] - 2 * v[1:-1] + v[:-2]) / h**2
 ```
 
-The stencil reads `local_with_halos` and writes `local`; with one ghost point,
-`v[1:-1]` is the interior. The result is the same on any number of ranks.
+The stencil reads `local_with_halos` and writes `local`; with one halo cell, `v[1:-1]` is
+the block. The result is the same on any number of ranks.
 
-The exchange is done axis by axis, so the corner ghost cells are filled too: the second
-axis exchanges rows that already contain the first axis's ghost cells. A 9-point stencil
-in 2D therefore works after a single `fill_halos()`.
+The axes are updated one after the other, so the corner halo cells are filled too: the
+second axis exchanges rows that already contain the first axis's halo cells. A 9-point
+stencil in 2D therefore works after a single `update_halos()`.
 
-## Accumulating ghost cells
+## Accumulating halo cells
 
-When particles are deposited on a grid, a particle near a subdomain edge also contributes to
-cells owned by the neighbour. Deposit into `local_with_halos`, then call
-`exchange_halos()`: each rank's ghost values are added to the matching interior cells of its
-neighbour and the ghost cells are reset to zero.
+When particles are deposited on a grid, a particle near the edge of a block also
+contributes to cells owned by the neighbour. Deposit into `local_with_halos`, then call
+`accumulate_halos()`: each rank's halo values are added to the matching cells of its
+neighbour, and the halo cells are reset to zero.
 
 ```python
-rho = DistributedArray.zeros((128, 128), comm, num_ghostpoints=2, periodic=(True, True))
+rho = mpa.zeros((128, 128), split=(0, 1), halo=2, periodic=True)
 
-deposit(particles, rho.local_with_halos)  # may write into the ghost cells
-rho.exchange_halos()  # ghost contributions -> owners
+deposit(particles, rho.local_with_halos)  # may write into the halo cells
+rho.accumulate_halos()  # halo contributions -> owners
 total_charge = rho.sum()  # nothing is lost on periodic axes
 ```
 
 On periodic axes the total is conserved. At a wall (`PROC_NULL` neighbour) the
 contributions that fall outside the domain are dropped; apply your boundary condition to
-the ghost cells before the exchange if they should be reflected or kept.
+the halo cells before accumulating if they should be reflected or kept.
 
 ## Halo cells and other operations
 
-- Arithmetic (`a + b`, `np.sin(a)`, …) acts on the whole local storage, halo cells
-  included, so the ghost cells of a result hold the operation applied to the operands'
-  ghost cells. They are meaningful only if the operands' ghost cells were. Call
-  `fill_halos()` on the result before using its ghost cells.
-- `fill(global_array)`, and assignments with array or mask indices, zero the halo cells.
-- Reductions, norms and `to_ndarray()` never read the halo cells.
-- `clear_halos(dim)` zeroes the ghost cells along one axis.
+- Arithmetic (`a + b`, `np.sin(a)`, …) acts on the whole storage, halo cells included, so
+  the halo cells of a result hold the operation applied to the operands' halo cells. They
+  are meaningful only if the operands' halo cells were; call `update_halos()` on the
+  result before using its halo cells.
+- `mpa.array(...)` starts with zero halo cells, and assignments with array or mask indices
+  zero them.
+- Reductions, norms, `gather()` and `get()` never read the halo cells.

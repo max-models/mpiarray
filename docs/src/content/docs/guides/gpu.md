@@ -23,14 +23,16 @@ import cunumpy as xp
 xp.set_backend("cupy")
 ```
 
-With the CuPy backend, `a.local`, `a.data` and `a.to_ndarray()` are CuPy arrays, and the
-operators and ufuncs run on the device. `a.to_numpy()` copies the gathered array to the host.
+With the CuPy backend, `a.local`, `a.local_with_halos` and `a.gather()` are CuPy arrays,
+and the operators and ufuncs run on the device. `a.to_numpy()` copies the gathered array to
+the host, and reductions without `axis` return host scalars, so `if a.max() > 1:` needs no
+conversion.
 
 Install the CuPy package for your CUDA version, for example `pip install cupy-cuda12x`.
 
 ## CUDA-aware MPI
 
-Halo exchanges, gathers and `reduce_across_ranks` pass array buffers to MPI. A CUDA-aware
+Halo exchanges, gathers and `allreduce_replicated` pass array buffers to MPI. A CUDA-aware
 MPI library can read device memory directly; any other needs the data copied through host
 memory. mpiarray does this through `xp.mpi.mpi_buffer`, which needs to know which case
 applies. Tell it once at startup:

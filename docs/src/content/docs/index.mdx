@@ -19,17 +19,17 @@ import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 ## What is included
 
 <CardGrid>
-	<Card title="Domain decomposition" icon="puzzle">
-		`DomainDecomposition` splits a Cartesian grid over the MPI ranks: process grid, neighbours, owned index ranges and subdomains.
+	<Card title="Like NumPy" icon="open-book">
+		`mpa.array`, `mpa.zeros`, `mpa.arange`, … create arrays split over the MPI ranks, with operators, ufuncs and reductions as in NumPy.
 	</Card>
-	<Card title="Distributed arrays" icon="open-book">
-		`DistributedArray` adds ghost cells, halo fill and accumulation, gathers, global reductions and NumPy operators.
+	<Card title="Halo cells" icon="puzzle">
+		Optional halo cells per axis, updated from the neighbours for stencils or accumulated into them after particle deposition.
 	</Card>
 	<Card title="NumPy or CuPy" icon="rocket">
 		Arrays come from cunumpy, so the same code runs on the CPU or the GPU, with or without CUDA-aware MPI.
 	</Card>
-	<Card title="API reference" icon="setting">
-		Every module, class and function is documented from the docstrings.
+	<Card title="With or without MPI" icon="setting">
+		Without an MPI launcher the same script runs serially, without mpi4py.
 	</Card>
 </CardGrid>
 
@@ -37,8 +37,8 @@ import { Card, CardGrid, LinkCard } from '@astrojs/starlight/components';
 
 <CardGrid>
 	<LinkCard title="Installation" href="/mpiarray/getting-started/installation/" description="Create an environment and install the package." />
-	<LinkCard title="Quickstart" href="/mpiarray/getting-started/quickstart/" description="A distributed array on four ranks." />
-	<LinkCard title="Guides" href="/mpiarray/guides/domain-decomposition/" description="Decomposition, storage, halo exchange, operations and GPUs." />
+	<LinkCard title="Quickstart" href="/mpiarray/getting-started/quickstart/" description="A distributed array on two ranks." />
+	<LinkCard title="Guides" href="/mpiarray/guides/distributed-arrays/" description="Arrays, layouts, halo exchange, operations and GPUs." />
 	<LinkCard title="Tutorials" href="/mpiarray/tutorials/" description="Executed notebooks with their outputs." />
 	<LinkCard title="API reference" href="/mpiarray/api/mpiarray/" description="Generated from the docstrings." />
 </CardGrid>
