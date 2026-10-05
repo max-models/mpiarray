@@ -18,7 +18,7 @@ comm = MPI.COMM_WORLD
 size = comm.Get_size()
 
 
-def _as_numpy(data: xp.ndarray) -> np.ndarray:
+def _as_numpy(data: Any) -> np.ndarray:
     """Return backend data as a NumPy array for assertions."""
     if hasattr(data, "get"):
         return data.get()
@@ -576,8 +576,8 @@ def test_numpy_reduction_functions_dispatch_to_distributed_array() -> None:
 
     assert np.isclose(np.sum(darray), global_data.sum())
     assert np.isclose(np.prod(darray / 10), np.prod(global_data / 10))
-    assert np.min(darray) == global_data.min()
-    assert np.max(darray) == global_data.max()
+    assert np.min(darray) == np.min(global_data)
+    assert np.max(darray) == np.max(global_data)
     assert np.isclose(np.mean(darray), global_data.mean())
     assert np.isclose(np.var(darray), global_data.var())
     assert np.isclose(np.var(darray, ddof=1), global_data.var(ddof=1))
@@ -623,11 +623,13 @@ def test_broadcast_operands_match_global_numpy_semantics(
     xp_operand = xp.asarray(operand)
 
     np.testing.assert_allclose((darray + xp_operand).to_numpy(), global_data + operand)
-    np.testing.assert_allclose((xp_operand - darray).to_numpy(), operand - global_data)
-    np.testing.assert_allclose(
-        np.multiply(darray, xp_operand).to_numpy(),
-        global_data * operand,
-    )
+    # ndarray - DistributedArray defers to DistributedArray (__array_ufunc__)
+    difference = xp_operand - darray
+    assert isinstance(difference, DistributedArray)
+    np.testing.assert_allclose(difference.to_numpy(), operand - global_data)
+    product = np.multiply(darray, xp_operand)
+    assert isinstance(product, DistributedArray)
+    np.testing.assert_allclose(product.to_numpy(), global_data * operand)
     darray += xp_operand
     np.testing.assert_allclose(darray.to_numpy(), global_data + operand)
 
@@ -789,7 +791,7 @@ def test_vdot_and_norm_match_numpy_on_the_gathered_array(
     if np.issubdtype(dtype, np.complexfloating):
         a = a + 1j * rng.integers(-5, 6, size=shape)
         b = b + 1j * rng.integers(-5, 6, size=shape)
-    layout = {
+    layout: dict[str, Any] = {
         "comm": comm,
         "num_ghostpoints": 1,
         "decompose": decompose,
@@ -818,7 +820,7 @@ def test_vdot_and_norm_reject_bad_arguments() -> None:
     with pytest.raises(ValueError, match="Shapes must match"):
         darray.vdot(other)
     with pytest.raises(TypeError, match="DistributedArray"):
-        darray.vdot(np.zeros((6, 4)))
+        darray.vdot(np.zeros((6, 4)))  # ty: ignore[invalid-argument-type]
     with pytest.raises(ValueError, match="norm order"):
         darray.norm(3)
 
@@ -998,18 +1000,18 @@ def test_ufunc_out_writes_in_place() -> None:
     )
     storage = darray.data
 
-    result = np.multiply(darray, 2.0, out=darray)
+    result = np.multiply(darray, 2.0, out=darray)  # ty: ignore[no-matching-overload]
     assert result is darray
     assert darray.data is storage
     np.testing.assert_array_equal(darray.to_numpy(), global_data * 2)
 
     target = DistributedArray.zeros(shape=(6, 4), comm=comm, num_ghostpoints=1)
-    assert np.add(darray, 1.0, out=target) is target
+    assert np.add(darray, 1.0, out=target) is target  # ty: ignore[no-matching-overload]
     np.testing.assert_array_equal(target.to_numpy(), global_data * 2 + 1)
 
     quotient = DistributedArray.zeros(shape=(6, 4), comm=comm, num_ghostpoints=1)
     remainder = DistributedArray.zeros(shape=(6, 4), comm=comm, num_ghostpoints=1)
-    outputs = np.divmod(darray, 5.0, out=(quotient, remainder))
+    outputs = np.divmod(darray, 5.0, out=(quotient, remainder))  # ty: ignore[no-matching-overload]
     assert outputs[0] is quotient
     assert outputs[1] is remainder
     np.testing.assert_array_equal(quotient.to_numpy(), (global_data * 2) // 5)
@@ -1022,14 +1024,14 @@ def test_ufunc_where_and_bad_out_arguments() -> None:
     darray = DistributedArray.from_array(xp.asarray(global_data), comm=comm)
     target = DistributedArray.zeros(shape=(3, 4), comm=comm)
 
-    np.negative(darray, out=target, where=darray > 5)
+    np.negative(darray, out=target, where=darray > 5)  # ty: ignore[no-matching-overload]
     np.testing.assert_array_equal(
         target.to_numpy(),
         np.where(global_data > 5, -global_data, 0.0),
     )
 
     with pytest.raises(ValueError, match="Shapes must match"):
-        np.add(darray, 1.0, out=DistributedArray.zeros(shape=(4, 3), comm=comm))
+        np.add(darray, 1.0, out=DistributedArray.zeros(shape=(4, 3), comm=comm))  # ty: ignore[no-matching-overload]
     with pytest.raises(TypeError):
         np.add(darray, 1.0, out=np.zeros((3, 4)))
 
@@ -1095,9 +1097,12 @@ def test_halo_methods_without_ghost_cells_change_nothing() -> None:
         ),
     ],
 )
-def test_operands_with_another_layout_are_rejected(kwargs, message) -> None:
+def test_operands_with_another_layout_are_rejected(
+    kwargs: dict[str, Any], message: str
+) -> None:
     darray = DistributedArray.zeros(shape=(4, 3), comm=comm, num_ghostpoints=1)
-    other = DistributedArray.zeros(comm=comm, **{"num_ghostpoints": 1, **kwargs})
+    layout: dict[str, Any] = {"num_ghostpoints": 1, **kwargs}
+    other = DistributedArray.zeros(comm=comm, **layout)
     if message == "process layouts" and darray.proc_sizes == other.proc_sizes:
         pytest.skip("on one rank every layout has the same process grid")
     with pytest.raises(ValueError, match=message):
@@ -1187,11 +1192,14 @@ def test_array_protocol_and_ufunc_methods() -> None:
 
     quotient, remainder = np.divmod(darray, 4.0)  # a ufunc with two outputs
     assert isinstance(quotient, DistributedArray)
+    assert isinstance(remainder, DistributedArray)
     np.testing.assert_array_equal(quotient.to_numpy(), global_data // 4.0)
     np.testing.assert_array_equal(remainder.to_numpy(), global_data % 4.0)
 
     with pytest.raises(TypeError):
-        np.add.reduce(darray)  # only plain ufunc calls are distributed
+        np.add.reduce(
+            darray
+        )  # only plain ufunc calls are distributed  # ty: ignore[no-matching-overload]
 
 
 def test_to_cupy(monkeypatch: pytest.MonkeyPatch) -> None:

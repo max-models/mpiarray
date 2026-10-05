@@ -4,20 +4,33 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeAlias
 
 import cunumpy as xp
 import numpy as np
 
 if TYPE_CHECKING:
+    from cunumpy.mpi import SerialComm
     from mpi4py import MPI
 else:
     # mpi4py.MPI under an MPI launcher, otherwise cunumpy's serial stand-in
     MPI = xp.mpi.get_mpi()
 
+# An mpi4py communicator, or cunumpy's serial stand-in for one.
+Comm: TypeAlias = "MPI.Comm | SerialComm"
+
 
 def split_array(array_length: int, num_procs: int) -> np.ndarray:
-    """Split an array length into near-even process chunks."""
+    """Split an array length into near-even process chunks.
+
+    Args:
+        array_length: Number of points to split.
+        num_procs: Number of chunks.
+
+    Returns:
+        The size of each chunk; the first ``array_length % num_procs`` chunks
+        are one point longer than the rest.
+    """
     base = array_length // num_procs
     remainder = array_length % num_procs
     result = np.full(num_procs, base)
@@ -26,10 +39,33 @@ def split_array(array_length: int, num_procs: int) -> np.ndarray:
 
 
 class DomainDecomposition:
-    """Represent the MPI process layout for a decomposed domain."""
+    """Represent the MPI process layout for a decomposed domain.
+
+    The ranks of ``comm`` are placed row-major on a Cartesian process grid
+    (the last axis varies fastest). Each rank owns one block of any grid laid
+    out over it, and knows its left and right neighbour along every axis.
+
+    Args:
+        comm: Communicator to decompose over, or ``None`` for a serial layout
+            with a single rank.
+        decompose: Whether each axis may be split over ranks; default: all.
+        dim_order: For each axis, which of the process counts sorted in
+            descending order it gets (``0`` is the largest); default: the
+            order of `calculate_proc_sizes`.
+        periodic: Whether each axis wraps around; default: none does.
+        ndim: Number of axes; needed only when ``decompose`` is not given.
+    """
 
     def _sort_proc_sizes(self, proc_sizes: Sequence[int]) -> list[int]:
-        """Sort process counts according to the decomposition order."""
+        """Sort process counts according to the decomposition order.
+
+        Args:
+            proc_sizes: Process counts per axis.
+
+        Returns:
+            The same counts, reordered so that axis ``i`` gets the
+            ``dim_order[i]``-th largest.
+        """
         assert self.dim_order is not None
         assert len(self.dim_order) == self.ndim
         assert set(self.dim_order) == set(
@@ -46,7 +82,7 @@ class DomainDecomposition:
 
     def __init__(
         self,
-        comm: MPI.Comm | None,
+        comm: Comm | None,
         decompose: list[bool] | None = None,
         dim_order: list[int] | None = None,
         periodic: Sequence[bool] | None = None,
@@ -117,7 +153,12 @@ class DomainDecomposition:
             )
 
     def create_proc_matrix(self) -> np.ndarray:
-        """Create the process-coordinate lookup matrix."""
+        """Create the process-coordinate lookup matrix.
+
+        Returns:
+            An integer array of shape ``(prod(proc_sizes), ndim)`` whose row
+            ``r`` holds the process coordinates of rank ``r``.
+        """
         ndim = len(self.proc_sizes)
         total_procs = math.prod(self.proc_sizes)
 
@@ -140,17 +181,45 @@ class DomainDecomposition:
         rank: int,
         dim: int,
     ) -> tuple[int, int]:
-        """Return the local bounds for one process and dimension."""
+        """Return the ``(start, end)`` indices one rank owns along one axis.
+
+        Args:
+            array_length: Global length of the axis.
+            num_procs: Number of processes along the axis.
+            rank: Flat MPI rank.
+            dim: The axis.
+
+        Returns:
+            The half-open index range ``[start, end)``.
+        """
         return get_proc_bounds(array_length, num_procs, self.get_proc_coord(rank)[dim])
 
     def get_proc_coord(self, rank: int) -> tuple[int, ...]:
-        """Return process coordinates for one rank."""
+        """Return process coordinates for one rank.
+
+        Args:
+            rank: Flat MPI rank.
+
+        Returns:
+            The rank's position on the process grid, one entry per axis. In a
+            replicated layout every rank is at the origin.
+        """
         if self.replicated:
             return self.proc_matrix[0]
         return self.proc_matrix[rank]
 
     def rank_from_proc_coord(self, proc_coord: tuple[int, ...]) -> int:
-        """Return the flat MPI rank for process coordinates."""
+        """Return the flat MPI rank for process coordinates.
+
+        Args:
+            proc_coord: Position on the process grid, one entry per axis.
+
+        Returns:
+            The rank at that position (row-major numbering).
+
+        Raises:
+            ValueError: If ``proc_coord`` does not have ``ndim`` entries.
+        """
         if len(proc_coord) != self.ndim:
             raise ValueError(f"Expected {self.ndim} process coordinates")
         strides = [math.prod(self.proc_sizes[i + 1 :]) for i in range(self.ndim)]
@@ -161,7 +230,20 @@ class DomainDecomposition:
         shape: tuple[int, ...],
         rank: int | None = None,
     ) -> list[tuple[int, int]]:
-        """Return global index bounds for one rank over a decomposed shape."""
+        """Return global index bounds for one rank over a decomposed shape.
+
+        Each axis is split as evenly as possible (see `split_array`).
+
+        Args:
+            shape: Global grid shape, one entry per axis.
+            rank: Flat MPI rank; default: this rank.
+
+        Returns:
+            One half-open ``(start, end)`` index range per axis.
+
+        Raises:
+            ValueError: If ``shape`` does not have ``ndim`` entries.
+        """
         if rank is None:
             rank = self.mpi_rank
         if len(shape) != self.ndim:
@@ -178,6 +260,14 @@ class DomainDecomposition:
 
         Process coordinate ``c`` owns ``[edges[c], edges[c + 1])``; the last one
         also owns ``upper``.  This is the split ``owner_rank_for_position`` uses.
+
+        Args:
+            dim: The axis.
+            lower: Lower end of the physical domain along ``dim``.
+            upper: Upper end of the physical domain along ``dim``.
+
+        Returns:
+            The subdomain edges, from ``lower`` to ``upper``.
         """
         num_procs = self.proc_sizes[dim]
         width = (upper - lower) / num_procs
@@ -189,7 +279,17 @@ class DomainDecomposition:
         lower_bound: tuple[float, ...],
         upper_bound: tuple[float, ...],
     ) -> tuple[tuple[float, ...], tuple[float, ...]]:
-        """Return the physical ``(lower, upper)`` corners of one rank's subdomain."""
+        """Return the physical ``(lower, upper)`` corners of one rank's subdomain.
+
+        Args:
+            rank: Flat MPI rank.
+            lower_bound: Lower corner of the physical domain.
+            upper_bound: Upper corner of the physical domain.
+
+        Returns:
+            The lower and upper corner of the rank's box, from the equal-width
+            split of `subdomain_edges`.
+        """
         proc_coord = self.get_proc_coord(rank)
         lower = []
         upper = []
@@ -209,7 +309,27 @@ class DomainDecomposition:
         num_gridpoints: tuple[int, ...],
         grid_spacing: Sequence[float] | np.ndarray | None = None,
     ) -> int:
-        """Return the rank owning a physical position in a decomposed grid."""
+        """Return the rank owning a physical position in a decomposed grid.
+
+        Ownership follows the equal-width split of `subdomain_edges`. A
+        position outside the domain belongs to the last rank along each axis
+        where it lies outside.
+
+        Args:
+            position: Physical coordinates, one per axis.
+            lower_bound: Lower corner of the physical domain.
+            upper_bound: Upper corner of the physical domain.
+            num_gridpoints: Number of grid points per axis.
+            grid_spacing: Grid spacing per axis; default: derived from the
+                bounds and ``num_gridpoints``.
+
+        Returns:
+            The flat rank of the owning process.
+
+        Raises:
+            ValueError: If the bounds or ``num_gridpoints`` do not have
+                ``ndim`` entries.
+        """
         if len(lower_bound) != self.ndim or len(upper_bound) != self.ndim:
             raise ValueError("Bounds must match decomposition dimensions")
         if len(num_gridpoints) != self.ndim:
@@ -245,7 +365,7 @@ class DomainDecomposition:
         return self.rank_from_proc_coord(tuple(proc_coord))
 
     @property
-    def comm(self) -> MPI.Comm | None:
+    def comm(self) -> Comm | None:
         """Return the MPI communicator."""
         return self._comm
 
@@ -296,7 +416,10 @@ class DomainDecomposition:
 
     @property
     def neighbour_ranks(self) -> list[tuple[int, int]]:
-        """Return neighboring MPI ranks."""
+        """Return the ``(left, right)`` neighbour ranks along each axis.
+
+        At a non-periodic wall the missing neighbour is ``MPI.PROC_NULL``.
+        """
         return self._neighbour_ranks
 
     @property
@@ -310,6 +433,14 @@ def get_proc_bounds(array_length: int, num_procs: int, rank: int) -> tuple[int, 
 
     The chunks are those of `split_array`; ``rank`` is the position along one
     axis of the process grid, not the flat MPI rank.
+
+    Args:
+        array_length: Number of points to split.
+        num_procs: Number of chunks.
+        rank: Index of the chunk, ``0 .. num_procs - 1``.
+
+    Returns:
+        The half-open index range ``[start, end)`` of the chunk.
     """
     counts = split_array(array_length, num_procs)
     start = int(counts[:rank].sum())
@@ -344,7 +475,7 @@ def calculate_neighbor_ranks(
     coords = [(rank // strides[i]) % proc_sizes[i] for i in range(ndim)]
 
     def shifted(dim: int, step: int) -> int:
-        """Return the rank one step along ``dim``, or ``PROC_NULL`` past a wall."""
+        """Return the rank ``step`` places along ``dim``, or ``PROC_NULL`` past a wall."""
         coord = coords[dim] + step
         if not 0 <= coord < proc_sizes[dim]:
             if not periodic[dim]:

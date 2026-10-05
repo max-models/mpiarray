@@ -21,7 +21,7 @@ pre-commit install
 ## Develop
 
 - Format and lint with [ruff](https://docs.astral.sh/ruff/); the pre-commit hooks run it for you.
-- Type-check with `pyright src/`.
+- Type-check with `pyright src/` and `ty check` (both run by `make lint`).
 - Add tests under `src/<package>/tests/` and run `pytest .`.
 - Every public module, class and function needs a Google-style docstring. They are rendered
   in the API reference and checked by ruff's `D` rules.
@@ -37,7 +37,7 @@ changelog and choose the next version.
 
 ## Pull requests
 
-Open the PR against `devel`. CI runs the tests on every supported Python version, ruff, pyright,
+Open the PR against `devel`. CI runs the tests on every supported Python version, ruff, pyright, ty,
 the tutorials and the documentation build. One approving review is required to merge.
 
 ## Releases

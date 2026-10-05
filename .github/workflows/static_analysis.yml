@@ -42,6 +42,22 @@ jobs:
       - name: Type check
         run: uv run pyright src/
 
+  ty:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install project
+        run: uv sync --extra dev
+
+      - name: Type check
+        run: uv run ty check --output-format github
+
   readme:
     runs-on: ubuntu-latest
     steps:
