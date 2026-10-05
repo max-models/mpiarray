@@ -4,10 +4,10 @@
   "include-component-in-tag": false,
   "packages": {
     ".": {
-      "package-name": "template-python",
+      "package-name": "mpiarray",
       "changelog-path": "CHANGELOG.md",
       "extra-files": [
-        "src/app/__init__.py",
+        "src/mpiarray/__init__.py",
         { "type": "generic", "path": "CITATION.cff" }
       ]
     }
