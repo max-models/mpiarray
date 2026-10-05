@@ -1086,6 +1086,7 @@ def test_host_staged_communication_matches_direct(tmp_path) -> None:
     from pathlib import Path
 
     src_dir = str(Path(__file__).resolve().parents[3])
+    pytest.importorskip("mpi4py", reason="needs mpi4py (the mpi extra)")
     launcher = shutil.which("mpiexec") or shutil.which("mpirun")
     if launcher is None:
         pytest.skip("needs mpiexec to start a 2-rank job")
