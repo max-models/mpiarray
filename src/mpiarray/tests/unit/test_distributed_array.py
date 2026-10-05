@@ -1034,6 +1034,182 @@ def test_ufunc_where_and_bad_out_arguments() -> None:
         np.add(darray, 1.0, out=np.zeros((3, 4)))
 
 
+# -------------------------------------------------------------------------- #
+# The rest of the API, on any number of ranks.
+
+
+def test_constructors_fill_storage_and_report_sizes() -> None:
+    """``data_local=``, ``full`` without a dtype, the ``data`` setter and byte sizes."""
+    probe = DistributedArray.zeros(shape=(5, 3), comm=comm, num_ghostpoints=1)
+    local = xp.full(probe.shape_with_halos, 2.5)
+    darray = DistributedArray(
+        shape=(5, 3), comm=comm, num_ghostpoints=1, data_local=local
+    )
+    np.testing.assert_array_equal(_as_numpy(darray.local_with_halos), _as_numpy(local))
+
+    ints = DistributedArray.full(shape=(5, 3), fill_value=7, comm=comm)
+    assert ints.dtype == xp.asarray(7).dtype
+    assert int(ints.sum()) == 7 * 15
+
+    global_data = np.arange(15.0).reshape(5, 3)
+    darray.data = xp.asarray(global_data)  # a global array, as in fill()
+    np.testing.assert_array_equal(darray.to_numpy(), global_data)
+    assert darray.itemsize == 8
+    assert darray.nbytes == 15 * 8
+
+
+def test_storage_errors() -> None:
+    darray = DistributedArray.zeros(shape=(4, 3), comm=comm, num_ghostpoints=1)
+    with pytest.raises(ValueError, match="dtype"):
+        darray.fill_local(xp.zeros(darray.shape_with_halos, dtype=np.int64))
+    with pytest.raises(ValueError, match="local data shape"):
+        darray._wrap_local(xp.zeros((1, 1)))
+    with pytest.raises(ValueError, match="Expected 2 indices, got 1"):
+        darray.global_to_local(1)
+    # out of range, so no rank owns it: the root raises after the gather
+    if darray.mpi_rank == 0:
+        with pytest.raises(ValueError, match="not found on any rank"):
+            darray.get_global_value((4, 0), root=0)
+    else:
+        assert darray.get_global_value((4, 0), root=0) is None
+
+
+def test_halo_methods_without_ghost_cells_change_nothing() -> None:
+    darray = DistributedArray.from_array(xp.arange(6.0), comm=comm, periodic=(True,))
+    before = _as_numpy(darray.local_with_halos).copy()
+    darray.fill_halos()
+    darray.exchange_halos()
+    darray.clear_halos(0)
+    np.testing.assert_array_equal(_as_numpy(darray.local_with_halos), before)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"shape": (4, 3, 1), "ndim": 3}, "Number of dimensions"),
+        ({"shape": (4, 3), "decompose": [False, False]}, "process layouts"),
+        ({"shape": (4, 3), "num_ghostpoints": 2}, "Halo widths"),
+        (
+            {"shape": (4, 3), "num_ghostpoints": 1, "ghost_axes": [True, False]},
+            "Halo axes",
+        ),
+    ],
+)
+def test_operands_with_another_layout_are_rejected(kwargs, message) -> None:
+    darray = DistributedArray.zeros(shape=(4, 3), comm=comm, num_ghostpoints=1)
+    other = DistributedArray.zeros(comm=comm, **{"num_ghostpoints": 1, **kwargs})
+    if message == "process layouts" and darray.proc_sizes == other.proc_sizes:
+        pytest.skip("on one rank every layout has the same process grid")
+    with pytest.raises(ValueError, match=message):
+        darray + other
+
+
+def test_min_and_max_reject_complex_values_on_every_rank() -> None:
+    """With more ranks than cells some ranks own nothing; all of them must raise.
+
+    Raising only on the empty ranks would leave the others waiting in allreduce.
+    """
+    darray = DistributedArray.zeros(shape=(1,), comm=comm, dtype=np.complex128)
+    for reduction in (darray.min, darray.max):
+        with pytest.raises(TypeError, match="min/max are not supported"):
+            reduction()
+
+
+@pytest.mark.parametrize("axis", [0, 1, (0, 1)])
+def test_reductions_along_an_axis_match_numpy(axis) -> None:
+    global_data = np.arange(1.0, 13.0).reshape(4, 3)
+    darray = DistributedArray.from_array(xp.asarray(global_data), comm=comm)
+    for name in ("sum", "prod", "min", "max", "mean", "var", "std", "all", "any"):
+        expected = getattr(np, name)(
+            global_data > 6 if name in ("all", "any") else global_data, axis=axis
+        )
+        operand = darray > 6 if name in ("all", "any") else darray
+        np.testing.assert_allclose(
+            _as_numpy(xp.asarray(getattr(operand, name)(axis=axis))), expected
+        )
+
+
+@pytest.mark.parametrize("ddof", [0, 1])
+def test_var_and_std_along_an_axis_pass_ddof(ddof: int) -> None:
+    global_data = np.arange(1.0, 13.0).reshape(4, 3) ** 2
+    darray = DistributedArray.from_array(xp.asarray(global_data), comm=comm)
+    for name in ("var", "std"):
+        result = getattr(darray, name)(axis=0, ddof=ddof)
+        expected = getattr(np, name)(global_data, axis=0, ddof=ddof)
+        np.testing.assert_allclose(_as_numpy(xp.asarray(result)), expected)
+
+
+def test_reflected_and_in_place_operators_match_numpy() -> None:
+    a = np.arange(1, 13).reshape(4, 3)
+    b = np.arange(12, 0, -1).reshape(4, 3)
+    da = DistributedArray.from_array(xp.asarray(a), comm=comm)
+    db = DistributedArray.from_array(xp.asarray(b), comm=comm)
+    cases = {
+        "a - b": (da - db, a - b),
+        "2 - a": (2 - da, 2 - a),
+        "3 * a": (3 * da, 3 * a),
+        "a / b": (da / db, a / b),
+        "1 / a": (1 / da, 1 / a),
+        "a // 4": (da // 4, a // 4),
+        "50 // a": (50 // da, 50 // a),
+        "a ** 2": (da**2, a**2),
+        "2 ** a": (2**da, 2**a),
+        "+a": (+da, +a),
+        "abs(-a)": (abs(-da), abs(-a)),
+        "a < b": (da < db, a < b),
+        "a <= b": (da <= db, a <= b),
+        "a == b": (da == db, a == b),
+        "a != b": (da != db, a != b),
+    }
+    for label, (result, expected) in cases.items():
+        assert isinstance(result, DistributedArray), label
+        np.testing.assert_allclose(result.to_numpy(), expected, err_msg=label)
+
+    c = da.copy()
+    c -= 1
+    c *= 2
+    np.testing.assert_array_equal(c.to_numpy(), (a - 1) * 2)
+    f = da.astype(float)
+    f /= 4
+    np.testing.assert_allclose(f.to_numpy(), a / 4)
+
+
+def test_array_protocol_and_ufunc_methods() -> None:
+    global_data = np.arange(6.0).reshape(2, 3)
+    darray = DistributedArray.from_array(xp.asarray(global_data), comm=comm)
+
+    as_int = darray.__array__(dtype=np.int32)
+    assert as_int.dtype == np.int32
+    np.testing.assert_array_equal(_as_numpy(as_int), global_data.astype(np.int32))
+    copied = darray.__array__(copy=True)
+    np.testing.assert_array_equal(_as_numpy(copied), global_data)
+    np.testing.assert_array_equal(_as_numpy(darray.__array__()), global_data)
+
+    quotient, remainder = np.divmod(darray, 4.0)  # a ufunc with two outputs
+    assert isinstance(quotient, DistributedArray)
+    np.testing.assert_array_equal(quotient.to_numpy(), global_data // 4.0)
+    np.testing.assert_array_equal(remainder.to_numpy(), global_data % 4.0)
+
+    with pytest.raises(TypeError):
+        np.add.reduce(darray)  # only plain ufunc calls are distributed
+
+
+def test_to_cupy(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+    from types import SimpleNamespace
+
+    darray = DistributedArray.from_array(xp.arange(4.0), comm=comm)
+    monkeypatch.setitem(sys.modules, "cupy", None)  # not installed
+    with pytest.raises(ImportError, match="requires CuPy"):
+        darray.to_cupy()
+    monkeypatch.setitem(
+        sys.modules, "cupy", SimpleNamespace(asarray=lambda a: ("cupy", a))
+    )
+    tag, gathered = darray.to_cupy()
+    assert tag == "cupy"
+    np.testing.assert_array_equal(_as_numpy(gathered), np.arange(4.0))
+
+
 _STAGING_SCRIPT = """
 import sys
 

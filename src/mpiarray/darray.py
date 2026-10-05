@@ -682,13 +682,17 @@ class DistributedArray(DomainDecomposition):
         decompositions that leave some ranks empty still reduce correctly.
         """
         is_extremum = mpi_op in (MPI.MIN, MPI.MAX)
-        if is_extremum and self.size == 0:
-            # Raised on every rank alike, so no rank is left waiting in allreduce.
-            raise ValueError("zero-size array has no minimum or maximum")
+        identity = None
+        if is_extremum:
+            # Errors are raised on every rank alike, so no rank is left waiting
+            # in allreduce: also the dtype check, before any rank skips it.
+            if self.size == 0:
+                raise ValueError("zero-size array has no minimum or maximum")
+            identity = self._extremum_identity(mpi_op)
 
         local_block = self._data[self.get_local_slices()]
         if is_extremum and local_block.size == 0:
-            local_value = self._extremum_identity(mpi_op)
+            local_value = identity
         else:
             # sum/prod of an empty block already return their neutral element.
             local_value = op(local_block, **op_kwargs)
@@ -922,7 +926,7 @@ class DistributedArray(DomainDecomposition):
                 self.to_ndarray(),
                 axis=axis,
                 dtype=dtype,
-                ddof=ddof,
+                correction=ddof,  # the array API name of numpy's ddof
                 keepdims=keepdims,
             )
         mean = self.mean(dtype=dtype)
