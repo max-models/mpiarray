@@ -28,6 +28,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
 
+      - name: Install MPI
+        run: sudo apt-get update && sudo apt-get install -y libopenmpi-dev openmpi-bin
+
       - name: Install project
         run: |
           uv sync --extra docs

@@ -28,11 +28,20 @@ jobs:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
 
+      - name: Install MPI
+        run: sudo apt-get update && sudo apt-get install -y libopenmpi-dev openmpi-bin
+
       - name: Install project
         run: uv sync --extra test
 
       - name: Run tests with coverage
         run: uv run pytest --cov --cov-report=xml --cov-report=term .
+
+      # some tests only run on exactly 2 or 6 ranks; the staging test starts its own 2-rank job
+      - name: Run tests under MPI
+        run: |
+          mpiexec -n 2 --oversubscribe .venv/bin/python -m pytest -q -p no:cacheprovider .
+          mpiexec -n 6 --oversubscribe .venv/bin/python -m pytest -q -p no:cacheprovider .
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
