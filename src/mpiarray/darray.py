@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Any, TypeAlias, cast
+from types import EllipsisType, NotImplementedType
+from typing import TYPE_CHECKING, Any, TypeAlias, TypeGuard, cast
 
 import cunumpy as xp
 import numpy as np
 from numpy.typing import DTypeLike
 
-from mpiarray.domain_decomposition import DomainDecomposition
+from mpiarray.domain_decomposition import Comm, DomainDecomposition
 
 if TYPE_CHECKING:
     from mpi4py import MPI
@@ -22,7 +23,10 @@ else:
 # A NumPy or CuPy array.
 Array: TypeAlias = Any
 Number: TypeAlias = int | float
-IndexLike: TypeAlias = int | slice | tuple[int | slice, ...]
+# One entry of an index: basic (int, slice, Ellipsis, None) or advanced (an
+# integer or boolean array, NumPy or CuPy).
+IndexItem: TypeAlias = int | np.integer | slice | EllipsisType | None | Array
+IndexLike: TypeAlias = IndexItem | tuple[IndexItem, ...]
 # Scalar returned by a global reduction (numpy/cupy scalar, Python number or bool).
 Scalar = Any
 
@@ -32,14 +36,34 @@ _EXCHANGE_TAG = 1000
 
 
 class DistributedArray(DomainDecomposition):
-    """Represent an MPI-distributed array with optional halo cells."""
+    """Represent an MPI-distributed array with optional halo cells.
+
+    Each rank stores the block of the global array it owns (see
+    `DomainDecomposition.get_index_bounds`), padded with ``num_ghostpoints``
+    ghost cells on both sides of every ghost axis. Elementwise operations run
+    on the local storage without communication; reductions, gathers and halo
+    exchanges are collective.
+
+    Args:
+        shape: Global array shape.
+            comm: Communicator to decompose over, or ``None`` for a serial array.
+            num_ghostpoints: Width of the ghost (halo) frame on each side.
+            ghost_axes: Which axes carry ghost cells; default: all.
+            decompose: Which axes may be split over ranks; default: all.
+            dim_order: Which axis gets the most ranks; see `DomainDecomposition`.
+            periodic: Which axes wrap around in halo exchanges; default: none.
+            ndim: Number of axes; default: ``len(shape)``.
+        data: Global array to fill from, the same on every rank.
+        data_local: Local storage to fill from, halo cells included.
+        dtype: Element type.
+    """
 
     __array_priority__ = 1000
 
     def __init__(
         self,
         shape: tuple[int, ...],
-        comm: MPI.Comm | None,
+        comm: Comm | None,
         data: Array | None = None,
         data_local: Array | None = None,
         num_ghostpoints: int = 0,
@@ -90,7 +114,7 @@ class DistributedArray(DomainDecomposition):
             self.fill_local(data=data_local)
 
     @property
-    def _distributed_comm(self) -> MPI.Comm:
+    def _distributed_comm(self) -> Comm:
         """Return the communicator of a distributed array (never ``None`` there)."""
         assert self.comm is not None
         return self.comm
@@ -105,14 +129,28 @@ class DistributedArray(DomainDecomposition):
         return self.comm is not None and self.mpi_size > 1 and not self.replicated
 
     # Narrower than DomainDecomposition.get_index_bounds: the shape is this array's.
-    def get_index_bounds(  # pyright: ignore[reportIncompatibleMethodOverride]
+    def get_index_bounds(  # pyright: ignore[reportIncompatibleMethodOverride]  # ty: ignore[invalid-method-override]
         self, rank: int | None = None
     ) -> list[tuple[int, int]]:
-        """Return the global ``(start, end)`` index bounds owned by ``rank``."""
+        """Return the global ``(start, end)`` index bounds owned by ``rank``.
+
+        Args:
+            rank: Flat MPI rank; default: this rank.
+
+        Returns:
+            One half-open index range per axis.
+        """
         return super().get_index_bounds(self.shape, rank)
 
     def get_shape_local(self, rank: int | None = None) -> tuple[int, ...]:
-        """Return the interior array shape owned by ``rank``."""
+        """Return the interior array shape owned by ``rank``.
+
+        Args:
+            rank: Flat MPI rank; default: this rank.
+
+        Returns:
+            The shape of the rank's block, without halo cells.
+        """
         return tuple(end - start for start, end in self.get_index_bounds(rank))
 
     def _wrap_local(self, data: Array) -> Self:
@@ -133,14 +171,14 @@ class DistributedArray(DomainDecomposition):
         return result
 
     def copy(self) -> Self:
-        """Return a copy of this object."""
+        """Return an independent copy with the same layout, halo cells included."""
         return self._wrap_local(self._data.copy())
 
     @classmethod
     def empty(
         cls,
         shape: tuple[int, ...],
-        comm: MPI.Comm | None,
+        comm: Comm | None,
         num_ghostpoints: int = 0,
         ghost_axes: list[bool] | None = None,
         decompose: list[bool] | None = None,
@@ -149,7 +187,22 @@ class DistributedArray(DomainDecomposition):
         ndim: int | None = None,
         dtype: DTypeLike = float,
     ) -> Self:
-        """Create an uninitialized distributed array."""
+        """Create an uninitialized distributed array.
+
+        Args:
+            shape: Global array shape.
+            comm: Communicator to decompose over, or ``None`` for a serial array.
+            num_ghostpoints: Width of the ghost (halo) frame on each side.
+            ghost_axes: Which axes carry ghost cells; default: all.
+            decompose: Which axes may be split over ranks; default: all.
+            dim_order: Which axis gets the most ranks; see `DomainDecomposition`.
+            periodic: Which axes wrap around in halo exchanges; default: none.
+            ndim: Number of axes; default: ``len(shape)``.
+            dtype: Element type.
+
+        Returns:
+            A new array; the values, halo cells included, are undefined.
+        """
         result = cls(
             shape=shape,
             comm=comm,
@@ -168,7 +221,7 @@ class DistributedArray(DomainDecomposition):
     def zeros(
         cls,
         shape: tuple[int, ...],
-        comm: MPI.Comm | None,
+        comm: Comm | None,
         num_ghostpoints: int = 0,
         ghost_axes: list[bool] | None = None,
         decompose: list[bool] | None = None,
@@ -177,7 +230,22 @@ class DistributedArray(DomainDecomposition):
         ndim: int | None = None,
         dtype: DTypeLike = float,
     ) -> Self:
-        """Create a distributed array filled with zeros."""
+        """Create a distributed array filled with zeros.
+
+        Args:
+            shape: Global array shape.
+            comm: Communicator to decompose over, or ``None`` for a serial array.
+            num_ghostpoints: Width of the ghost (halo) frame on each side.
+            ghost_axes: Which axes carry ghost cells; default: all.
+            decompose: Which axes may be split over ranks; default: all.
+            dim_order: Which axis gets the most ranks; see `DomainDecomposition`.
+            periodic: Which axes wrap around in halo exchanges; default: none.
+            ndim: Number of axes; default: ``len(shape)``.
+            dtype: Element type.
+
+        Returns:
+            A new array of zeros, halo cells included.
+        """
         return cls(
             shape=shape,
             comm=comm,
@@ -195,7 +263,7 @@ class DistributedArray(DomainDecomposition):
         cls,
         shape: tuple[int, ...],
         fill_value: Number,
-        comm: MPI.Comm | None,
+        comm: Comm | None,
         num_ghostpoints: int = 0,
         ghost_axes: list[bool] | None = None,
         decompose: list[bool] | None = None,
@@ -204,7 +272,23 @@ class DistributedArray(DomainDecomposition):
         ndim: int | None = None,
         dtype: DTypeLike | None = None,
     ) -> Self:
-        """Create a distributed array filled with a scalar value."""
+        """Create a distributed array filled with a scalar value.
+
+        Args:
+            shape: Global array shape.
+            fill_value: Value of every element, halo cells included.
+            comm: Communicator to decompose over, or ``None`` for a serial array.
+            num_ghostpoints: Width of the ghost (halo) frame on each side.
+            ghost_axes: Which axes carry ghost cells; default: all.
+            decompose: Which axes may be split over ranks; default: all.
+            dim_order: Which axis gets the most ranks; see `DomainDecomposition`.
+            periodic: Which axes wrap around in halo exchanges; default: none.
+            ndim: Number of axes; default: ``len(shape)``.
+            dtype: Element type; default: that of ``fill_value``.
+
+        Returns:
+            A new array.
+        """
         if dtype is None:
             dtype = xp.asarray(fill_value).dtype
         result = cls.zeros(
@@ -225,7 +309,7 @@ class DistributedArray(DomainDecomposition):
     def ones(
         cls,
         shape: tuple[int, ...],
-        comm: MPI.Comm | None,
+        comm: Comm | None,
         num_ghostpoints: int = 0,
         ghost_axes: list[bool] | None = None,
         decompose: list[bool] | None = None,
@@ -234,7 +318,22 @@ class DistributedArray(DomainDecomposition):
         ndim: int | None = None,
         dtype: DTypeLike = float,
     ) -> Self:
-        """Create a distributed array filled with ones."""
+        """Create a distributed array filled with ones.
+
+        Args:
+            shape: Global array shape.
+            comm: Communicator to decompose over, or ``None`` for a serial array.
+            num_ghostpoints: Width of the ghost (halo) frame on each side.
+            ghost_axes: Which axes carry ghost cells; default: all.
+            decompose: Which axes may be split over ranks; default: all.
+            dim_order: Which axis gets the most ranks; see `DomainDecomposition`.
+            periodic: Which axes wrap around in halo exchanges; default: none.
+            ndim: Number of axes; default: ``len(shape)``.
+            dtype: Element type.
+
+        Returns:
+            A new array of ones, halo cells included.
+        """
         return cls.full(
             shape=shape,
             fill_value=1,
@@ -252,7 +351,7 @@ class DistributedArray(DomainDecomposition):
     def from_array(
         cls,
         data: Array,
-        comm: MPI.Comm | None,
+        comm: Comm | None,
         num_ghostpoints: int = 0,
         ghost_axes: list[bool] | None = None,
         decompose: list[bool] | None = None,
@@ -261,7 +360,24 @@ class DistributedArray(DomainDecomposition):
         ndim: int | None = None,
         dtype: DTypeLike | None = None,
     ) -> Self:
-        """Create a distributed array from a global ndarray."""
+        """Create a distributed array from a global ndarray.
+
+        Every rank passes the same global array and keeps the block it owns.
+
+        Args:
+            data: The global array.
+            comm: Communicator to decompose over, or ``None`` for a serial array.
+            num_ghostpoints: Width of the ghost (halo) frame on each side.
+            ghost_axes: Which axes carry ghost cells; default: all.
+            decompose: Which axes may be split over ranks; default: all.
+            dim_order: Which axis gets the most ranks; see `DomainDecomposition`.
+            periodic: Which axes wrap around in halo exchanges; default: none.
+            ndim: Number of axes; default: ``len(shape)``.
+            dtype: Element type; default: that of ``data``.
+
+        Returns:
+            A new array with zero halo cells.
+        """
         data = xp.asarray(data, dtype=dtype)
         return cls(
             shape=data.shape,
@@ -277,7 +393,14 @@ class DistributedArray(DomainDecomposition):
         )
 
     def fill_local(self, data: Array) -> None:
-        """Fill the local storage (including halo cells) from local data."""
+        """Fill the local storage (including halo cells) from local data.
+
+        Args:
+            data: This rank's storage, of shape `shape_with_halos`.
+
+        Raises:
+            ValueError: If the dtype or the shape does not match.
+        """
         if data.dtype != self.dtype:
             raise ValueError(f"dtype {data.dtype} does not match {self.dtype}")
         if data.shape != self.data.shape:
@@ -291,7 +414,14 @@ class DistributedArray(DomainDecomposition):
         return tuple(slice(start, end) for start, end in self.get_index_bounds(rank))
 
     def fill(self, data: Array) -> None:
-        """Fill the distributed array from global data; halo cells are zeroed."""
+        """Fill the distributed array from global data; halo cells are zeroed.
+
+        Args:
+            data: The global array, the same on every rank.
+
+        Raises:
+            ValueError: If the dtype or the shape does not match.
+        """
         if data.dtype != self.dtype:
             raise ValueError(f"dtype {data.dtype} does not match {self.dtype}")
         if data.shape != self.shape:
@@ -302,7 +432,12 @@ class DistributedArray(DomainDecomposition):
         self._data[self.get_local_slices()] = data[self._global_slices()]
 
     def get_local_slices(self) -> tuple[slice, ...]:
-        """Return slices selecting the local interior region."""
+        """Return slices selecting the local interior region.
+
+        Returns:
+            An index into the local storage (`data`) that selects the cells
+            this rank owns, without halo cells.
+        """
         g = self.num_ghostpoints
         if g == 0:
             return (slice(None),) * self.ndim
@@ -326,7 +461,13 @@ class DistributedArray(DomainDecomposition):
         return self._data
 
     def to_ndarray(self) -> Array:
-        """Gather the distributed array into a global ndarray on every rank."""
+        """Gather the distributed array into a global ndarray on every rank.
+
+        This is collective (an ``Allgatherv``). Halo cells are not included.
+
+        Returns:
+            The global array, a NumPy or CuPy array as the backend selects.
+        """
         if not self.is_distributed:
             return self._data[self.get_local_slices()].copy()
 
@@ -397,7 +538,10 @@ class DistributedArray(DomainDecomposition):
         is added to the left neighbour's upper interior, the upper halo to the
         right neighbour's lower interior. Halos along ``dim`` are zeroed
         afterwards. At physical (non-periodic) boundaries the halo values are
-        discarded.
+        discarded. Collective.
+
+        Args:
+            dim: The axis to exchange along.
         """
         if self.num_ghostpoints == 0 or not self.ghost_axes[dim]:
             return
@@ -438,7 +582,11 @@ class DistributedArray(DomainDecomposition):
         self.clear_halos(dim)
 
     def clear_halos(self, dim: int) -> None:
-        """Reset halo cells along ``dim`` to zero."""
+        """Reset halo cells along ``dim`` to zero.
+
+        Args:
+            dim: The axis whose ghost cells are cleared.
+        """
         if self.num_ghostpoints == 0 or not self.ghost_axes[dim]:
             return
         regions = self._halo_regions(dim)
@@ -446,7 +594,7 @@ class DistributedArray(DomainDecomposition):
         self._data[regions["upper_halo"]] = 0
 
     def exchange_halos(self) -> None:
-        """Accumulate halo cells into neighbouring interiors in all dimensions."""
+        """Accumulate halo cells into neighbouring interiors in all dimensions (collective)."""
         if self.num_ghostpoints == 0:
             return
         for dim in range(self.ndim):
@@ -464,6 +612,10 @@ class DistributedArray(DomainDecomposition):
 
         At physical domain boundaries (PROC_NULL neighbours) the ghost cells
         are left unchanged (typically 0, which encodes a homogeneous Dirichlet BC).
+        Collective.
+
+        Args:
+            dim: The axis to fill along.
         """
         if self.num_ghostpoints == 0 or not self.ghost_axes[dim]:
             return
@@ -502,7 +654,7 @@ class DistributedArray(DomainDecomposition):
             self._data[regions["upper_halo"]] = recv
 
     def fill_halos(self) -> None:
-        """Fill ghost cells from neighbouring ranks in all dimensions."""
+        """Fill ghost cells from neighbouring ranks in all dimensions (collective)."""
         if self.num_ghostpoints == 0:
             return
         for dim in range(self.ndim):
@@ -513,7 +665,15 @@ class DistributedArray(DomainDecomposition):
     ) -> tuple[int, ...] | None:
         """Convert a global index to a local one (including the ghost offset).
 
-        Returns ``None`` if this rank does not own the index.
+        Args:
+            global_idx: One integer per axis; negative values count from the end.
+
+        Returns:
+            The index into the local storage (`data`), or ``None`` if this rank
+            does not own the element.
+
+        Raises:
+            ValueError: If ``global_idx`` does not have ``ndim`` entries.
         """
         if not isinstance(global_idx, tuple):
             global_idx = (global_idx,)
@@ -539,7 +699,15 @@ class DistributedArray(DomainDecomposition):
     ) -> Scalar | None:
         """Return the value at global index ``index`` on ``root`` (collective).
 
-        Non-root ranks return ``None``.
+        Args:
+            index: One integer per axis.
+            root: The rank that receives the value.
+
+        Returns:
+            The element on ``root``; ``None`` on the other ranks.
+
+        Raises:
+            ValueError: On ``root``, if no rank owns ``index``.
         """
         local_idx = self.global_to_local(index)
         local_value = None if local_idx is None else self.data[local_idx]
@@ -573,7 +741,7 @@ class DistributedArray(DomainDecomposition):
         if self.ghost_axes != other.ghost_axes:
             raise ValueError("Halo axes must match")
 
-    def _new_like(self, data_local: Array, dtype: type | None = None) -> Self:
+    def _new_like(self, data_local: Array, dtype: DTypeLike | None = None) -> Self:
         """Create a distributed array with matching layout from local storage data."""
         data = xp.asarray(data_local, dtype=dtype)
         if xp.may_share_memory(data, self._data):
@@ -780,18 +948,31 @@ class DistributedArray(DomainDecomposition):
         """Return this rank global index bounds."""
         return self._proc_index_bounds
 
-    def astype(self, dtype: type, copy: bool = True) -> Self:
-        """Return this distributed array with a different dtype."""
+    def astype(self, dtype: DTypeLike, copy: bool = True) -> Self:
+        """Return this distributed array with a different dtype.
+
+        Args:
+            dtype: The new element type.
+            copy: If ``False`` and ``dtype`` is already the array's, return the
+                array itself instead of a copy.
+
+        Returns:
+            An array with the same layout, halo cells included.
+        """
         if not copy and xp.dtype(dtype) == self.dtype:
             return self
         return self._wrap_local(self.data.astype(dtype))
 
     def to_numpy(self) -> np.ndarray:
-        """Gather and return the global array as a ``numpy.ndarray``."""
+        """Gather and return the global array as a ``numpy.ndarray`` (collective)."""
         return xp.to_numpy(self.to_ndarray())
 
     def to_cupy(self) -> Array:
-        """Gather and return the global array as a ``cupy.ndarray``."""
+        """Gather and return the global array as a ``cupy.ndarray`` (collective).
+
+        Raises:
+            ImportError: If CuPy is not installed.
+        """
         try:
             import cupy as cp  # pyright: ignore[reportMissingImports]
         except ImportError as exc:
@@ -802,8 +983,19 @@ class DistributedArray(DomainDecomposition):
 
         return cp.asarray(self.to_ndarray())
 
-    def __array__(self, dtype: type | None = None, copy: bool | None = None) -> Array:
-        """Return a gathered global ndarray for NumPy interoperability."""
+    def __array__(
+        self, dtype: DTypeLike | None = None, copy: bool | None = None
+    ) -> Array:
+        """Return a gathered global ndarray for NumPy interoperability (collective).
+
+        Args:
+            dtype: Convert to this element type.
+            copy: Whether to copy; the gathered array is always new, so only
+                ``True`` with a ``dtype`` makes a difference.
+
+        Returns:
+            The global array.
+        """
         array = self.to_ndarray()
         if dtype is not None:
             return array.astype(dtype, copy=False if copy is None else copy)
@@ -811,11 +1003,23 @@ class DistributedArray(DomainDecomposition):
             return array.copy()
         return array
 
-    def __array_ufunc__(self, ufunc: Any, method: str, *inputs: Any, **kwargs: Any):
+    def __array_ufunc__(
+        self, ufunc: np.ufunc, method: str, *inputs: Any, **kwargs: Any
+    ) -> DistributedArray | tuple[DistributedArray, ...] | NotImplementedType:
         """Apply NumPy/CuPy ufuncs elementwise to local storage.
 
         ``out=`` accepts distributed arrays with the same layout and writes in
         place, so ``np.multiply(a, 2.0, out=a)`` allocates nothing.
+
+        Args:
+            ufunc: The ufunc being called.
+            method: How it is called; only ``"__call__"`` is supported.
+            *inputs: The operands; see `_coerce_other_data` for the accepted ones.
+            **kwargs: Keyword arguments of the ufunc, ``out`` and ``where`` included.
+
+        Returns:
+            A `DistributedArray` (a tuple for ufuncs with several outputs), or
+            ``NotImplemented`` for other methods or a non-distributed ``out``.
         """
         if method != "__call__":
             return NotImplemented
@@ -850,7 +1054,24 @@ class DistributedArray(DomainDecomposition):
         out: None = None,
         keepdims: bool = False,
     ) -> Scalar | Array:
-        """Sum array values globally, or along an axis on the gathered array."""
+        """Sum array values globally, or along an axis on the gathered array.
+
+        Collective: every rank must call it. Halo cells are not included.
+
+        Args:
+            axis: Axis or axes to reduce along on the gathered array; ``None``
+                reduces the whole array without gathering.
+            dtype: Type of the accumulator and the result.
+            out: Not supported; must be ``None``.
+            keepdims: Keep the reduced axes with length one.
+
+        Returns:
+            With ``axis=None``, a scalar, the same on every rank; otherwise a
+            NumPy or CuPy array on every rank.
+
+        Raises:
+            TypeError: If ``out`` is given.
+        """
         self._reject_out(out)
         if axis is None:
             value = self._global_reduction(xp.sum, MPI.SUM, dtype=dtype)
@@ -864,7 +1085,24 @@ class DistributedArray(DomainDecomposition):
         out: None = None,
         keepdims: bool = False,
     ) -> Scalar | Array:
-        """Multiply array values globally, or along an axis on the gathered array."""
+        """Multiply array values globally, or along an axis on the gathered array.
+
+        Collective: every rank must call it. Halo cells are not included.
+
+        Args:
+            axis: Axis or axes to reduce along on the gathered array; ``None``
+                reduces the whole array without gathering.
+            dtype: Type of the accumulator and the result.
+            out: Not supported; must be ``None``.
+            keepdims: Keep the reduced axes with length one.
+
+        Returns:
+            With ``axis=None``, a scalar, the same on every rank; otherwise a
+            NumPy or CuPy array on every rank.
+
+        Raises:
+            TypeError: If ``out`` is given.
+        """
         self._reject_out(out)
         if axis is None:
             value = self._global_reduction(xp.prod, MPI.PROD, dtype=dtype)
@@ -877,7 +1115,24 @@ class DistributedArray(DomainDecomposition):
         out: None = None,
         keepdims: bool = False,
     ) -> Scalar | Array:
-        """Return the minimum globally, or along an axis on the gathered array."""
+        """Return the minimum globally, or along an axis on the gathered array.
+
+        Collective: every rank must call it. Halo cells are not included.
+
+        Args:
+            axis: Axis or axes to reduce along on the gathered array; ``None``
+                reduces the whole array without gathering.
+            out: Not supported; must be ``None``.
+            keepdims: Keep the reduced axes with length one.
+
+        Returns:
+            With ``axis=None``, a scalar, the same on every rank; otherwise a
+            NumPy or CuPy array on every rank.
+
+        Raises:
+            TypeError: If ``out`` is given.
+            ValueError: If the array has no elements.
+        """
         self._reject_out(out)
         if axis is None:
             value = self._global_reduction(xp.min, MPI.MIN)
@@ -890,7 +1145,24 @@ class DistributedArray(DomainDecomposition):
         out: None = None,
         keepdims: bool = False,
     ) -> Scalar | Array:
-        """Return the maximum globally, or along an axis on the gathered array."""
+        """Return the maximum globally, or along an axis on the gathered array.
+
+        Collective: every rank must call it. Halo cells are not included.
+
+        Args:
+            axis: Axis or axes to reduce along on the gathered array; ``None``
+                reduces the whole array without gathering.
+            out: Not supported; must be ``None``.
+            keepdims: Keep the reduced axes with length one.
+
+        Returns:
+            With ``axis=None``, a scalar, the same on every rank; otherwise a
+            NumPy or CuPy array on every rank.
+
+        Raises:
+            TypeError: If ``out`` is given.
+            ValueError: If the array has no elements.
+        """
         self._reject_out(out)
         if axis is None:
             value = self._global_reduction(xp.max, MPI.MAX)
@@ -904,7 +1176,24 @@ class DistributedArray(DomainDecomposition):
         out: None = None,
         keepdims: bool = False,
     ) -> Scalar | Array:
-        """Return the mean globally, or along an axis on the gathered array."""
+        """Return the mean globally, or along an axis on the gathered array.
+
+        Collective: every rank must call it. Halo cells are not included.
+
+        Args:
+            axis: Axis or axes to reduce along on the gathered array; ``None``
+                reduces the whole array without gathering.
+            dtype: Type of the accumulator and the result.
+            out: Not supported; must be ``None``.
+            keepdims: Keep the reduced axes with length one.
+
+        Returns:
+            With ``axis=None``, a scalar, the same on every rank; otherwise a
+            NumPy or CuPy array on every rank.
+
+        Raises:
+            TypeError: If ``out`` is given.
+        """
         self._reject_out(out)
         if axis is None:
             value = self.sum(dtype=dtype) / self.size
@@ -919,7 +1208,25 @@ class DistributedArray(DomainDecomposition):
         ddof: int = 0,
         keepdims: bool = False,
     ) -> Scalar | Array:
-        """Return the variance globally, or along an axis on the gathered array."""
+        """Return the variance globally, or along an axis on the gathered array.
+
+        Collective: every rank must call it. Halo cells are not included.
+
+        Args:
+            axis: Axis or axes to reduce along on the gathered array; ``None``
+                reduces the whole array without gathering.
+            dtype: Type of the accumulator and the result.
+            out: Not supported; must be ``None``.
+            ddof: Delta degrees of freedom; the divisor is ``size - ddof``.
+            keepdims: Keep the reduced axes with length one.
+
+        Returns:
+            With ``axis=None``, a scalar, the same on every rank; otherwise a
+            NumPy or CuPy array on every rank.
+
+        Raises:
+            TypeError: If ``out`` is given.
+        """
         self._reject_out(out)
         if axis is not None:
             return xp.var(
@@ -943,7 +1250,25 @@ class DistributedArray(DomainDecomposition):
         ddof: int = 0,
         keepdims: bool = False,
     ) -> Scalar | Array:
-        """Return the standard deviation globally, or along an axis."""
+        """Return the standard deviation globally, or along an axis.
+
+        Collective: every rank must call it. Halo cells are not included.
+
+        Args:
+            axis: Axis or axes to reduce along on the gathered array; ``None``
+                reduces the whole array without gathering.
+            dtype: Type of the accumulator and the result.
+            out: Not supported; must be ``None``.
+            ddof: Delta degrees of freedom; the divisor is ``size - ddof``.
+            keepdims: Keep the reduced axes with length one.
+
+        Returns:
+            With ``axis=None``, a scalar, the same on every rank; otherwise a
+            NumPy or CuPy array on every rank.
+
+        Raises:
+            TypeError: If ``out`` is given.
+        """
         return xp.sqrt(
             self.var(axis=axis, dtype=dtype, out=out, ddof=ddof, keepdims=keepdims),
         )
@@ -954,7 +1279,23 @@ class DistributedArray(DomainDecomposition):
         out: None = None,
         keepdims: bool = False,
     ) -> bool | Array:
-        """Return whether all values are true."""
+        """Return whether all values are true.
+
+        Collective: every rank must call it. Halo cells are not included.
+
+        Args:
+            axis: Axis or axes to reduce along on the gathered array; ``None``
+                reduces the whole array without gathering.
+            out: Not supported; must be ``None``.
+            keepdims: Keep the reduced axes with length one.
+
+        Returns:
+            With ``axis=None``, a scalar, the same on every rank; otherwise a
+            NumPy or CuPy array on every rank.
+
+        Raises:
+            TypeError: If ``out`` is given.
+        """
         self._reject_out(out)
         if axis is None:
             local_value = bool(xp.all(self._data[self.get_local_slices()]))
@@ -968,7 +1309,23 @@ class DistributedArray(DomainDecomposition):
         out: None = None,
         keepdims: bool = False,
     ) -> bool | Array:
-        """Return whether any value is true."""
+        """Return whether any value is true.
+
+        Collective: every rank must call it. Halo cells are not included.
+
+        Args:
+            axis: Axis or axes to reduce along on the gathered array; ``None``
+                reduces the whole array without gathering.
+            out: Not supported; must be ``None``.
+            keepdims: Keep the reduced axes with length one.
+
+        Returns:
+            With ``axis=None``, a scalar, the same on every rank; otherwise a
+            NumPy or CuPy array on every rank.
+
+        Raises:
+            TypeError: If ``out`` is given.
+        """
         self._reject_out(out)
         if axis is None:
             local_value = bool(xp.any(self._data[self.get_local_slices()]))
@@ -980,6 +1337,17 @@ class DistributedArray(DomainDecomposition):
         """Return ``sum(conj(self) * other)`` over the whole array, on every rank.
 
         Like ``numpy.vdot`` on the gathered arrays; halo cells are excluded.
+        Collective.
+
+        Args:
+            other: An array with the same layout.
+
+        Returns:
+            The inner product, the same on every rank.
+
+        Raises:
+            TypeError: If ``other`` is not a `DistributedArray`.
+            ValueError: If the layouts differ.
         """
         if not isinstance(other, DistributedArray):
             raise TypeError("vdot needs another DistributedArray")
@@ -990,7 +1358,17 @@ class DistributedArray(DomainDecomposition):
     def norm(self, ord: float = 2) -> float:
         """Return the vector norm of the whole array, on every rank.
 
-        ``ord`` is 2 (Euclidean), 1 or ``numpy.inf``; halo cells are excluded.
+        Halo cells are excluded. Collective.
+
+        Args:
+            ord: 2 (Euclidean), 1 (sum of absolute values) or ``numpy.inf``
+                (largest absolute value).
+
+        Returns:
+            The norm, the same on every rank.
+
+        Raises:
+            ValueError: For any other ``ord``.
         """
         if ord == 2:
             return float(xp.sqrt(xp.real(self.vdot(self))))
@@ -1004,7 +1382,7 @@ class DistributedArray(DomainDecomposition):
 
     def reduce_across_ranks(
         self,
-        comm: MPI.Comm | None = None,
+        comm: Comm | None = None,
         op: MPI.Op = MPI.SUM,
     ) -> None:
         """Combine every rank's copy of this array in place, halo cells included.
@@ -1014,6 +1392,14 @@ class DistributedArray(DomainDecomposition):
         defaults to the array's communicator; pass the particle partition's
         communicator when the array itself was created without one. This is a
         collective call on ``comm`` and a no-op on a single rank.
+
+        Args:
+            comm: Communicator over which to combine; default: the array's.
+            op: The MPI reduction operation.
+
+        Raises:
+            ValueError: If the array is decomposed over ``comm``, so that the
+                ranks hold different blocks rather than copies.
         """
         if comm is None:
             comm = self.comm
@@ -1043,7 +1429,8 @@ class DistributedArray(DomainDecomposition):
         """
         items = index if isinstance(index, tuple) else (index,)
 
-        def is_int(item: Any) -> bool:
+        def is_int(item: object) -> TypeGuard[int | np.integer]:
+            """Return whether ``item`` is an integer index (not a bool)."""
             return isinstance(item, int | np.integer) and not isinstance(
                 item, bool | np.bool_
             )
@@ -1123,6 +1510,12 @@ class DistributedArray(DomainDecomposition):
         An integer per axis returns the value on the owning rank and ``None``
         elsewhere (no communication). Any other index gathers the whole array
         and is therefore collective.
+
+        Args:
+            index: A global index, as for a NumPy array of shape `shape`.
+
+        Returns:
+            The element or the selection, as described above.
         """
         basic = self._normalize_basic_index(index)
         if basic is not None and all(isinstance(item, int) for item in basic):
@@ -1137,6 +1530,10 @@ class DistributedArray(DomainDecomposition):
         cells it owns, without communication; ``value`` must be identical on
         every rank. Advanced indices (arrays, masks) gather the whole array,
         are collective, and zero the halo cells.
+
+        Args:
+            index: A global index, as for a NumPy array of shape `shape`.
+            value: The value to write, broadcast to the selection.
         """
         basic = self._normalize_basic_index(index)
         if basic is not None:
@@ -1234,11 +1631,11 @@ class DistributedArray(DomainDecomposition):
         """Compare elementwise."""
         return self._binary_op(other, xp.less_equal)
 
-    def __eq__(self, other: object) -> Self:  # pyright: ignore[reportIncompatibleMethodOverride]
+    def __eq__(self, other: object) -> Self:  # pyright: ignore[reportIncompatibleMethodOverride]  # ty: ignore[invalid-method-override]
         """Compare elementwise for equality."""
         return self._binary_op(other, xp.equal)
 
-    def __ne__(self, other: object) -> Self:  # pyright: ignore[reportIncompatibleMethodOverride]
+    def __ne__(self, other: object) -> Self:  # pyright: ignore[reportIncompatibleMethodOverride]  # ty: ignore[invalid-method-override]
         """Compare elementwise for inequality."""
         return self._binary_op(other, xp.not_equal)
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import math
+from typing import TYPE_CHECKING, cast
 
 import cunumpy as xp
 import numpy as np
@@ -16,6 +17,9 @@ from mpiarray import (
     get_proc_bounds,
     split_array,
 )
+
+if TYPE_CHECKING:
+    from mpiarray.domain_decomposition import Comm
 
 MPI = xp.mpi.get_mpi()
 
@@ -136,9 +140,14 @@ class FakeComm:
         return self.rank
 
 
+def fake_comm(size: int, rank: int) -> Comm:
+    """Return a `FakeComm`, typed as the communicator it stands in for."""
+    return cast("Comm", FakeComm(size, rank))
+
+
 def _layouts(nprocs: int, **kwargs) -> list[DomainDecomposition]:
     """Return the layout seen by every rank of an ``nprocs``-rank communicator."""
-    return [DomainDecomposition(FakeComm(nprocs, r), **kwargs) for r in range(nprocs)]
+    return [DomainDecomposition(fake_comm(nprocs, r), **kwargs) for r in range(nprocs)]
 
 
 @pytest.mark.parametrize(
@@ -216,18 +225,18 @@ def test_layouts_agree_across_ranks(nprocs: int, periodic) -> None:
 
 
 def test_layout_with_dim_order_on_six_ranks() -> None:
-    layout = DomainDecomposition(FakeComm(6, 0), decompose=[True, True, True])
+    layout = DomainDecomposition(fake_comm(6, 0), decompose=[True, True, True])
     assert layout.proc_sizes == [2, 1, 3]
     assert layout.dim_order is None and layout.comm is not None
     ordered = DomainDecomposition(
-        FakeComm(6, 0), decompose=[True, True, True], dim_order=[2, 0, 1]
+        fake_comm(6, 0), decompose=[True, True, True], dim_order=[2, 0, 1]
     )
     assert ordered.proc_sizes == [1, 3, 2]
     assert ordered.dim_order == [2, 0, 1]
 
 
 def test_layout_from_ndim_decomposes_every_axis() -> None:
-    layout = DomainDecomposition(FakeComm(4, 3), ndim=2)
+    layout = DomainDecomposition(fake_comm(4, 3), ndim=2)
     assert layout.decompose == [True, True]
     assert layout.periodic == (False, False)
     assert layout.proc_sizes == [2, 2]
@@ -236,7 +245,7 @@ def test_layout_from_ndim_decomposes_every_axis() -> None:
 
 
 def test_replicated_layout_on_several_ranks() -> None:
-    layout = DomainDecomposition(FakeComm(3, 2), decompose=[False], periodic=(True,))
+    layout = DomainDecomposition(fake_comm(3, 2), decompose=[False], periodic=(True,))
     assert layout.replicated
     assert layout.neighbour_ranks == [(2, 2)]
     assert list(layout.get_proc_coord(1)) == [0]
@@ -246,7 +255,7 @@ def test_layout_rejects_bad_arguments() -> None:
     with pytest.raises(AssertionError, match="either ndim or decompose"):
         DomainDecomposition(None)
     with pytest.raises(AssertionError, match="permutation"):
-        DomainDecomposition(FakeComm(4, 0), decompose=[True, True], dim_order=[0, 0])
+        DomainDecomposition(fake_comm(4, 0), decompose=[True, True], dim_order=[0, 0])
     layout = DomainDecomposition(None, decompose=[True, True])
     with pytest.raises(ValueError, match="2 process coordinates"):
         layout.rank_from_proc_coord((0,))

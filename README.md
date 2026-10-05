@@ -100,11 +100,12 @@ documentation tooling and the linters; `dev` includes `mpi`.
 ## Development
 
 Formatting and linting use [ruff](https://docs.astral.sh/ruff/), type
-checking [pyright](https://microsoft.github.io/pyright/), run by
+checking [pyright](https://microsoft.github.io/pyright/) and
+[ty](https://docs.astral.sh/ty/), run by
 [pre-commit](https://pre-commit.com/) and in CI:
 
 ``` bash
-make lint     # ruff check, ruff format --check, pyright
+make lint     # ruff check, ruff format --check, pyright, ty
 make test     # pytest with coverage
 ```
 
