@@ -39,7 +39,7 @@ applies. Tell it once at startup:
 MPI = xp.mpi.get_mpi()
 comm = MPI.COMM_WORLD
 
-xp.mpi.mpi_is_cuda_aware(comm)    # probe the library (collective)
+xp.mpi.mpi_is_cuda_aware(comm)  # probe the library (collective)
 # or, if you know the answer:
 xp.mpi.set_mpi_cuda_aware(False)  # always copy through host memory
 ```

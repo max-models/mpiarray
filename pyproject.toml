@@ -80,6 +80,9 @@ addopts = "-ra"
 [tool.coverage.run]
 source = [ "mpiarray" ]
 omit = [ "*/tests/*" ]
+# one data file per process (every MPI rank, and the jobs tests start), for `coverage combine`
+parallel = true
+patch = [ "subprocess" ]
 
 [tool.coverage.report]
 show_missing = true

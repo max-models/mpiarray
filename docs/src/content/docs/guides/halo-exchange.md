@@ -77,9 +77,9 @@ neighbour and the ghost cells are reset to zero.
 ```python
 rho = DistributedArray.zeros((128, 128), comm, num_ghostpoints=2, periodic=(True, True))
 
-deposit(particles, rho.local_with_halos)   # may write into the ghost cells
-rho.exchange_halos()                       # ghost contributions -> owners
-total_charge = rho.sum()                   # nothing is lost on periodic axes
+deposit(particles, rho.local_with_halos)  # may write into the ghost cells
+rho.exchange_halos()  # ghost contributions -> owners
+total_charge = rho.sum()  # nothing is lost on periodic axes
 ```
 
 On periodic axes the total is conserved. At a wall (`PROC_NULL` neighbour) the

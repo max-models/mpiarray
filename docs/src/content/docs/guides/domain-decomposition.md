@@ -38,12 +38,12 @@ the layout for any number of ranks:
 ```python
 from mpiarray import calculate_proc_sizes
 
-calculate_proc_sizes(4, [True, True])         # [2, 2]
-calculate_proc_sizes(6, [True, True])         # [2, 3]
-calculate_proc_sizes(12, [True, True])        # [3, 4]
+calculate_proc_sizes(4, [True, True])  # [2, 2]
+calculate_proc_sizes(6, [True, True])  # [2, 3]
+calculate_proc_sizes(12, [True, True])  # [3, 4]
 calculate_proc_sizes(12, [True, True, True])  # [2, 2, 3]
 calculate_proc_sizes(15, [True, True, True])  # [1, 3, 5]
-calculate_proc_sizes(7, [True, True])         # [1, 7]
+calculate_proc_sizes(7, [True, True])  # [1, 7]
 ```
 
 The algorithm aims for the same number of ranks along every flagged axis (the $d$-th root
@@ -63,7 +63,7 @@ reorders them: entry `i` says which of the sorted counts (`0` = largest) axis `i
 
 ```python
 # six ranks, decompose=[True, True]
-DomainDecomposition(comm, decompose=[True, True]).proc_sizes                    # [2, 3]
+DomainDecomposition(comm, decompose=[True, True]).proc_sizes  # [2, 3]
 DomainDecomposition(comm, decompose=[True, True], dim_order=[0, 1]).proc_sizes  # [3, 2]
 ```
 
@@ -75,10 +75,10 @@ halo surfaces small.
 Ranks are placed on the process grid in row-major order: the last axis varies fastest.
 
 ```python
-layout.proc_coord           # this rank's position on the process grid
-layout.get_proc_coord(r)    # the position of rank r
+layout.proc_coord  # this rank's position on the process grid
+layout.get_proc_coord(r)  # the position of rank r
 layout.rank_from_proc_coord((1, 0))
-layout.neighbour_ranks      # [(left, right), ...], one pair per axis
+layout.neighbour_ranks  # [(left, right), ...], one pair per axis
 ```
 
 On four ranks with `periodic=(True, False)` the grid is $2 \times 2$:
@@ -106,8 +106,8 @@ a grid of the given shape. Each axis is split as evenly as possible; when the le
 not divide, the first ranks get one point more.
 
 ```python
-layout.get_index_bounds((10, 7))           # this rank
-layout.get_index_bounds((10, 7), rank=3)   # another rank
+layout.get_index_bounds((10, 7))  # this rank
+layout.get_index_bounds((10, 7), rank=3)  # another rank
 ```
 
 On the $2 \times 2$ grid above, a $10 \times 7$ grid is split into rows `0:5` and `5:10`
@@ -123,8 +123,8 @@ axis of the box is cut into `proc_sizes[dim]` intervals of equal width:
 ```python
 lower, upper = (0.0, 0.0), (1.0, 2.0)
 
-layout.subdomain_edges(0, 0.0, 1.0)             # [0.0, 0.5, 1.0] on a 2 x 2 grid
-layout.subdomain_bounds(rank, lower, upper)     # ((0.5, 1.0), (1.0, 2.0)) for rank 3
+layout.subdomain_edges(0, 0.0, 1.0)  # [0.0, 0.5, 1.0] on a 2 x 2 grid
+layout.subdomain_bounds(rank, lower, upper)  # ((0.5, 1.0), (1.0, 2.0)) for rank 3
 layout.owner_rank_for_position((0.6, 1.9), lower, upper, num_gridpoints=(11, 21))  # 3
 ```
 
