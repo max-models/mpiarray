@@ -8,10 +8,12 @@ First, ensure that `mpiarray` is [installed](/mpiarray/getting-started/installat
 ## A distributed array
 
 ```python
-from mpi4py import MPI
+import cunumpy as xp
 
 from mpiarray import DistributedArray
 
+# mpi4py.MPI under mpiexec, otherwise a serial stand-in (no MPI needed)
+MPI = xp.mpi.get_mpi()
 comm = MPI.COMM_WORLD
 
 # a 64 x 48 grid split over the ranks, one ghost layer, periodic in x
@@ -35,7 +37,9 @@ Save it as `example.py` and run it on four ranks:
 mpiexec -n 4 python example.py
 ```
 
-The same script also runs serially, as a single rank holding the whole array.
+The same script also runs serially (`python example.py`), as a single rank holding the
+whole array. `xp.mpi.get_mpi()` returns `mpi4py.MPI` when the script is started by an MPI
+launcher, and otherwise cunumpy's serial stand-in, so a serial run does not start MPI.
 
 ## Halo cells
 
@@ -49,10 +53,11 @@ The same script also runs serially, as a single rank holding the whole array.
 `DomainDecomposition` gives the layout without any array:
 
 ```python
-from mpi4py import MPI
+import cunumpy as xp
 
 from mpiarray import DomainDecomposition
 
+MPI = xp.mpi.get_mpi()
 layout = DomainDecomposition(MPI.COMM_WORLD, decompose=[True, True, False])
 layout.proc_sizes  # processes along each axis
 layout.neighbour_ranks  # (left, right) per axis, MPI.PROC_NULL at walls
@@ -71,4 +76,15 @@ xp.mpi.mpi_is_cuda_aware(MPI.COMM_WORLD)  # collective probe, or:
 xp.mpi.set_mpi_cuda_aware(False)  # copy through host memory
 ```
 
-See the [API reference](/mpiarray/api/mpiarray/) for every class and function.
+## Next steps
+
+- [Domain decomposition](/mpiarray/guides/domain-decomposition/): how the grid is split and
+  who neighbours whom.
+- [Distributed arrays](/mpiarray/guides/distributed-arrays/): storage, ghost cells, filling
+  and gathering.
+- [Halo exchange](/mpiarray/guides/halo-exchange/): `fill_halos` for stencils,
+  `exchange_halos` for deposition.
+- [Operations and reductions](/mpiarray/guides/operations/): arithmetic, indexing,
+  reductions, and which calls are collective.
+- [GPU arrays](/mpiarray/guides/gpu/): CuPy and CUDA-aware MPI.
+- The [API reference](/mpiarray/api/mpiarray/) for every class and function.

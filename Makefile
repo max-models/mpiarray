@@ -5,7 +5,7 @@ NOTEBOOKS = $(PYTHON) docs/tools/notebooks.py
 DOCS_ENV = DOCS_PYTHON=$(shell $(PYTHON) -c "import sys; print(sys.executable)")
 FORCE ?=
 
-.PHONY: help install test lint readme readme-check docs-install docs-notebooks docs-dev docs-build docs-preview docs-clean
+.PHONY: help install test coverage lint readme readme-check docs-install docs-notebooks docs-dev docs-build docs-preview docs-clean
 
 help:  ## list the targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
@@ -16,6 +16,15 @@ install:  ## uv sync with the dev extra, and the pre-commit hooks
 
 test:  ## pytest with coverage
 	uv run pytest --cov .
+
+coverage:  ## coverage of the serial and the MPI runs combined, which must be 100% (needs mpiexec)
+	rm -f .coverage .coverage.*
+	.venv/bin/python -m coverage run -m pytest -q -p no:cacheprovider
+	for n in 2 3 4 6; do \
+		mpiexec -n $$n --oversubscribe .venv/bin/python -m coverage run -m pytest -q -p no:cacheprovider || exit 1; \
+	done
+	.venv/bin/python -m coverage combine -q
+	.venv/bin/python -m coverage report --fail-under=100
 
 lint:  ## ruff and pyright
 	uv run ruff check .
