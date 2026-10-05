@@ -1,26 +1,26 @@
 ---
 title: Quickstart
-description: Run the command line entry point of template-python.
+description: Run the command line entry point of mpiarray.
 ---
 
-First, ensure that `template-python` is [installed](/template-python/getting-started/installation/).
+First, ensure that `mpiarray` is [installed](/mpiarray/getting-started/installation/).
 
 ## Basic usage
 
 After installation, you can run the application with:
 
 ```bash
-template-python
+mpiarray
 ```
 
-which calls `app.main.main` and prints a greeting.
+which calls `mpiarray.main.main` and prints a greeting.
 
 ## Use the package from Python
 
 ```python
-from app.main import main
+from mpiarray.main import main
 
 main()
 ```
 
-See the [API reference](/template-python/api/app/) for every module and function.
+See the [API reference](/mpiarray/api/mpiarray/) for every module and function.
