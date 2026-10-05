@@ -12,6 +12,9 @@ image: python:latest
 # only cache local items.
 variables:
   PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  # the container runs as root; the MPI staging test starts mpiexec
+  OMPI_ALLOW_RUN_AS_ROOT: "1"
+  OMPI_ALLOW_RUN_AS_ROOT_CONFIRM: "1"
 
 # https://pip.pypa.io/en/stable/topics/caching/
 cache:
@@ -20,6 +23,7 @@ cache:
 
 before_script:
   - python --version ; pip --version # For debugging
+  - apt-get update && apt-get install -y libopenmpi-dev openmpi-bin
   - pip install uv
   - uv sync --extra dev
 
