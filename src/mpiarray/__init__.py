@@ -39,7 +39,7 @@ from mpiarray.io import load, load_hdf5, save, save_hdf5
 from mpiarray.layout import Layout, chunk_bounds, process_grid
 from mpiarray.points import migrate
 
-__version__ = "0.1.0"  # x-release-please-version
+__version__ = "0.1.0"
 
 __all__ = [
     "DistributedArray",
