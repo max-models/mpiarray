@@ -8,7 +8,7 @@ Every function takes the same keyword arguments for the layout:
   `Layout` raises.
 - ``halo``: the halo width, for every axis or one per axis (default ``0``).
 - ``periodic``: whether each axis wraps around in halo updates.
-- ``comm``: the communicator (default: ``MPI.COMM_WORLD``, or cunumpy's serial
+- ``comm``: the communicator (default: ``MPI.COMM_WORLD``, or maybempi's serial
   stand-in when not started by an MPI launcher).
 - ``process_grid``: explicit process counts per axis, instead of ``split``.
 - ``layout``: an existing `Layout`, instead of all of the above.
@@ -22,7 +22,7 @@ from __future__ import annotations
 import hashlib
 import math
 from collections.abc import Callable, Sequence
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
 import cunumpy as xp
 import numpy as np
@@ -517,7 +517,7 @@ def from_local(
     received = xp.empty((target[1] - target[0]) * row, dtype=block.dtype)
     receiving = xp.mpi.mpi_buffer(received, send=False, recv=True)
     with xp.mpi.mpi_buffer(send) as sendbuf, receiving as recvbuf:
-        cast("MPI.Comm", comm).Alltoallv(
+        comm.Alltoallv(
             [sendbuf, (send_counts, send_displacements)],
             [recvbuf, (recv_counts, recv_displacements)],
         )

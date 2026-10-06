@@ -85,21 +85,23 @@ stencil in 2D therefore works after a single `update_halos()`.
 
 ### Overlapping the update with computation
 
-Both directions of an axis are exchanged at the same time, and on the CPU the halo slabs
-go to and from MPI straight out of the storage (as MPI subarray types), without copies;
-receive and GPU staging buffers are kept and reused between calls. To also hide the
-latency, start the update, work on the cells that do not need halos, then wait:
+On the CPU the halo slabs go to and from MPI straight out of the storage (as MPI subarray
+types), without copies; receive and GPU staging buffers are kept and reused between calls.
+To also hide the latency, start the update, work on the cells that do not need halos, then
+wait:
 
 ```python
-pending = u.update_halos(wait=False)  # all axes started at once
+pending = u.update_halos(wait=False)  # all messages started at once
 inner = v[2:-2]  # e.g. the part of the stencil that needs no halo cells
 ...
 pending.wait()  # now the halo cells are up to date
 ```
 
-In this mode the corner halo cells are not updated (the axes run at the same time, not one
-after the other), and the array must not be written until `wait()` returns. A 5-point
-stencil needs no corners; for a 9-point stencil use the default `wait=True`.
+With `wait=False` every rank exchanges with all its neighbours at once, the diagonal ones
+included (up to 26 in 3D), so the result is exactly that of `wait=True`, corner halo cells
+and boundary conditions included; a 9-point stencil works too. The array must not be
+written until `wait()` returns. On one rank, or when no axis is split, the update is done
+before the call returns and `wait()` does nothing.
 
 ## Accumulating halo cells
 
@@ -119,6 +121,11 @@ total_charge = rho.sum()  # nothing is lost on periodic axes
 On periodic axes the total is conserved. At a wall (`PROC_NULL` neighbour) the
 contributions that fall outside the domain are dropped; apply your boundary condition to
 the halo cells before accumulating if they should be reflected or kept.
+
+`accumulate_halos(wait=False)` starts the messages and returns a handle in the same way;
+`wait()` adds the received contributions. Contributions in corner halo cells reach the
+diagonal neighbours directly, so the result equals that of `wait=True`. Do not write into
+the array before `wait()`.
 
 ## Halo cells and other operations
 

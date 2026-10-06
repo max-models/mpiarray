@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import cunumpy as xp
+import maybempi
 import numpy as np
 import pytest
 
 import mpiarray as mpa
 from mpiarray.io import _header
 
-MPI = xp.mpi.get_mpi()
+MPI = maybempi.get_mpi()
 comm = MPI.COMM_WORLD
 rank, size = comm.Get_rank(), comm.Get_size()
 W = 2 * size + 3

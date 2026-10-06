@@ -6,12 +6,13 @@ The configurations come from a fixed seed, so every rank draws the same ones.
 from __future__ import annotations
 
 import cunumpy as xp
+import maybempi
 import numpy as np
 import pytest
 
 import mpiarray as mpa
 
-MPI = xp.mpi.get_mpi()
+MPI = maybempi.get_mpi()
 size = MPI.COMM_WORLD.Get_size()
 
 

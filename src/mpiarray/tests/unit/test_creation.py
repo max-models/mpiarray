@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, cast
 
 import cunumpy as xp
+import maybempi
 import numpy as np
 import pytest
 
@@ -19,7 +20,7 @@ from mpiarray.creation import _check_identical
 if TYPE_CHECKING:
     from mpiarray._mpi import Comm
 
-MPI = xp.mpi.get_mpi()
+MPI = maybempi.get_mpi()
 comm = MPI.COMM_WORLD
 rank, size = comm.Get_rank(), comm.Get_size()
 N = size + 3  # an axis length that every rank count up to N can split

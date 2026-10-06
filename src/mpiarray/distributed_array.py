@@ -15,6 +15,7 @@ from __future__ import annotations
 import bisect
 import contextlib
 import functools
+import itertools
 import math
 from collections.abc import Callable, Iterator, Sequence
 from types import EllipsisType, NotImplementedType
@@ -24,6 +25,7 @@ import cunumpy as xp
 import numpy as np
 from numpy.typing import DTypeLike
 
+from mpiarray._exchange import Box, exchange_boxes, local_index, target_ranks
 from mpiarray._mpi import MPI, check_collective
 from mpiarray.layout import Layout
 
@@ -47,6 +49,7 @@ _BOUNDARIES = ("zero", "edge", "symmetric", "reflect")
 # Tag offsets so halo updates and halo accumulations never share a message tag.
 _UPDATE_TAG = 0
 _ACCUMULATE_TAG = 1000
+_NEIGHBOUR_TAG = 2000
 
 
 @functools.lru_cache(maxsize=1024)
@@ -137,6 +140,27 @@ def _identity(name: str, dtype: np.dtype) -> Any:
         return info.max if largest else info.min
     infinity = np.inf if largest else -np.inf
     return complex(infinity, infinity) if kind == "c" else infinity
+
+
+def _arg_key(candidate: tuple[Any, int], is_min: bool) -> tuple:
+    """Order (value, index) candidates as argmin/argmax do: NaN first, then the first index."""
+    value, index = candidate
+    value = value.item() if isinstance(value, np.generic) else value
+    if value != value:  # NaN
+        return (0, 0, index)
+    return (1, value if is_min else -value, index)
+
+
+def _better(piece: Any, current: Any, is_min: bool) -> Any:
+    """Return where ``piece`` (values, indices) beats ``current`` for argmin/argmax."""
+    value, index = piece[0], piece[1]
+    best, best_index = current[0], current[1]
+    strictly = value < best if is_min else value > best
+    tie = (value == best) & (index < best_index)
+    if np.dtype(piece.dtype).kind != "f":
+        return strictly | tie
+    nan, best_nan = xp.isnan(value), xp.isnan(best)
+    return xp.where(best_nan, nan & (index < best_index), nan | strictly | tie)
 
 
 def _host(value: Any) -> Any:
@@ -379,22 +403,24 @@ class DistributedArray:
     def __getitem__(self, index: IndexLike) -> Scalar | Array:
         """Return an element or a selection of the global array, on every rank.
 
-        Collective. An integer per axis is `get`. Integers, slices and Ellipsis
-        gather only the selected cells; index arrays and masks gather the whole
-        array first.
+        Collective. An integer per axis is `get`: a host scalar, the same on
+        every rank. Any other index returns a new `DistributedArray`: basic
+        indices (integers, slices, Ellipsis) move only the selected cells to the
+        ranks that own them in the result; index arrays and masks gather the
+        array first. Call ``gather()`` on the result for a NumPy array.
 
         Args:
             index: A global index, as for a NumPy array of shape `shape`.
 
         Returns:
-            A host scalar, or a NumPy or CuPy array.
+            A host scalar, or a `DistributedArray`.
         """
         basic = self._normalize_basic_index(index)
         if basic is not None and all(_is_int(item) for item in basic):
             return self.get(tuple(int(item) for item in basic if _is_int(item)))
         if basic is not None:
-            return self._gather_selection(basic)
-        return self._gather_all()[index]
+            return self._select(basic)
+        return self._spread(self._gather_all()[index])
 
     def __setitem__(self, index: IndexLike, value: Any) -> None:
         """Set an element or a selection of the global array.
@@ -503,34 +529,127 @@ class DistributedArray:
             tuple(piece_shape),
         )
 
-    def _gather_selection(self, index: tuple[int | slice, ...]) -> Array:
-        """Return a basic selection on every rank, gathering only its cells."""
+    def _layout_like(self, shape: tuple[int, ...], split: Sequence[int]) -> Layout:
+        """Return a layout for a result: split along ``split`` if it fits, else replicated."""
         layout = self._layout
+        if layout.distributed and split:
+            try:
+                return Layout(shape, comm=layout.comm, split=tuple(split))
+            except ValueError:
+                pass
+        return Layout(shape, comm=layout.comm, split=None)
+
+    def _spread(self, data: Array) -> Self:
+        """Return a global array that every rank holds as a distributed array."""
+        target = self._layout_like(tuple(data.shape), (0,) if data.ndim else ())
+        return self._with_layout(target, data[target.global_slices()])
+
+    def _with_layout(self, layout: Layout, block: Array) -> Self:
+        """Return an array of this type with ``layout`` around a block (halos zero)."""
+        storage = xp.zeros(layout.storage_shape, dtype=block.dtype)
+        storage[layout.interior] = block
+        return type(self)(layout, storage)
+
+    def _select(self, index: tuple[int | slice, ...]) -> Self:
+        """Return a basic selection as a distributed array, moving only its cells."""
+        layout = self._layout
+        slice_axes = [
+            axis for axis, item in enumerate(index) if isinstance(item, slice)
+        ]
         selection_shape, own = self._selection_plan(index, layout.rank)
+        split = [k for k, axis in enumerate(slice_axes) if axis in layout.split]
+        target = self._layout_like(selection_shape, split)
         if not layout.distributed:
             if own is None:
-                return xp.empty(selection_shape, dtype=self.dtype)
-            return self._data[own[0]].copy()
+                block = xp.empty(selection_shape, dtype=self.dtype)
+            else:
+                block = self._data[own[0]]
+            return self._with_layout(target, block[target.global_slices()])
 
-        plans = [self._selection_plan(index, r)[1] for r in range(layout.size)]
-        counts = [0 if plan is None else math.prod(plan[2]) for plan in plans]
-        send = (
-            xp.empty(0, dtype=self.dtype)
-            if own is None
-            else xp.ascontiguousarray(self._data[own[0]])
+        def box_of(plan: Any) -> Box | None:
+            return None if plan is None else tuple((i.start, i.stop) for i in plan[1])
+
+        boxes = [box_of(self._selection_plan(index, r)[1]) for r in range(layout.size)]
+        data = self._data[own[0]] if own is not None else self._data
+        pieces = exchange_boxes(
+            target, data, boxes[layout.rank], boxes, name="a[...] (selection)"
         )
-        recv = xp.empty(sum(counts), dtype=self.dtype)
-        check_collective(layout.comm, "a[...] (selection)")
-        receiving = xp.mpi.mpi_buffer(recv, send=False, recv=True)
-        with xp.mpi.mpi_buffer(send) as sendbuf, receiving as recvbuf:
-            layout.comm.Allgatherv(sendbuf, [recvbuf, counts])
-        result = xp.empty(selection_shape, dtype=self.dtype)
-        offset = 0
-        for plan, count in zip(plans, counts, strict=True):
-            if plan is not None:
-                result[plan[1]] = recv[offset : offset + count].reshape(plan[2])
-                offset += count
-        return result
+        storage = xp.zeros(target.storage_shape, dtype=self.dtype)
+        for _, box, piece in pieces:
+            storage[local_index(box, target.index_bounds, target.halo)] = piece
+        return type(self)(target, storage)
+
+    def redistribute(self, layout: Layout) -> Self:
+        """Return the array moved to another layout of the same shape and communicator.
+
+        Every rank sends each other rank only the part of its block that the
+        other owns in ``layout`` (one ``Alltoallv``); nothing global is built.
+        The halo cells of the result start at zero. Collective.
+
+        Args:
+            layout: The new layout.
+
+        Returns:
+            A new array; a copy if ``layout`` is already the array's.
+
+        Raises:
+            ValueError: If ``layout`` has another shape, or a communicator with
+                other processes (a renumbered one, e.g. from ``reorder=True``,
+                is fine).
+        """
+        source = self._layout
+        if layout.shape != self.shape:
+            raise ValueError(
+                f"cannot redistribute shape {self.shape} to {layout.shape}"
+            )
+        try:
+            target_ranks(source.comm, layout.comm)
+        except ValueError:
+            raise ValueError("cannot redistribute to another communicator") from None
+        if layout == source:
+            return self.copy()
+        storage = xp.zeros(layout.storage_shape, dtype=self.dtype)
+        if not source.distributed:  # every rank holds the whole array
+            storage[layout.interior] = self.local[layout.global_slices()]
+            return type(self)(layout, storage)
+        boxes: list[Box | None] = [
+            source.index_bounds_of(r) for r in range(source.size)
+        ]
+        pieces = exchange_boxes(
+            layout,
+            self.local,
+            source.index_bounds,
+            boxes,
+            name="redistribute",
+            comm=source.comm,
+        )
+        for _, box, piece in pieces:
+            storage[local_index(box, layout.index_bounds, layout.halo)] = piece
+        return type(self)(layout, storage)
+
+    def rebalance(self, weights: Any) -> Self:
+        """Return the array moved to blocks of about equal weight; see `Layout.weighted`.
+
+        Collective.
+
+        Args:
+            weights: The cost of each element: an array of the same shape (a
+                `DistributedArray` too), or one 1-D profile per axis.
+
+        Returns:
+            The redistributed array, with explicit `Layout.bounds`.
+        """
+        layout = self._layout
+        balanced = Layout.weighted(
+            self.shape,
+            weights,
+            comm=layout.comm,
+            split=layout.split if layout.split else None,
+            halo=layout.halo,
+            periodic=layout.periodic,
+            process_grid=layout.process_grid if layout.distributed else None,
+        )
+        return self.redistribute(balanced)
 
     def _assign_basic(self, index: tuple[int | slice, ...], value: Any) -> None:
         """Write ``value`` into the owned part of the global selection ``index``.
@@ -554,14 +673,14 @@ class DistributedArray:
         return range(self.ndim) if axis is None else (axis,)
 
     def _region_bounds(
-        self, axis: int, name: str, corners: bool
+        self, axis: int, name: str
     ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-        """Return the ``(starts, sizes)`` in the storage of a halo region.
+        """Return the ``(starts, sizes)`` in the storage of a halo region along ``axis``.
 
         ``name`` is one of ``lower_halo``, ``lower_interior``, ``upper_interior``
         and ``upper_halo``: the halo cells along ``axis`` or the layers of the
-        block next to them. With ``corners`` the region spans the whole storage
-        along the other axes (halos included), else only their blocks.
+        block next to them, across the whole storage along the other axes
+        (their halos included, so that corners travel with the faces).
         """
         layout = self._layout
         h = layout.halo[axis]
@@ -572,24 +691,13 @@ class DistributedArray:
             "upper_interior": extent - 2 * h,
             "upper_halo": extent - h,
         }[name]
-        starts, sizes = [], []
-        for ax, (n, other_halo) in enumerate(
-            zip(layout.storage_shape, layout.halo, strict=True)
-        ):
-            if ax == axis:
-                starts.append(offset)
-                sizes.append(h)
-            elif corners:
-                starts.append(0)
-                sizes.append(n)
-            else:
-                starts.append(other_halo)
-                sizes.append(n - 2 * other_halo)
+        starts = [offset if ax == axis else 0 for ax in range(self.ndim)]
+        sizes = [h if ax == axis else n for ax, n in enumerate(layout.storage_shape)]
         return tuple(starts), tuple(sizes)
 
-    def _region(self, axis: int, name: str, corners: bool = True) -> tuple[slice, ...]:
+    def _region(self, axis: int, name: str) -> tuple[slice, ...]:
         """Return the index of a halo region in the storage; see `_region_bounds`."""
-        starts, sizes = self._region_bounds(axis, name, corners)
+        starts, sizes = self._region_bounds(axis, name)
         return tuple(slice(a, a + n) for a, n in zip(starts, sizes, strict=True))
 
     def _is_self_neighbour(self, axis: int) -> bool:
@@ -628,7 +736,6 @@ class DistributedArray:
         self,
         axis: int,
         accumulate: bool,
-        corners: bool,
         requests: list,
         arrivals: list[tuple[tuple[slice, ...], Array]],
         stack: contextlib.ExitStack,
@@ -641,7 +748,7 @@ class DistributedArray:
         """
         layout = self._layout
         # Exchanges only run between different ranks, so under a real MPI
-        # (cunumpy's serial stand-in has no point-to-point calls).
+        # (maybempi's serial stand-in has no point-to-point calls).
         comm = cast("MPI.Comm", layout.comm)
         left, right = layout.neighbours[axis]
         tag = (_ACCUMULATE_TAG if accumulate else _UPDATE_TAG) + 2 * axis
@@ -659,7 +766,7 @@ class DistributedArray:
             ]
         in_place = self._sends_in_place()
         for send_name, dest, recv_name, source, message_tag in transfers:
-            starts, sizes = self._region_bounds(axis, recv_name, corners)
+            starts, sizes = self._region_bounds(axis, recv_name)
             if in_place and not accumulate:
                 datatype = _subarray(self._data.shape, starts, sizes, self.dtype.str)
                 requests.append(
@@ -668,7 +775,7 @@ class DistributedArray:
                     )
                 )
             else:
-                key = (axis, recv_name, corners)
+                key = (axis, recv_name)
                 buffer = self._buffer(key, sizes)
                 receiving = xp.mpi.mpi_buffer(
                     buffer, send=False, recv=True, staging=self._staging(key, sizes)
@@ -679,26 +786,24 @@ class DistributedArray:
                     )
                 )
                 if source != MPI.PROC_NULL:
-                    arrivals.append((self._region(axis, recv_name, corners), buffer))
+                    arrivals.append((self._region(axis, recv_name), buffer))
 
-            starts, sizes = self._region_bounds(axis, send_name, corners)
+            starts, sizes = self._region_bounds(axis, send_name)
             if in_place:
                 datatype = _subarray(self._data.shape, starts, sizes, self.dtype.str)
                 requests.append(
                     comm.Isend([self._data, 1, datatype], dest=dest, tag=message_tag)
                 )
             else:
-                key = (axis, send_name, corners, "send")
+                key = (axis, send_name, "send")
                 buffer = self._buffer(key, sizes)
-                buffer[...] = self._data[self._region(axis, send_name, corners)]
+                buffer[...] = self._data[self._region(axis, send_name)]
                 sending = xp.mpi.mpi_buffer(buffer, staging=self._staging(key, sizes))
                 requests.append(
                     comm.Isend(stack.enter_context(sending), dest=dest, tag=message_tag)
                 )
 
-    def _exchange(
-        self, axes: Sequence[int], accumulate: bool, corners: bool
-    ) -> HaloUpdate:
+    def _exchange(self, axes: Sequence[int], accumulate: bool) -> HaloUpdate:
         """Start the halo exchange along ``axes``; return the handle that finishes it."""
         requests: list = []
         arrivals: list[tuple[tuple[slice, ...], Array]] = []
@@ -707,7 +812,7 @@ class DistributedArray:
             name = "accumulate_halos" if accumulate else "update_halos"
             check_collective(self._layout.comm, f"{name} (axes {tuple(axes)})")
         for axis in axes:
-            self._post_axis(axis, accumulate, corners, requests, arrivals, stack)
+            self._post_axis(axis, accumulate, requests, arrivals, stack)
 
         def finish() -> None:
             MPI.Request.Waitall(requests)
@@ -767,7 +872,7 @@ class DistributedArray:
                         f"along axis {axis}, the smallest has {length // n}",
                     )
 
-    def _fill_walls(self, axis: int, boundary: Boundary, corners: bool) -> None:
+    def _fill_walls(self, axis: int, boundary: Boundary) -> None:
         """Write the boundary condition into the halo cells at walls along ``axis``."""
         layout = self._layout
         h = layout.halo[axis]
@@ -778,7 +883,7 @@ class DistributedArray:
         for side, neighbour in (("lower", left), ("upper", right)):
             if neighbour != MPI.PROC_NULL:
                 continue
-            region = list(self._region(axis, f"{side}_halo", corners))
+            region = list(self._region(axis, f"{side}_halo"))
             if not isinstance(boundary, str) or boundary == "zero":
                 self._data[tuple(region)] = 0 if boundary == "zero" else boundary
                 continue
@@ -795,6 +900,141 @@ class DistributedArray:
             values[axis] = source
             self._data[tuple(region)] = self._data[tuple(values)]
 
+    def _box(self, offset: Sequence[int], halo_side: bool) -> tuple[slice, ...]:
+        """Return the storage box on side ``offset`` of the block.
+
+        Its halo cells, or (``halo_side=False``) the block cells next to them;
+        along axes where the offset is 0, the whole block.
+        """
+        layout = self._layout
+        index = []
+        for o, h, n in zip(offset, layout.halo, layout.storage_shape, strict=True):
+            if o == 0:
+                index.append(slice(h, n - h))
+            elif halo_side:
+                index.append(slice(0, h) if o < 0 else slice(n - h, n))
+            else:
+                index.append(slice(h, 2 * h) if o < 0 else slice(n - 2 * h, n - h))
+        return tuple(index)
+
+    def _neighbour(self, offset: Sequence[int]) -> int:
+        """Return the rank at ``offset`` on the process grid, or PROC_NULL past a wall."""
+        layout = self._layout
+        coord = []
+        for c, o, n, wraps in zip(
+            layout.process_coord,
+            offset,
+            layout.process_grid,
+            layout.periodic,
+            strict=True,
+        ):
+            c += o
+            if not 0 <= c < n:
+                if not wraps:
+                    return MPI.PROC_NULL
+                c %= n
+            coord.append(c)
+        return layout.rank_of(coord)
+
+    def _neighbourhood_exchange(
+        self, accumulate: bool, boundary: Boundary
+    ) -> HaloUpdate:
+        """Exchange every halo region directly with its neighbour, diagonals included.
+
+        One round of messages for all axes (up to 26 neighbours in 3-D), so
+        corners need no second step; see `update_halos` and `accumulate_halos`
+        with ``wait=False``.
+        """
+        layout = self._layout
+        comm = cast("MPI.Comm", layout.comm)
+        offsets = [
+            offset
+            for offset in itertools.product((-1, 0, 1), repeat=self.ndim)
+            if any(offset)
+            and all(h > 0 or o == 0 for o, h in zip(offset, layout.halo, strict=True))
+        ]
+        tags: dict[tuple[int, ...], int] = {
+            offset: _NEIGHBOUR_TAG + k for k, offset in enumerate(offsets)
+        }
+        name = "accumulate_halos" if accumulate else "update_halos"
+        check_collective(comm, f"{name} (neighbourhood)")
+        in_place = self._sends_in_place() and not accumulate
+        requests: list = []
+        arrivals: list[tuple[tuple[slice, ...], Array]] = []
+        stack = contextlib.ExitStack()
+        for offset in offsets:
+            opposite = tuple(-o for o in offset)
+            source, dest = self._neighbour(offset), self._neighbour(offset)
+            # receive: what the neighbour at ``offset`` sent towards us
+            target = self._box(offset, halo_side=not accumulate)
+            sizes = tuple(sl.stop - sl.start for sl in target)
+            if in_place:
+                datatype = _subarray(
+                    self._data.shape,
+                    tuple(sl.start for sl in target),
+                    sizes,
+                    self.dtype.str,
+                )
+                requests.append(
+                    comm.Irecv(
+                        [self._data, 1, datatype], source=source, tag=tags[opposite]
+                    )
+                )
+            else:
+                key = ("neighbourhood", offset, accumulate)
+                buffer = self._buffer(key, sizes)
+                receiving = xp.mpi.mpi_buffer(
+                    buffer, send=False, recv=True, staging=self._staging(key, sizes)
+                )
+                requests.append(
+                    comm.Irecv(
+                        stack.enter_context(receiving),
+                        source=source,
+                        tag=tags[opposite],
+                    )
+                )
+                if source != MPI.PROC_NULL:
+                    arrivals.append((target, buffer))
+            # send: our cells for the neighbour at ``offset``
+            box = self._box(offset, halo_side=accumulate)
+            sizes = tuple(sl.stop - sl.start for sl in box)
+            if self._sends_in_place():
+                datatype = _subarray(
+                    self._data.shape,
+                    tuple(sl.start for sl in box),
+                    sizes,
+                    self.dtype.str,
+                )
+                requests.append(
+                    comm.Isend([self._data, 1, datatype], dest=dest, tag=tags[offset])
+                )
+            else:
+                key = ("neighbourhood send", offset, accumulate)
+                buffer = self._buffer(key, sizes)
+                buffer[...] = self._data[box]
+                sending = xp.mpi.mpi_buffer(buffer, staging=self._staging(key, sizes))
+                requests.append(
+                    comm.Isend(
+                        stack.enter_context(sending), dest=dest, tag=tags[offset]
+                    )
+                )
+
+        def finish() -> None:
+            MPI.Request.Waitall(requests)
+            stack.close()
+            for region, buffer in arrivals:
+                if accumulate:
+                    self._data[region] += buffer
+                else:
+                    self._data[region] = buffer
+            if accumulate:
+                self.clear_halos()
+            else:
+                for ax in range(self.ndim):
+                    self._fill_walls(ax, boundary)
+
+        return HaloUpdate(finish)
+
     def update_halos(
         self,
         axis: int | None = None,
@@ -810,11 +1050,12 @@ class DistributedArray:
         storage is sent and received in place, without copies.
 
         With ``wait=True`` the axes are updated one after the other, so the
-        corner halo cells are filled too. With ``wait=False`` every axis is
-        started at once and a handle is returned: compute on the block, then
-        call its ``wait()`` before reading the halo cells. In that mode the
-        corner halo cells are not updated, and the array must not be written
-        until ``wait()`` returns.
+        corner halo cells are filled too. With ``wait=False`` the messages to
+        every neighbour, diagonal ones included, are started at once and a
+        handle is returned: compute on the block, then call its ``wait()``
+        before reading the halo cells. The result is the same as with
+        ``wait=True``, corners included; the array must not be written until
+        ``wait()`` returns.
 
         ``boundary`` fills the halo cells at walls (non-periodic boundaries),
         where there is no neighbour to copy from:
@@ -843,33 +1084,52 @@ class DistributedArray:
         self._check_boundary(boundary)
         if wait:
             for ax in self._axes(axis):
-                self._exchange(self._exchanged_axes(ax), False, corners=True).wait()
-                self._fill_walls(ax, boundary, corners=True)
+                self._exchange(self._exchanged_axes(ax), False).wait()
+                self._fill_walls(ax, boundary)
             return None
-        pending = self._exchange(self._exchanged_axes(axis), False, corners=False)
-        # the walls' halo cells are written by nobody else, so fill them now
-        for ax in self._axes(axis):
-            self._fill_walls(ax, boundary, corners=False)
-        return pending
+        if not self._layout.distributed:  # nothing to send: done at once
+            self.update_halos(axis, boundary=boundary)
+            return HaloUpdate(lambda: None)
+        if axis is not None:
+            pending = self._exchange(self._exchanged_axes(axis), False)
 
-    def accumulate_halos(self, axis: int | None = None) -> None:
+            def finish() -> None:
+                pending.wait()
+                self._fill_walls(axis, boundary)
+
+            return HaloUpdate(finish)
+        return self._neighbourhood_exchange(accumulate=False, boundary=boundary)
+
+    def accumulate_halos(
+        self, axis: int | None = None, *, wait: bool = True
+    ) -> HaloUpdate | None:
         """Add the halo cells into the neighbours' boundary cells, then zero them.
 
         This is the scatter-add after depositing particles near the edges of a
         block. At walls (non-periodic boundaries) the halo values are dropped.
-        Axes are handled one after the other, so values deposited in corner
-        halo cells reach the diagonal neighbour.
+        With ``wait=True`` the axes are handled one after the other, so values
+        deposited in corner halo cells reach the diagonal neighbour in two
+        steps. With ``wait=False`` (all axes) every halo region goes straight
+        to the neighbour it belongs to, diagonal ones included, and a handle is
+        returned: call its ``wait()`` before using the array, and do not write
+        the array until then.
 
         Collective.
 
         Args:
             axis: The axis to accumulate along; default: every axis.
+            wait: Whether to finish before returning.
+
+        Returns:
+            ``None``, or with ``wait=False`` the `HaloUpdate` to wait for.
         """
+        if not wait and axis is None and self._layout.distributed:
+            return self._neighbourhood_exchange(accumulate=True, boundary=None)
         for ax in self._axes(axis):
             if self._layout.halo[ax] == 0:
                 continue
             if self._layout.distributed and not self._is_self_neighbour(ax):
-                self._exchange([ax], True, corners=True).wait()
+                self._exchange([ax], True).wait()
                 continue
             if self._layout.periodic[ax]:
                 lower_halo = self._data[self._region(ax, "lower_halo")].copy()
@@ -878,6 +1138,7 @@ class DistributedArray:
                 ]
                 self._data[self._region(ax, "upper_interior")] += lower_halo
             self.clear_halos(ax)
+        return None if wait else HaloUpdate(lambda: None)
 
     def clear_halos(self, axis: int | None = None) -> None:
         """Set the halo cells to zero; no communication.
@@ -1042,9 +1303,10 @@ class DistributedArray:
     def __array__(
         self, dtype: DTypeLike | None = None, copy: bool | None = None
     ) -> Array:
-        """Return the gathered global array, for NumPy functions without a method here.
+        """Return the gathered global array as a NumPy array, for ``np.asarray(a)``.
 
-        Collective.
+        Collective. On the CuPy backend the array is copied to the host, as
+        NumPy's protocol requires; use `gather` to keep it on the device.
 
         Args:
             dtype: Convert to this element type.
@@ -1052,9 +1314,9 @@ class DistributedArray:
                 ``True`` with a ``dtype`` makes a difference.
 
         Returns:
-            The global array.
+            The global array, a ``numpy.ndarray``.
         """
-        array = self._gather_all()
+        array = xp.to_numpy(self._gather_all())
         if dtype is not None:
             return array.astype(dtype, copy=False if copy is None else copy)
         if copy:
@@ -1084,9 +1346,52 @@ class DistributedArray:
             # Raised on every rank alike, so that no rank waits in allreduce.
             if self.size == 0:
                 raise ValueError("zero-size array has no minimum or maximum")
-            if self.dtype.kind == "c":
-                raise TypeError(f"min/max are not supported for dtype {self.dtype}")
+            if self.dtype.kind == "c" and self._layout.distributed:
+                # MPI has no complex MIN/MAX: compare the candidates, ordered
+                # like NumPy orders complex numbers (real part, then imaginary)
+                check_collective(self._layout.comm, name)
+                candidates = self._layout.comm.allgather(_host(op(self.local)))
+                key = lambda z: (z.real, z.imag)  # noqa: E731
+                return (
+                    min(candidates, key=key)
+                    if name == "min"
+                    else max(candidates, key=key)
+                )
         return self._allreduce(op(self.local, **op_kwargs), mpi_op, name)
+
+    def _axis_result(
+        self, axes: tuple[int, ...], keepdims: bool
+    ) -> tuple[Layout, list[Box | None], bool]:
+        """Return a reduction's result layout, every rank's box in it, and whether it is local.
+
+        "Local" means each rank's partial result already is its block of the
+        result. Reducing along axes that are not split leaves every block where it is;
+        otherwise the result is split along the remaining split axes (or held
+        whole, if they cannot be split).
+        """
+        layout = self._layout
+        kept = [a for a in range(self.ndim) if a not in axes]
+        result_axes = list(range(self.ndim)) if keepdims else kept
+
+        def project(bounds: Sequence[tuple[int, int]]) -> Box:
+            return tuple(
+                (0, 1) if a in axes else (bounds[a][0], bounds[a][1])
+                for a in result_axes
+            )
+
+        shape = tuple(end for _, end in project([(0, n) for n in self.shape]))
+        boxes: list[Box | None] = [
+            project(layout.index_bounds_of(r)) for r in range(layout.size)
+        ]
+        if not layout.distributed:
+            return Layout(shape, comm=layout.comm, split=None), boxes, True
+        if all(layout.process_grid[a] == 1 for a in axes):
+            cuts = [(0, 1) if a in axes else layout.bounds[a] for a in result_axes]
+            return Layout(shape, comm=layout.comm, bounds=cuts), boxes, True
+        split = [
+            k for k, a in enumerate(result_axes) if a in layout.split and a not in axes
+        ]
+        return self._layout_like(shape, split), boxes, False
 
     def _reduce_along(
         self,
@@ -1094,55 +1399,153 @@ class DistributedArray:
         axis: int | tuple[int, ...],
         keepdims: bool,
         **kwargs: Any,
-    ) -> Array:
-        """Reduce along ``axis`` without gathering the array; the result on every rank.
+    ) -> Any:
+        """Reduce along ``axis`` without gathering: a `DistributedArray` (or a scalar).
 
-        Each rank reduces its own block; only these partial results are sent
-        (one ``Allgatherv``) and combined, so the data moved is about the size
-        of the result times the ranks along ``axis``, not the whole array.
+        Each rank reduces its own block; the partial results go to the ranks
+        that own them in the result and are combined there.
         """
         axes = _normalize_axes(axis, self.ndim)
-        local_op, combine = _AXIS_REDUCTIONS[name]
         if name in ("min", "max") and any(self.shape[a] == 0 for a in axes):
             raise ValueError(f"zero-size array to reduction operation {name}")
-        partial = local_op(self.local, axis=axes, keepdims=True, **kwargs)
-        layout = self._layout
-        result_shape = tuple(1 if a in axes else n for a, n in enumerate(self.shape))
-        if not layout.distributed:
-            result = partial
-        else:
-            pieces = []
-            for r in range(layout.size):
-                bounds = layout.index_bounds_of(r)
-                shape = tuple(
-                    1 if a in axes else end - start
-                    for a, (start, end) in enumerate(bounds)
-                )
-                index = tuple(
-                    slice(0, 1) if a in axes else slice(start, end)
-                    for a, (start, end) in enumerate(bounds)
-                )
-                pieces.append((shape, index))
-            counts = [math.prod(shape) for shape, _ in pieces]
-            send = xp.ascontiguousarray(partial)
-            recv = xp.empty(sum(counts), dtype=send.dtype)
-            check_collective(layout.comm, f"{name}(axis={axis!r})")
-            receiving = xp.mpi.mpi_buffer(recv, send=False, recv=True)
-            with xp.mpi.mpi_buffer(send) as sendbuf, receiving as recvbuf:
-                layout.comm.Allgatherv(sendbuf, [recvbuf, counts])
-            result = xp.full(
-                result_shape, _identity(name, send.dtype), dtype=send.dtype
-            )
-            offset = 0
-            for (shape, index), count in zip(pieces, counts, strict=True):
-                piece = recv[offset : offset + count].reshape(shape)
-                result[index] = combine(result[index], piece)
-                offset += count
-        if keepdims:
-            return result
-        return result.reshape(
-            tuple(n for a, n in enumerate(result_shape) if a not in axes)
+        if len(axes) == self.ndim and not keepdims:
+            return getattr(self, name)(**kwargs)
+        local_op, combine = _AXIS_REDUCTIONS[name]
+        partial = local_op(self.local, axis=axes, keepdims=keepdims, **kwargs)
+        target, boxes, local_only = self._axis_result(axes, keepdims)
+        if local_only:
+            return self._with_layout(target, partial)
+        result = xp.full(
+            target.local_shape, _identity(name, partial.dtype), dtype=partial.dtype
         )
+        pieces = exchange_boxes(
+            target,
+            partial,
+            boxes[self._layout.rank],
+            boxes,
+            name=f"{name}(axis={axis!r})",
+        )
+        for _, box, piece in pieces:
+            index = local_index(box, target.index_bounds)
+            result[index] = combine(result[index], piece)
+        return self._with_layout(target, result)
+
+    def _var_along(
+        self,
+        axis: int | tuple[int, ...],
+        dtype: DTypeLike | None,
+        ddof: int,
+        keepdims: bool,
+    ) -> Any:
+        """Return the variance along ``axis``: blocks combined with Chan et al.'s update."""
+        axes = _normalize_axes(axis, self.ndim)
+        if len(axes) == self.ndim and not keepdims:
+            return self.var(dtype=dtype, ddof=ddof)
+        local = self.local
+        total = math.prod(self.shape[a] for a in axes)
+        count = math.prod(local.shape[a] for a in axes)
+        mean = xp.sum(local, axis=axes, keepdims=True, dtype=dtype) / max(count, 1)
+        deviation = local - mean
+        if deviation.dtype.kind == "c":
+            squares = deviation.real**2 + deviation.imag**2
+        else:
+            squares = deviation * deviation
+        m2 = xp.sum(squares, axis=axes, keepdims=keepdims, dtype=dtype)
+        if not keepdims:
+            mean = mean.reshape(m2.shape)
+        target, boxes, local_only = self._axis_result(axes, keepdims)
+        if local_only:
+            return self._with_layout(target, m2 / (total - ddof))
+        layout = self._layout
+        counts = [
+            math.prod(
+                end - start
+                for a, (start, end) in enumerate(layout.index_bounds_of(r))
+                if a in axes
+            )
+            for r in range(layout.size)
+        ]
+        dtype_ = np.result_type(mean.dtype, m2.dtype)
+        stacked = xp.stack([mean.astype(dtype_), m2.astype(dtype_)])
+        seen = xp.zeros(target.local_shape)
+        state_mean = xp.zeros(target.local_shape, dtype=dtype_)
+        state_m2 = xp.zeros(target.local_shape, dtype=dtype_)
+        pieces = exchange_boxes(
+            target,
+            stacked,
+            boxes[layout.rank],
+            boxes,
+            lead=(2,),
+            name=f"var(axis={axis!r})",
+        )
+        for source, box, piece in pieces:
+            index = local_index(box, target.index_bounds)
+            n = counts[source]
+            delta = piece[0] - state_mean[index]
+            together = seen[index] + n
+            state_m2[index] += (
+                piece[1] + xp.abs(delta) ** 2 * seen[index] * n / together
+            )
+            state_mean[index] += delta * n / together
+            seen[index] = together
+        return self._with_layout(target, xp.real(state_m2) / (total - ddof))
+
+    def _arg_extremum(self, name: str, axis: int | None, keepdims: bool) -> Any:
+        """Return ``argmin``/``argmax``: a global flat index, or indices along ``axis``."""
+        if self.dtype.kind == "c":
+            raise TypeError(f"{name} is not supported for dtype {self.dtype}")
+        if self.size == 0:
+            raise ValueError(f"attempt to get {name} of an empty sequence")
+        local = self.local
+        is_min = name == "argmin"
+        layout = self._layout
+        if axis is None:
+            position = np.unravel_index(int(getattr(xp, name)(local)), local.shape)
+            value = _host(local[position])
+            index = int(
+                np.ravel_multi_index(
+                    tuple(
+                        int(p) + start
+                        for p, (start, _) in zip(
+                            position, layout.index_bounds, strict=True
+                        )
+                    ),
+                    self.shape,
+                )
+            )
+            candidates = [(value, index)]
+            if layout.distributed:
+                check_collective(layout.comm, name)
+                candidates = layout.comm.allgather((value, index))
+            return min(candidates, key=lambda c: _arg_key(c, is_min))[1]
+        (axis,) = _normalize_axes(axis, self.ndim)
+        arg = getattr(xp, name)(local, axis=axis, keepdims=True)
+        values = xp.take_along_axis(local, arg, axis=axis)
+        indices = arg + layout.index_bounds[axis][0]
+        if not keepdims:
+            values, indices = values.squeeze(axis), indices.squeeze(axis)
+        target, boxes, local_only = self._axis_result((axis,), keepdims)
+        if local_only:
+            return self._with_layout(target, indices.astype(np.int64))
+        dtype_ = np.float64 if self.dtype.kind == "f" else np.int64
+        stacked = xp.stack([values.astype(dtype_), indices.astype(dtype_)])
+        best = xp.zeros((2, *target.local_shape), dtype=dtype_)
+        empty = xp.ones(target.local_shape, dtype=bool)
+        pieces = exchange_boxes(
+            target,
+            stacked,
+            boxes[layout.rank],
+            boxes,
+            lead=(2,),
+            name=f"{name}(axis={axis})",
+        )
+        for _, box, piece in pieces:
+            index = local_index(box, target.index_bounds)
+            current = best[(slice(None), *index)]
+            better = empty[index] | _better(piece, current, is_min)
+            best[(slice(None), *index)] = xp.where(better, piece, current)
+            empty[index] = False
+        return self._with_layout(target, best[1].astype(np.int64))
 
     def _finish(self, value: Scalar, keepdims: bool) -> Scalar | Array:
         """Apply ``keepdims`` to the result of a whole-array reduction."""
@@ -1311,8 +1714,9 @@ class DistributedArray:
         if axis is None:
             return self._finish(self.sum(dtype=dtype) / self.size, keepdims)
         total = self._reduce_along("sum", axis, keepdims, dtype=dtype)
-        count = math.prod(self.shape[a] for a in _normalize_axes(axis, self.ndim))
-        return total / count
+        return total / math.prod(
+            self.shape[a] for a in _normalize_axes(axis, self.ndim)
+        )
 
     def var(
         self,
@@ -1343,13 +1747,7 @@ class DistributedArray:
         """
         self._reject_out(out)
         if axis is not None:
-            return xp.var(
-                self._gather_all(),
-                axis=axis,
-                dtype=dtype,
-                correction=ddof,  # the array API name of numpy's ddof
-                keepdims=keepdims,
-            )
+            return self._var_along(axis, dtype, ddof, keepdims)
         # Each rank's count, mean and sum of squared deviations, combined in
         # one collective with Chan et al.'s parallel update (numerically like
         # two passes, but one round of communication).
@@ -1404,7 +1802,7 @@ class DistributedArray:
         variance = self.var(
             axis=axis, dtype=dtype, out=out, ddof=ddof, keepdims=keepdims
         )
-        if axis is None and not keepdims:
+        if isinstance(variance, DistributedArray) or (axis is None and not keepdims):
             return np.sqrt(variance)
         return xp.sqrt(variance)
 
@@ -1465,6 +1863,136 @@ class DistributedArray:
             value = self._allreduce(bool(xp.any(self.local)), MPI.LOR, "any")
             return self._finish(value, keepdims)
         return self._reduce_along("any", axis, keepdims)
+
+    def argmin(
+        self, axis: int | None = None, out: None = None, *, keepdims: bool = False
+    ) -> Any:
+        """Return the index of the smallest element, like ``numpy.argmin``.
+
+        Collective. Without ``axis``, the index into the flattened global array
+        (a host int, the same on every rank); with ``axis``, a `DistributedArray`
+        of indices along it. The first occurrence wins, NaN first, as in NumPy.
+
+        Args:
+            axis: The axis to search along; ``None``: the whole array.
+            out: Not supported; must be ``None``.
+            keepdims: Keep the searched axis with length one.
+
+        Raises:
+            TypeError: If ``out`` is given, or for complex values.
+            ValueError: If the array is empty.
+        """
+        self._reject_out(out)
+        return self._arg_extremum("argmin", axis, keepdims)
+
+    def argmax(
+        self, axis: int | None = None, out: None = None, *, keepdims: bool = False
+    ) -> Any:
+        """Return the index of the largest element, like ``numpy.argmax``.
+
+        Collective; see `argmin`.
+
+        Args:
+            axis: The axis to search along; ``None``: the whole array.
+            out: Not supported; must be ``None``.
+            keepdims: Keep the searched axis with length one.
+
+        Raises:
+            TypeError: If ``out`` is given, or for complex values.
+            ValueError: If the array is empty.
+        """
+        self._reject_out(out)
+        return self._arg_extremum("argmax", axis, keepdims)
+
+    def _accumulate(self, name: str, axis: int | None, dtype: DTypeLike | None) -> Self:
+        """Return the running sum or product along ``axis``; see `cumsum`."""
+        if axis is None:
+            if self.ndim != 1:
+                raise TypeError(
+                    f"{name} without an axis flattens the array, which a distributed "
+                    "array does not do; give an axis, or use gather()",
+                )
+            axis = 0
+        (axis,) = _normalize_axes(axis, self.ndim)
+        layout = self._layout
+        running = getattr(xp, name)(self.local, axis=axis, dtype=dtype)
+        if layout.distributed and layout.process_grid[axis] > 1 and running.size:
+            # add the totals of the blocks before this one along the axis
+            last = xp.to_numpy(xp.take(running, [-1], axis=axis))
+            check_collective(layout.comm, f"{name}(axis={axis})")
+            totals = layout.comm.allgather((layout.process_coord, last))
+            mine = layout.process_coord
+            before = [
+                total
+                for coord, total in totals
+                if coord[axis] < mine[axis]
+                and all(
+                    c == m
+                    for k, (c, m) in enumerate(zip(coord, mine, strict=True))
+                    if k != axis
+                )
+            ]
+            if before:
+                offset = before[0]
+                for total in before[1:]:
+                    offset = offset + total if name == "cumsum" else offset * total
+                offset = xp.asarray(offset)
+                running = running + offset if name == "cumsum" else running * offset
+        return self._with_layout(layout, running)
+
+    def cumsum(self, axis: int | None = None, dtype: DTypeLike | None = None) -> Self:
+        """Return the cumulative sum along ``axis``, a new array with this layout.
+
+        Each rank sums its block, then adds the totals of the blocks before it
+        along the axis (one small ``allgather``); nothing is gathered.
+        Collective.
+
+        Args:
+            axis: The axis; ``None`` only for 1-D arrays (NumPy would flatten).
+            dtype: The type of the accumulator and the result.
+
+        Raises:
+            TypeError: Without ``axis`` for more than one dimension.
+        """
+        return self._accumulate("cumsum", axis, dtype)
+
+    def cumprod(self, axis: int | None = None, dtype: DTypeLike | None = None) -> Self:
+        """Return the cumulative product along ``axis``; see `cumsum`.
+
+        Args:
+            axis: The axis; ``None`` only for 1-D arrays (NumPy would flatten).
+            dtype: The type of the accumulator and the result.
+
+        Raises:
+            TypeError: Without ``axis`` for more than one dimension.
+        """
+        return self._accumulate("cumprod", axis, dtype)
+
+    def __array_function__(
+        self, func: Callable, types: tuple, args: tuple, kwargs: dict[str, Any]
+    ) -> Any:
+        """Run the distributed version of a NumPy function, if there is one.
+
+        Reductions, ``argmin``/``argmax``, ``cumsum``/``cumprod``, ``where``,
+        ``clip``, ``round``, ``real``/``imag``, ``isclose``, ``allclose``,
+        ``array_equal``, ``linalg.norm``, ``vdot``, ``copy``, the ``*_like``
+        functions, ``shape``/``ndim``/``size`` and ``astype`` work like their
+        NumPy versions. Any other NumPy function raises ``TypeError`` instead
+        of quietly gathering the array; call ``gather()`` first for those.
+
+        Args:
+            func: The NumPy function.
+            types: The argument types that implement this protocol.
+            args: The positional arguments.
+            kwargs: The keyword arguments.
+
+        Returns:
+            The result, or ``NotImplemented`` for unsupported functions.
+        """
+        handler = _ARRAY_FUNCTIONS.get(func)
+        if handler is None:
+            return NotImplemented
+        return handler(*args, **kwargs)
 
     def vdot(self, other: DistributedArray) -> Scalar:
         """Return ``sum(conj(self) * other)`` over the whole array, on every rank.
@@ -1691,3 +2219,152 @@ class DistributedArray:
         return self._binary_op(other, xp.greater_equal)
 
     __hash__ = None  # type: ignore[assignment]  # mutable, and == is elementwise
+
+
+# --------------------------------------------------------------------------- #
+# NumPy functions with a distributed version (see DistributedArray.__array_function__)
+
+
+def _template(*values: Any) -> DistributedArray:
+    """Return the first distributed array among ``values``."""
+    return next(v for v in values if isinstance(v, DistributedArray))
+
+
+def _where(condition: Any, x: Any = None, y: Any = None) -> Any:
+    if x is None or y is None:
+        raise TypeError(
+            "np.where(condition) (nonzero) is not supported on distributed arrays"
+        )
+    return _template(condition, x, y)._elementwise(xp.where, (condition, x, y))
+
+
+def _clip(a: Any, a_min: Any = None, a_max: Any = None, **kwargs: Any) -> Any:
+    low, high = kwargs.pop("min", a_min), kwargs.pop("max", a_max)
+    if kwargs:
+        raise TypeError(f"np.clip on distributed arrays does not take {sorted(kwargs)}")
+    operands = [a] + [v for v in (low, high) if v is not None]
+
+    def clip(x: Any, *bounds: Any) -> Any:
+        values = iter(bounds)
+        return xp.clip(
+            x,
+            next(values) if low is not None else None,
+            next(values) if high is not None else None,
+        )
+
+    return _template(*operands)._elementwise(clip, tuple(operands))
+
+
+def _isclose(
+    a: Any, b: Any, rtol: float = 1e-05, atol: float = 1e-08, equal_nan: bool = False
+) -> Any:
+    def isclose(x: Any, y: Any) -> Any:
+        return xp.isclose(x, y, rtol=rtol, atol=atol, equal_nan=equal_nan)
+
+    return _template(a, b)._elementwise(isclose, (a, b))
+
+
+def _allclose(
+    a: Any, b: Any, rtol: float = 1e-05, atol: float = 1e-08, equal_nan: bool = False
+) -> bool:
+    return bool(_isclose(a, b, rtol=rtol, atol=atol, equal_nan=equal_nan).all())
+
+
+def _array_equal(a: Any, b: Any, equal_nan: bool = False) -> bool:
+    template = _template(a, b)
+    other = b if template is a else a
+    if np.shape(other) != template.shape:
+        return False
+    if isinstance(other, DistributedArray) and other.layout != template.layout:
+        other = other.redistribute(template.layout)
+    if equal_nan:
+        return _allclose(template, other, rtol=0, atol=0, equal_nan=True)
+    return bool((template == other).all())
+
+
+def _round(a: DistributedArray, decimals: int = 0) -> Any:
+    return a._elementwise(lambda x: x.round(decimals), (a,))
+
+
+def _norm(
+    x: DistributedArray, ord: Any = None, axis: Any = None, keepdims: bool = False
+) -> Any:
+    if axis is not None or keepdims:
+        raise TypeError(
+            "np.linalg.norm on distributed arrays takes no axis or keepdims"
+        )
+    if ord in (None, "fro") or (x.ndim == 1 and ord == 2):
+        return x.norm(2)
+    if x.ndim == 1 and ord in (1, np.inf):
+        return x.norm(ord)
+    raise TypeError(
+        f"np.linalg.norm(ord={ord!r}) is not supported for {x.ndim}-D distributed arrays"
+    )
+
+
+def _like(name: str) -> Callable:
+    def create(a: DistributedArray, *args: Any, **kwargs: Any) -> Any:
+        from mpiarray import creation
+
+        if (
+            kwargs.pop("shape", None) is not None
+            or kwargs.pop("subok", True) is not True
+        ):
+            raise TypeError(f"np.{name} on distributed arrays takes no shape or subok")
+        return getattr(creation, name)(a, *args, **kwargs)
+
+    return create
+
+
+def _method(name: str) -> Callable:
+    def call(a: DistributedArray, *args: Any, **kwargs: Any) -> Any:
+        return getattr(a, name)(*args, **kwargs)
+
+    return call
+
+
+_ARRAY_FUNCTIONS: dict[Callable, Callable] = {
+    **{
+        getattr(np, name): _method(name)
+        for name in (
+            "sum",
+            "prod",
+            "min",
+            "max",
+            "mean",
+            "var",
+            "std",
+            "all",
+            "any",
+            "argmin",
+            "argmax",
+            "cumsum",
+            "cumprod",
+            "copy",
+        )
+    },
+    np.amin: _method("min"),
+    np.amax: _method("max"),
+    np.where: _where,
+    np.clip: _clip,
+    np.round: _round,
+    np.around: _round,
+    np.real: lambda a: a._elementwise(lambda x: x.real, (a,)),
+    np.imag: lambda a: a._elementwise(lambda x: x.imag, (a,)),
+    np.isclose: _isclose,
+    np.allclose: _allclose,
+    np.array_equal: _array_equal,
+    np.linalg.norm: _norm,
+    np.vdot: lambda a, b: _template(a, b).vdot(b if _template(a, b) is a else a),
+    np.shape: lambda a: a.shape,
+    np.ndim: lambda a: a.ndim,
+    np.size: lambda a, axis=None: a.size if axis is None else a.shape[axis],
+    np.zeros_like: _like("zeros_like"),
+    np.ones_like: _like("ones_like"),
+    np.empty_like: _like("empty_like"),
+    np.full_like: _like("full_like"),
+}
+if hasattr(np, "astype"):  # pragma: no branch - NumPy 2 (CI has no NumPy 1)
+    _ARRAY_FUNCTIONS[np.astype] = lambda a, dtype, copy=True, **_: a.astype(
+        dtype, copy=copy
+    )

@@ -1,21 +1,22 @@
-"""The MPI module of mpiarray: mpi4py under an MPI launcher, else a serial stand-in."""
+"""The MPI module of mpiarray: mpi4py under an MPI launcher, else maybempi's stand-in."""
 
 from __future__ import annotations
 
 import os
 import time
-from typing import TYPE_CHECKING, Any, TypeAlias, cast
+from typing import TYPE_CHECKING, Any, TypeAlias
 
 import cunumpy as xp
+import maybempi
 
 if TYPE_CHECKING:
-    from cunumpy.mpi import SerialComm
+    from maybempi import SerialComm
     from mpi4py import MPI
 else:
-    # mpi4py.MPI under an MPI launcher, otherwise cunumpy's serial stand-in
-    MPI = xp.mpi.get_mpi()
+    # mpi4py.MPI under an MPI launcher, otherwise maybempi's serial stand-in
+    MPI = maybempi.get_mpi()
 
-# An mpi4py communicator, or cunumpy's serial stand-in for one.
+# An mpi4py communicator, or maybempi's serial stand-in for one.
 Comm: TypeAlias = "MPI.Comm | SerialComm"
 
 #: Environment variable that turns on the (collective) consistency checks.
@@ -30,7 +31,7 @@ _CALLS: dict[int, int] = {}
 def default_comm() -> Comm:
     """Return the communicator arrays use by default: ``MPI.COMM_WORLD``.
 
-    Under an MPI launcher this is mpi4py's; otherwise cunumpy's serial
+    Under an MPI launcher this is mpi4py's; otherwise maybempi's serial
     stand-in, with one rank.
     """
     return MPI.COMM_WORLD
@@ -44,7 +45,9 @@ def debug_checks() -> bool:
 def check_collective(comm: Comm, name: str) -> None:
     """With ``MPIARRAY_DEBUG=1``, check that every rank makes the same collective call.
 
-    Called right before mpiarray communicates. All ranks first meet in a
+    Called right before mpiarray communicates. It also makes device buffers go
+    through host memory, unless the program has told cunumpy that MPI is
+    CUDA-aware. All ranks first meet in a
     non-blocking barrier: a rank that waits longer than
     ``MPIARRAY_DEBUG_TIMEOUT`` seconds (default 30) raises instead of hanging,
     which is what happens when a collective is called on only some ranks.
@@ -59,14 +62,16 @@ def check_collective(comm: Comm, name: str) -> None:
         RuntimeError: If the other ranks do not arrive in time, or arrive in a
             different call.
     """
+    if xp.mpi.get_mpi_cuda_aware() is None:
+        # Device buffers go through host memory unless the program has said
+        # that MPI can take them (xp.mpi.set_mpi_cuda_aware / mpi_is_cuda_aware).
+        xp.mpi.set_mpi_cuda_aware(False)
     if not debug_checks() or comm.Get_size() == 1:
         return
     count = _CALLS.get(id(comm), 0) + 1
     _CALLS[id(comm)] = count
-    # several ranks only happen under a real MPI
-    mpi_comm = cast("MPI.Comm", comm)
     timeout = float(os.environ.get(DEBUG_TIMEOUT_VARIABLE, "30"))
-    arrived: Any = mpi_comm.Ibarrier()
+    arrived: Any = comm.Ibarrier()
     deadline = time.monotonic() + timeout
     while not arrived.Test():
         if time.monotonic() > deadline:
@@ -77,7 +82,7 @@ def check_collective(comm: Comm, name: str) -> None:
                 f"Set {DEBUG_TIMEOUT_VARIABLE} to wait longer.",
             )
         time.sleep(0.001)
-    calls = mpi_comm.allgather((name, count))
+    calls = comm.allgather((name, count))
     if len(set(calls)) > 1:
         listing = ", ".join(
             f"rank {r}: {n} (call {c})" for r, (n, c) in enumerate(calls)

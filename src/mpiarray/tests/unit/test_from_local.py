@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import cunumpy as xp
+import maybempi
 import numpy as np
 import pytest
 
 import mpiarray as mpa
 from mpiarray import Layout
 
-MPI = xp.mpi.get_mpi()
+MPI = maybempi.get_mpi()
 comm = MPI.COMM_WORLD
 rank, size = comm.Get_rank(), comm.Get_size()
 
@@ -61,7 +62,8 @@ def test_whole_arrays_and_given_layouts() -> None:
     same = mpa.from_local(a.local, layout=a.layout)
     np.testing.assert_array_equal(xp.to_numpy(same.gather()), xp.to_numpy(a.gather()))
     with_halos = mpa.from_local(a.local_with_halos, layout=a.layout, with_halos=True)
-    assert with_halos.local_with_halos is a.local_with_halos  # used as it is
+    with_halos.local_with_halos[...] = -1  # used as it is: the memory is shared
+    assert (xp.to_numpy(a.local_with_halos) == -1).all()
 
 
 def test_blocks_that_do_not_fit_raise_on_every_rank() -> None:

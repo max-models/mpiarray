@@ -4,15 +4,17 @@ import ast
 import sys
 from pathlib import Path
 
-import cunumpy as xp
+import maybempi
 import pytest
 
 PACKAGE = Path(__file__).resolve().parents[2]
 ALLOWED = {
     "cunumpy",
+    "maybempi",
     "mpi4py",
     "numpy",
     "cupy",  # lazily, in DistributedArray.to_cupy()
+    "h5py",  # lazily, for save_hdf5/load_hdf5 (the hdf5 extra)
     "typing_extensions",  # under TYPE_CHECKING only
 }
 
@@ -41,11 +43,12 @@ _SERIAL_SCRIPT = """
 import sys
 
 import cunumpy as xp
+import maybempi
 
 import mpiarray as mpa
 from mpiarray import _mpi, distributed_array, layout
 
-assert isinstance(_mpi.MPI, xp.mpi.SerialMPI)
+assert maybempi.is_serial(_mpi.MPI)
 assert layout.MPI is distributed_array.MPI is _mpi.MPI
 a = mpa.arange(6.0, halo=1, periodic=True)
 a.update_halos()
@@ -55,12 +58,12 @@ assert "mpi4py" not in sys.modules, "a serial run imported mpi4py"
 """
 
 
-@pytest.mark.skipif(xp.mpi.launched_under_mpi(), reason="checks a serial run")
+@pytest.mark.skipif(maybempi.launched_under_mpi(), reason="checks a serial run")
 def test_serial_run_uses_the_stand_in_and_never_imports_mpi4py() -> None:
     import os
     import subprocess
 
-    from cunumpy.mpi import OVERRIDE_VARIABLE
+    from maybempi import OVERRIDE_VARIABLE
 
     env = {key: value for key, value in os.environ.items() if key != OVERRIDE_VARIABLE}
     subprocess.run([sys.executable, "-c", _SERIAL_SCRIPT], env=env, check=True)

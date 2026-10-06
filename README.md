@@ -38,22 +38,33 @@ mpiexec -n 2 python example.py   # or just: python example.py
   by default; `split=` chooses other axes, `split=None` gives every rank
   the whole array.
 - **Halo cells** per axis: `update_halos()` before a stencil,
-  `accumulate_halos()` after depositing particles near block edges.
+  `accumulate_halos()` after depositing particles near block edges; both
+  can overlap with computation (`wait=False`).
 - **Operators, ufuncs and reductions** as in NumPy (`sum`, `max`,
-  `mean`, `norm`, `vdot`, …); global reductions return the same host
-  scalar on every rank.
+  `mean`, `var`, `argmax`, `cumsum`, `norm`, `vdot`, …), and NumPy’s
+  functions (`np.mean(a, axis=0)`, `np.allclose`, `np.where`, …) through
+  `__array_function__`. Global reductions return the same host scalar on
+  every rank; reductions along axes and slices (`a[2:10, :]`) return
+  distributed arrays, without gathering anything.
+- **Redistribution and load balancing:** `redistribute` moves an array
+  to any other layout with one `Alltoallv`; explicit or weighted cut
+  points (`Layout(bounds=...)`, `Layout.weighted`, `rebalance`) and
+  `layout.aligned` for cell and node arrays.
+- **Particles:** `layout.owners` finds the rank of many cells at once,
+  `mpa.migrate` sends rows of NumPy or CuPy arrays to their ranks.
 - **NumPy or CuPy:** arrays come from
   [cunumpy](https://github.com/max-models/cunumpy), so the same code
-  runs on the GPU. Without a CUDA-aware MPI, device buffers are copied
-  through host memory; tell cunumpy once with
-  `xp.mpi.mpi_is_cuda_aware(comm)` or
-  `xp.mpi.set_mpi_cuda_aware(False)`.
+  runs on the GPU. Device buffers are copied through host memory unless
+  the program declares its MPI CUDA-aware
+  (`xp.mpi.set_mpi_cuda_aware(True)` or
+  `xp.mpi.mpi_is_cuda_aware(comm)`).
 - **With or without MPI:** without an MPI launcher the script runs as
-  one rank on cunumpy’s stand-in for `mpi4py.MPI`, without importing
+  one rank on maybempi’s stand-in for `mpi4py.MPI`, without importing
   mpi4py.
 - **Data in and out:** `from_local` builds an array from the pieces the
   ranks hold; `save`/`load` write and read ordinary `.npy` files in
-  parallel with MPI-IO.
+  parallel with MPI-IO, and `save_hdf5`/`load_hdf5` several arrays and
+  attributes in one HDF5 file (`mpiarray[hdf5]`).
 - **Halo boundary conditions** at walls: constant, `"edge"`,
   `"symmetric"`, `"reflect"`.
 - **Debugging:** with `MPIARRAY_DEBUG=1`, a collective called on only
@@ -69,12 +80,13 @@ Documentation: <https://max-models.github.io/mpiarray/>
 ``` bash
 pip install "mpiarray[mpi]"   # with mpi4py, for runs under mpiexec
 pip install mpiarray          # serial only, no MPI library needed
+pip install "mpiarray[hdf5]"  # with h5py, for save_hdf5/load_hdf5
 ```
 
 The `mpi` extra installs [mpi4py](https://mpi4py.readthedocs.io/), which
 needs an MPI library, e.g. `brew install open-mpi` or
 `sudo apt-get install libopenmpi-dev openmpi-bin`. Without it, mpiarray
-runs on cunumpy’s serial stand-in for `mpi4py.MPI`, as one rank holding
+runs on maybempi’s serial stand-in for `mpi4py.MPI`, as one rank holding
 the whole array. Starting such an installation with `mpiexec` gives a
 warning, and every process then computes the whole problem on its own.
 
@@ -110,8 +122,13 @@ The tests run serially and under MPI; some only run on 2 or 6 ranks:
 ``` bash
 mpiexec -n 2 .venv/bin/python -m pytest
 mpiexec -n 6 .venv/bin/python -m pytest
-make coverage   # serial and 2, 3, 4, 6 ranks, combined; fails below 100% line coverage
+make coverage   # serial and 2, 3, 4, 6 ranks, combined; fails below 100% line and branch coverage
 ```
+
+The CuPy code paths run on the CPU with cunumpy’s fake CuPy
+(`CUNUMPY_FAKE_CUPY=1 CUNUMPY_BACKEND=cupy`), and on NVIDIA GPUs in a
+GitLab pipeline that GitHub Actions starts for every push and pull
+request (`.github/workflows/gpu_ci_trigger.yml`).
 
 Commit messages follow [Conventional
 Commits](https://www.conventionalcommits.org/); see

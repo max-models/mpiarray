@@ -11,7 +11,7 @@
 The creation functions (`array`, `zeros`, `arange`, `fromfunction`, ...)
 split the array along ``split`` (default: the first axis) over the ranks of
 ``comm`` (default: ``MPI.COMM_WORLD``). Without an MPI launcher, mpiarray runs
-serially on cunumpy's stand-in for mpi4py, as one rank holding everything.
+serially on maybempi's stand-in for mpi4py, as one rank holding everything.
 Arrays come from cunumpy, so the same code runs on NumPy or CuPy; on the CuPy
 backend call ``xp.mpi.mpi_is_cuda_aware(comm)`` or
 ``xp.mpi.set_mpi_cuda_aware(...)`` once at startup.
@@ -35,8 +35,9 @@ from mpiarray.creation import (
     zeros_like,
 )
 from mpiarray.distributed_array import DistributedArray, HaloUpdate
-from mpiarray.io import load, save
+from mpiarray.io import load, load_hdf5, save, save_hdf5
 from mpiarray.layout import Layout, chunk_bounds, process_grid
+from mpiarray.points import migrate
 
 __version__ = "0.1.0"  # x-release-please-version
 
@@ -58,10 +59,13 @@ __all__ = [
     "full_like",
     "linspace",
     "load",
+    "load_hdf5",
+    "migrate",
     "ones",
     "ones_like",
     "process_grid",
     "save",
+    "save_hdf5",
     "zeros",
     "zeros_like",
 ]

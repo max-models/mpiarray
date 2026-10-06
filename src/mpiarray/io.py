@@ -1,16 +1,21 @@
-"""Saving and loading distributed arrays as ``.npy`` files, in parallel.
+"""Saving and loading distributed arrays: ``.npy`` files, and HDF5 files.
 
-The files are ordinary NumPy files: `numpy.load` reads what `save` writes,
-and `load` reads what `numpy.save` writes. With several ranks, every rank
-writes and reads only its own block, through MPI-IO; nothing global is
-built. Without, NumPy does the work.
+`save` and `load` handle one array in an ordinary NumPy file: `numpy.load`
+reads what `save` writes, and `load` reads what `numpy.save` writes. With
+several ranks, every rank writes and reads only its own block, through
+MPI-IO; nothing global is built.
+
+`save_hdf5` and `load_hdf5` keep several arrays and attributes in one HDF5
+file (needs h5py: ``pip install "mpiarray[hdf5]"``). With an MPI-enabled h5py
+build every rank writes and reads its own block; with an ordinary build,
+rank 0 writes each array after gathering it, and every rank reads its block.
 """
 
 from __future__ import annotations
 
 import io
 import os
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, cast
 
 import cunumpy as xp
@@ -65,7 +70,7 @@ def save(path: PathLike, a: DistributedArray) -> None:
             np.save(path, xp.to_numpy(a.local))
         if layout.size > 1:  # replicated: the others wait for the file
             check_collective(layout.comm, "save")
-            cast("MPI.Comm", layout.comm).Barrier()
+            layout.comm.Barrier()
         return
 
     comm = cast("MPI.Intracomm", layout.comm)
@@ -156,3 +161,133 @@ def load(
     storage = xp.zeros(layout.storage_shape, dtype=dtype)
     storage[layout.interior] = xp.asarray(np.ascontiguousarray(block))
     return DistributedArray(layout, storage)
+
+
+def _h5py() -> Any:
+    """Import h5py, with a hint if it is missing."""
+    try:
+        import h5py
+    except ImportError as error:
+        raise ImportError(
+            'save_hdf5 and load_hdf5 need h5py: pip install "mpiarray[hdf5]"'
+        ) from error
+    return h5py
+
+
+def save_hdf5(
+    path: PathLike,
+    arrays: Mapping[str, DistributedArray],
+    attrs: Mapping[str, Any] | None = None,
+) -> None:
+    """Write several arrays, and attributes, to one HDF5 file.
+
+    Collective. Each array becomes a dataset of its global shape (halo cells
+    are not saved), and ``attrs`` become attributes of the file. With an
+    MPI-enabled h5py build all ranks write their blocks into the file at
+    once; with an ordinary build each array is gathered on rank 0, which
+    writes the file.
+
+    Args:
+        path: The file to write; it is created or overwritten.
+        arrays: The arrays, by dataset name; all on the same communicator.
+        attrs: Attributes for the file: numbers, strings or small arrays.
+
+    Raises:
+        ValueError: Without arrays, or for arrays on different communicators.
+        ImportError: Without h5py.
+    """
+    if not arrays:
+        raise ValueError("save_hdf5 needs at least one array")
+    layouts = [a.layout for a in arrays.values()]
+    comm = layouts[0].comm
+    if any(not (lay.comm is comm or bool(lay.comm == comm)) for lay in layouts):
+        raise ValueError("save_hdf5 needs every array on the same communicator")
+    h5py = _h5py()
+    path = os.fspath(path)
+    parallel = comm.Get_size() > 1 and bool(h5py.get_config().mpi)
+    if parallel:  # pragma: no cover - needs an MPI-enabled h5py build
+        check_collective(comm, "save_hdf5")
+        with h5py.File(path, "w", driver="mpio", comm=comm) as handle:
+            handle.attrs.update(dict(attrs or {}))
+            for name, a in arrays.items():
+                dataset = handle.create_dataset(name, shape=a.shape, dtype=a.dtype)
+                with dataset.collective:
+                    dataset[a.layout.global_slices()] = xp.to_numpy(a.local)
+        return
+    gathered = {name: a.to_numpy(root=0) for name, a in arrays.items()}
+    if comm.Get_rank() == 0:
+        with h5py.File(path, "w") as handle:
+            handle.attrs.update(dict(attrs or {}))
+            for name, data in gathered.items():
+                handle.create_dataset(name, data=data)
+    if comm.Get_size() > 1:  # the others wait for the file
+        check_collective(comm, "save_hdf5")
+        comm.Barrier()
+
+
+def load_hdf5(
+    path: PathLike,
+    names: Sequence[str] | None = None,
+    *,
+    split: SplitArg = DEFAULT,
+    halo: _HaloArg = DEFAULT,
+    periodic: _PeriodicArg = DEFAULT,
+    comm: Comm | None = None,
+    process_grid: Sequence[int] | None = None,
+) -> tuple[dict[str, DistributedArray], dict[str, Any]]:
+    """Read datasets of an HDF5 file into distributed arrays, each rank its own block.
+
+    Collective. The layout options apply to every dataset (each gets a layout
+    for its own shape).
+
+    Args:
+        path: The file, e.g. written by `save_hdf5`.
+        names: The datasets to read; default: every dataset at the top level.
+        split: The split axis or axes.
+        halo: The halo width; the halo cells start at zero.
+        periodic: Whether each axis wraps around.
+        comm: The communicator.
+        process_grid: Explicit process counts per axis.
+
+    Returns:
+        The arrays by name, and the file's attributes.
+
+    Raises:
+        ImportError: Without h5py.
+    """
+    h5py = _h5py()
+    path = os.fspath(path)
+    arrays: dict[str, DistributedArray] = {}
+    with h5py.File(path, "r", locking=False) as handle:
+        attrs = {key: _plain(value) for key, value in handle.attrs.items()}
+        if names is None:
+            names = [
+                key for key, item in handle.items() if isinstance(item, h5py.Dataset)
+            ]
+        for name in names:
+            dataset = handle[name]
+            layout = _make_layout(
+                dataset.shape,
+                None,
+                split,
+                0 if halo is DEFAULT else halo,
+                False if periodic is DEFAULT else periodic,
+                comm,
+                process_grid,
+            )
+            block = (
+                dataset[layout.global_slices()]
+                if dataset.size
+                else np.empty(layout.local_shape, dtype=dataset.dtype)
+            )
+            storage = xp.zeros(layout.storage_shape, dtype=dataset.dtype)
+            storage[layout.interior] = xp.asarray(np.ascontiguousarray(block))
+            arrays[name] = DistributedArray(layout, storage)
+    return arrays, attrs
+
+
+def _plain(value: Any) -> Any:
+    """Return an HDF5 attribute as a Python value where it is a scalar."""
+    if isinstance(value, np.generic):
+        return value.item()
+    return value

@@ -36,7 +36,7 @@ mpiexec -n 2 python example.py
 
 Rank 0 prints its block `[1, 2]`, rank 1 prints `[3, 4]`. The same script also runs
 serially (`python example.py`), as one rank holding the whole array: without an MPI
-launcher mpiarray uses cunumpy's stand-in for `mpi4py.MPI` and never starts MPI.
+launcher mpiarray uses maybempi's stand-in for `mpi4py.MPI` and never starts MPI.
 
 ## What to remember
 
@@ -51,15 +51,15 @@ launcher mpiarray uses cunumpy's stand-in for `mpi4py.MPI` and never starts MPI.
 
 ## GPU arrays
 
-Select CuPy with `CUNUMPY_BACKEND=cupy` (or `xp.set_backend("cupy")`), and tell cunumpy
-once whether the MPI library can take device buffers:
+Select CuPy with `CUNUMPY_BACKEND=cupy` (or `xp.set_backend("cupy")`), Device buffers go through host memory
+unless you tell cunumpy that the MPI library can take them:
 
 ```python
 import cunumpy as xp
+from maybempi import MPI  # mpi4py.MPI under mpiexec, a serial stand-in otherwise
 
-MPI = xp.mpi.get_mpi()
 xp.mpi.mpi_is_cuda_aware(MPI.COMM_WORLD)  # collective probe, or:
-xp.mpi.set_mpi_cuda_aware(False)  # copy through host memory
+xp.mpi.set_mpi_cuda_aware(True)  # MPI takes device buffers (default: through the host)
 ```
 
 ## Next steps
