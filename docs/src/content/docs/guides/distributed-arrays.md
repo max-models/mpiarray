@@ -134,7 +134,9 @@ one.
 
 ```python
 mpa.save("field.npy", a)  # an ordinary .npy file, written in parallel
-b = mpa.load("field.npy", split=1, halo=2)  # any layout; the shape and dtype from the file
+b = mpa.load(
+    "field.npy", split=1, halo=2
+)  # any layout; the shape and dtype from the file
 ```
 
 With several ranks both use MPI-IO: rank 0 writes the header, and every rank writes or
