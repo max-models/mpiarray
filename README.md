@@ -143,10 +143,11 @@ make readme
 
 ## Releases
 
-Before merging a release to `main`, update the version in `pyproject.toml`,
-`src/mpiarray/__init__.py` and `CITATION.cff` (including its release date), and add the release
-notes to `CHANGELOG.md`. The push to `main` creates a GitHub release with a `vX.Y.Z` tag
-and publishes the package to PyPI with trusted publishing (OIDC). The one-time
-PyPI and GitHub configuration is
-described in the [publishing
+Before merging a release to `main`, update the version in
+`pyproject.toml`, `src/mpiarray/__init__.py` and `CITATION.cff`
+(including its release date), and add the release notes to
+`CHANGELOG.md`. The push to `main` creates a GitHub release with a
+`vX.Y.Z` tag and publishes the package to PyPI with trusted publishing
+(OIDC). The one-time PyPI and GitHub configuration is described in the
+[publishing
 guide](https://max-models.github.io/mpiarray/development/publishing/).
