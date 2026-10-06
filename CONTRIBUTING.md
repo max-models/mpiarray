@@ -32,8 +32,8 @@ pre-commit install
 
 Commits follow [Conventional Commits](https://www.conventionalcommits.org/):
 `feat:`, `fix:`, `docs:`, `chore:`, `refactor:`, `test:`, `ci:`. A `feat!:` or a
-`BREAKING CHANGE:` footer marks a breaking change. release-please reads these to write the
-changelog and choose the next version.
+`BREAKING CHANGE:` footer marks a breaking change. Before a release, update the package version
+and changelog manually.
 
 ## Pull requests
 
@@ -42,5 +42,7 @@ the tutorials and the documentation build. One approving review is required to m
 
 ## Releases
 
-Merging to `main` lets release-please open or update a release PR. Merging that PR tags the
-release, updates `CHANGELOG.md` and publishes the package to PyPI.
+Before merging a release to `main`, update the versions in `pyproject.toml`,
+`src/mpiarray/__init__.py` and `CITATION.cff` (including its release date), and add the release
+notes to `CHANGELOG.md`. The push creates a GitHub release with a version tag and publishes the
+package to PyPI.
