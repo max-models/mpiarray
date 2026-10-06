@@ -205,6 +205,88 @@ def test_layouts_compare_by_value() -> None:
 
 
 def test_default_communicator_is_comm_world() -> None:
-    layout = Layout(4)
+    n = MPI.COMM_WORLD.Get_size() + 1
+    layout = Layout(n)
     assert layout.comm is MPI.COMM_WORLD
-    assert layout == mpa.zeros(4).layout
+    assert layout == mpa.zeros(n).layout
+
+
+def test_signatures_show_the_default_marker() -> None:
+    import inspect
+
+    from mpiarray.layout import DEFAULT
+
+    assert repr(DEFAULT) == "DEFAULT"
+    assert str(inspect.signature(mpa.zeros).parameters["split"]).endswith("= DEFAULT")
+
+
+def test_split_axes_need_an_element_per_rank() -> None:
+    with pytest.raises(ValueError, match="axis 0 has 3 elements but is split over 4"):
+        Layout(3, comm=fake_comm(4, 0))
+    with pytest.raises(ValueError, match="axis 1 has 2 elements"):
+        Layout((8, 2), comm=fake_comm(4, 0), split=1)
+    with pytest.raises(ValueError, match="axis 0 has 0 elements"):
+        Layout((0, 5), comm=fake_comm(2, 0))
+    # one element per rank, unsplit short axes and empty unsplit arrays are fine
+    assert Layout(4, comm=fake_comm(4, 3)).index_bounds == ((3, 4),)
+    assert Layout((8, 2), comm=fake_comm(4, 0)).process_grid == (4, 1)
+    assert Layout((0, 5), comm=fake_comm(2, 0), split=None).replicated
+
+
+def test_halos_must_fit_in_the_smallest_block() -> None:
+    # 10 elements on 4 ranks: blocks of 3, 3, 2, 2
+    assert Layout(10, comm=fake_comm(4, 0), halo=2).halo == (2,)
+    with pytest.raises(
+        ValueError, match="halo 3 along axis 0 is wider .* \\(2 elements\\)"
+    ):
+        Layout(10, comm=fake_comm(4, 0), halo=3)
+    # a periodic axis held whole exchanges with itself: same rule
+    assert Layout((4, 3), comm=fake_comm(1, 0), halo=3, periodic=True).halo == (3, 3)
+    with pytest.raises(ValueError, match="halo 4 along axis 1"):
+        Layout((4, 3), comm=fake_comm(1, 0), halo=(0, 4), periodic=True)
+    # without neighbours to exchange with, any halo width is fine
+    assert Layout(2, comm=fake_comm(1, 0), halo=5).storage_shape == (12,)
+
+
+def test_process_grid_must_agree_with_a_given_split() -> None:
+    comm = fake_comm(6, 0)
+    assert Layout((12, 6), comm=comm, split=(0, 1), process_grid=(6, 1)).split == (0,)
+    with pytest.raises(
+        ValueError, match="splits axes \\(0, 1\\), but split is \\(0,\\)"
+    ):
+        Layout((12, 6), comm=comm, split=0, process_grid=(3, 2))
+
+
+@pytest.mark.parametrize("periodic", [False, True])
+@pytest.mark.parametrize(
+    ("nprocs", "shape", "split"),
+    [
+        (1, (7,), 0),
+        (4, (10,), 0),
+        (6, (13, 7), (0, 1)),
+        (12, (13, 7, 4), (0, 1, 2)),
+        (3, (9, 5), None),
+    ],
+)
+def test_owners_agree_with_owner(nprocs, shape, split, periodic) -> None:
+    layout = Layout(shape, comm=fake_comm(nprocs, 0), split=split, periodic=periodic)
+    grid = np.indices(shape).reshape(len(shape), -1).T
+    ranks = layout.owners(grid)
+    assert ranks.shape == (grid.shape[0],)
+    assert ranks.tolist() == [layout.owner(tuple(i)) for i in grid]
+    assert layout.owners(grid - np.array(shape)).tolist() == ranks.tolist()  # negative
+
+
+def test_owners_forms_clipping_and_errors() -> None:
+    layout = Layout(10, comm=fake_comm(4, 0))  # blocks 0:3, 3:6, 6:8, 8:10
+    assert layout.owners(np.array([0, 3, 7, 9])).tolist() == [0, 1, 2, 3]
+    assert layout.owners(np.array([[2], [8]])).tolist() == [0, 3]
+    assert int(layout.owners(np.array(5))) == 1
+    assert layout.owners(np.array([-5, 20]), clip=True).tolist() == [0, 3]
+    with pytest.raises(IndexError, match="out of bounds for axis 0"):
+        layout.owners(np.array([0, 10]))
+    plane = Layout((6, 4), comm=fake_comm(4, 0), split=(0, 1))
+    with pytest.raises(ValueError, match="do not end in 2 axes"):
+        plane.owners(np.array([1, 2, 3]))
+    with pytest.raises(ValueError, match="do not end in 2 axes"):
+        plane.owners(np.array(1))

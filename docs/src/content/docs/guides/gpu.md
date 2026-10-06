@@ -47,7 +47,8 @@ xp.mpi.set_mpi_cuda_aware(False)  # always copy through host memory
 ```
 
 Reductions without `axis` (`sum`, `max`, `norm`, …) send a single scalar, which is moved to
-the host first in either case.
+the host first in either case. Halo updates without CUDA-aware MPI copy each slab through
+pinned host buffers, which each array keeps and reuses from one update to the next.
 
 ## One GPU per rank
 

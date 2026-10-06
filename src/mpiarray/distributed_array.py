@@ -12,10 +12,13 @@ indices, reductions and halo updates. Elementwise arithmetic, ``local`` and
 
 from __future__ import annotations
 
+import bisect
+import contextlib
+import functools
 import math
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from types import EllipsisType, NotImplementedType
-from typing import TYPE_CHECKING, Any, TypeAlias, TypeGuard, overload
+from typing import TYPE_CHECKING, Any, TypeAlias, TypeGuard, cast, overload
 
 import cunumpy as xp
 import numpy as np
@@ -40,6 +43,55 @@ Scalar: TypeAlias = Any
 # Tag offsets so halo updates and halo accumulations never share a message tag.
 _UPDATE_TAG = 0
 _ACCUMULATE_TAG = 1000
+
+
+@functools.lru_cache(maxsize=1024)
+def _subarray(
+    shape: tuple[int, ...], starts: tuple[int, ...], sizes: tuple[int, ...], dtype: str
+) -> Any:
+    """Return a committed MPI datatype for a box of a C-ordered array of ``shape``.
+
+    Cached and never freed: there is one per halo region, layout and dtype.
+    """
+    from mpi4py.util import dtlib
+
+    base = dtlib.from_numpy_dtype(np.dtype(dtype))
+    return base.Create_subarray(list(shape), list(sizes), list(starts)).Commit()
+
+
+class HaloUpdate:
+    """A halo update in flight, from ``update_halos(wait=False)``.
+
+    Args:
+        finish: Completes the exchange; called once, by `wait`.
+    """
+
+    def __init__(self, finish: Callable[[], None]) -> None:
+        """Keep ``finish`` for `wait`."""
+        self._finish: Callable[[], None] | None = finish
+
+    @property
+    def done(self) -> bool:
+        """Whether `wait` has completed the update."""
+        return self._finish is None
+
+    def wait(self) -> None:
+        """Wait for the messages and write the halo cells; later calls do nothing."""
+        if self._finish is not None:
+            finish, self._finish = self._finish, None
+            finish()
+
+
+def _positions_within(selected: range, start: int, end: int) -> tuple[int, int]:
+    """Return the positions ``[lo, hi)`` of ``selected`` whose values lie in ``[start, end)``.
+
+    O(log n): a range is a sorted sequence, so bisection needs no array.
+    """
+    if selected.step > 0:
+        return bisect.bisect_left(selected, start), bisect.bisect_left(selected, end)
+    ascending = selected[::-1]
+    lo, hi = bisect.bisect_left(ascending, start), bisect.bisect_left(ascending, end)
+    return len(selected) - hi, len(selected) - lo
 
 
 def _host(value: Any) -> Any:
@@ -82,6 +134,8 @@ class DistributedArray:
             )
         self._layout = layout
         self._data = storage
+        # receive buffers and host staging, reused by every halo exchange
+        self._halo_buffers: dict[tuple, Any] = {}
 
     def _with_storage(self, storage: Array) -> Self:
         """Return an array with this layout and type that owns ``storage``."""
@@ -276,8 +330,9 @@ class DistributedArray:
     def __getitem__(self, index: IndexLike) -> Scalar | Array:
         """Return an element or a selection of the global array, on every rank.
 
-        Collective. An integer per axis is `get`; any other index selects from
-        the gathered array.
+        Collective. An integer per axis is `get`. Integers, slices and Ellipsis
+        gather only the selected cells; index arrays and masks gather the whole
+        array first.
 
         Args:
             index: A global index, as for a NumPy array of shape `shape`.
@@ -288,6 +343,8 @@ class DistributedArray:
         basic = self._normalize_basic_index(index)
         if basic is not None and all(_is_int(item) for item in basic):
             return self.get(tuple(int(item) for item in basic if _is_int(item)))
+        if basic is not None:
+            return self._gather_selection(basic)
         return self._gather_all()[index]
 
     def __setitem__(self, index: IndexLike, value: Any) -> None:
@@ -340,20 +397,27 @@ class DistributedArray:
             items = items + fill
         return tuple(int(item) if _is_int(item) else item for item in items)
 
-    def _assign_basic(self, index: tuple[int | slice, ...], value: Any) -> None:
-        """Write ``value`` into the owned part of the global selection ``index``.
+    def _selection_plan(
+        self, index: tuple[int | slice, ...], rank: int
+    ) -> tuple[tuple[int, ...], tuple[tuple, tuple, tuple[int, ...]] | None]:
+        """Return how the global selection ``index`` meets the block of ``rank``.
 
-        ``value`` must be the same on every rank and broadcast to the shape of
-        the selection. No communication happens, and halo cells are untouched.
+        Returns:
+            The shape of the whole selection, and ``None`` if ``rank`` owns none
+            of it, or else ``(storage_index, result_index, piece_shape)``: where
+            the owned part lies in that rank's storage and in the selection.
+
+        Raises:
+            IndexError: If an integer is out of bounds (on every rank alike).
         """
-        if isinstance(value, DistributedArray):
-            value = value._gather_all()
-        selection_shape = []
-        data_index: list[int | slice] = []
-        value_index: list[slice] = []
+        bounds = self._layout.index_bounds_of(rank)
+        selection_shape: list[int] = []
+        storage_index: list[int | slice] = []
+        result_index: list[slice] = []
+        piece_shape: list[int] = []
         owned = True
         for axis, (item, (start, end), halo) in enumerate(
-            zip(index, self._layout.index_bounds, self._layout.halo, strict=True),
+            zip(index, bounds, self._layout.halo, strict=True),
         ):
             extent = self.shape[axis]
             if isinstance(item, int):
@@ -364,27 +428,73 @@ class DistributedArray:
                         f"with size {extent}",
                     )
                 owned = owned and start <= position < end
-                data_index.append(position - start + halo)
+                storage_index.append(position - start + halo)
                 continue
 
-            selected = np.arange(extent)[item]
-            selection_shape.append(selected.size)
+            selected = range(*item.indices(extent))
+            selection_shape.append(len(selected))
             # The selection is monotonic, so the owned entries are contiguous.
-            positions = np.flatnonzero((selected >= start) & (selected < end))
-            if positions.size == 0:
+            lo, hi = _positions_within(selected, start, end)
+            if lo == hi:
                 owned = False
                 continue
-            first = int(selected[positions[0]]) - start + halo
-            last = int(selected[positions[-1]]) - start + halo
-            step = item.indices(extent)[2]
-            stop = last + step
-            data_index.append(slice(first, None if stop < 0 else stop, step))
-            value_index.append(slice(int(positions[0]), int(positions[-1]) + 1))
+            first = selected[lo] - start + halo
+            last = selected[hi - 1] - start + halo
+            stop = last + selected.step
+            storage_index.append(
+                slice(first, None if stop < 0 else stop, selected.step)
+            )
+            result_index.append(slice(lo, hi))
+            piece_shape.append(hi - lo)
+        if not owned:
+            return tuple(selection_shape), None
+        return tuple(selection_shape), (
+            tuple(storage_index),
+            tuple(result_index),
+            tuple(piece_shape),
+        )
 
+    def _gather_selection(self, index: tuple[int | slice, ...]) -> Array:
+        """Return a basic selection on every rank, gathering only its cells."""
+        layout = self._layout
+        selection_shape, own = self._selection_plan(index, layout.rank)
+        if not layout.distributed:
+            if own is None:
+                return xp.empty(selection_shape, dtype=self.dtype)
+            return self._data[own[0]].copy()
+
+        plans = [self._selection_plan(index, r)[1] for r in range(layout.size)]
+        counts = [0 if plan is None else math.prod(plan[2]) for plan in plans]
+        send = (
+            xp.empty(0, dtype=self.dtype)
+            if own is None
+            else xp.ascontiguousarray(self._data[own[0]])
+        )
+        recv = xp.empty(sum(counts), dtype=self.dtype)
+        receiving = xp.mpi.mpi_buffer(recv, send=False, recv=True)
+        with xp.mpi.mpi_buffer(send) as sendbuf, receiving as recvbuf:
+            layout.comm.Allgatherv(sendbuf, [recvbuf, counts])
+        result = xp.empty(selection_shape, dtype=self.dtype)
+        offset = 0
+        for plan, count in zip(plans, counts, strict=True):
+            if plan is not None:
+                result[plan[1]] = recv[offset : offset + count].reshape(plan[2])
+                offset += count
+        return result
+
+    def _assign_basic(self, index: tuple[int | slice, ...], value: Any) -> None:
+        """Write ``value`` into the owned part of the global selection ``index``.
+
+        ``value`` must be the same on every rank and broadcast to the shape of
+        the selection. No communication happens, and halo cells are untouched.
+        """
+        if isinstance(value, DistributedArray):
+            value = value._gather_all()
+        selection_shape, own = self._selection_plan(index, self._layout.rank)
         # Broadcast on every rank, so a bad value raises everywhere alike.
-        value = xp.broadcast_to(xp.asarray(value), tuple(selection_shape))
-        if owned:
-            self._data[tuple(data_index)] = value[tuple(value_index)]
+        value = xp.broadcast_to(xp.asarray(value), selection_shape)
+        if own is not None:
+            self._data[own[0]] = value[own[1]]
 
     # ------------------------------------------------------------------ #
     # Halo cells
@@ -393,99 +503,233 @@ class DistributedArray:
         """Return the axes a halo method works on."""
         return range(self.ndim) if axis is None else (axis,)
 
-    def _axis_slice(self, axis: int, start: int, stop: int | None) -> tuple[slice, ...]:
-        """Return an index selecting ``start:stop`` along ``axis`` and everything else."""
-        index = [slice(None)] * self.ndim
-        index[axis] = slice(start, stop)
-        return tuple(index)
+    def _region_bounds(
+        self, axis: int, name: str, corners: bool
+    ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        """Return the ``(starts, sizes)`` in the storage of a halo region.
 
-    def _halo_regions(self, axis: int) -> dict[str, tuple[slice, ...]]:
-        """Return the halos along ``axis`` and the interior layers next to them."""
-        h = self._layout.halo[axis]
-        return {
-            "lower_halo": self._axis_slice(axis, 0, h),
-            "lower_interior": self._axis_slice(axis, h, 2 * h),
-            "upper_interior": self._axis_slice(axis, -2 * h, -h),
-            "upper_halo": self._axis_slice(axis, -h, None),
-        }
+        ``name`` is one of ``lower_halo``, ``lower_interior``, ``upper_interior``
+        and ``upper_halo``: the halo cells along ``axis`` or the layers of the
+        block next to them. With ``corners`` the region spans the whole storage
+        along the other axes (halos included), else only their blocks.
+        """
+        layout = self._layout
+        h = layout.halo[axis]
+        extent = layout.storage_shape[axis]
+        offset = {
+            "lower_halo": 0,
+            "lower_interior": h,
+            "upper_interior": extent - 2 * h,
+            "upper_halo": extent - h,
+        }[name]
+        starts, sizes = [], []
+        for ax, (n, other_halo) in enumerate(
+            zip(layout.storage_shape, layout.halo, strict=True)
+        ):
+            if ax == axis:
+                starts.append(offset)
+                sizes.append(h)
+            elif corners:
+                starts.append(0)
+                sizes.append(n)
+            else:
+                starts.append(other_halo)
+                sizes.append(n - 2 * other_halo)
+        return tuple(starts), tuple(sizes)
+
+    def _region(self, axis: int, name: str, corners: bool = True) -> tuple[slice, ...]:
+        """Return the index of a halo region in the storage; see `_region_bounds`."""
+        starts, sizes = self._region_bounds(axis, name, corners)
+        return tuple(slice(a, a + n) for a, n in zip(starts, sizes, strict=True))
 
     def _is_self_neighbour(self, axis: int) -> bool:
         """Return whether both neighbours along ``axis`` are this rank."""
         left, right = self._layout.neighbours[axis]
         return left == right == self._layout.rank
 
-    def _sendrecv(self, send: Array, dest: int, source: int, tag: int) -> Array:
-        """Send ``send`` to ``dest`` and return the matching buffer from ``source``."""
-        send = xp.ascontiguousarray(send)
-        recv = xp.empty(send.shape, dtype=send.dtype)
-        receiving = xp.mpi.mpi_buffer(recv, send=False, recv=True)
-        with xp.mpi.mpi_buffer(send) as sendbuf, receiving as recvbuf:
-            self._layout.comm.Sendrecv(
-                sendbuf,
-                dest=dest,
-                sendtag=tag,
-                recvbuf=recvbuf,
-                source=source,
-                recvtag=tag,
-            )
-        return recv
+    def _sends_in_place(self) -> bool:
+        """Return whether halo slabs can go to MPI straight from the storage.
 
-    def update_halos(self, axis: int | None = None) -> None:
+        True for C-ordered host storage, described by MPI subarray datatypes;
+        device or other storage goes through contiguous buffers instead.
+        """
+        return not xp.is_gpu(self._data) and bool(self._data.flags.c_contiguous)
+
+    def _buffer(self, key: tuple, shape: tuple[int, ...]) -> Array:
+        """Return a contiguous buffer kept for repeated halo exchanges."""
+        buffer = self._halo_buffers.get(key)
+        if buffer is None:
+            buffer = xp.empty(shape, dtype=self.dtype)
+            self._halo_buffers[key] = buffer
+        return buffer
+
+    def _staging(self, key: tuple, shape: tuple[int, ...]) -> Any:
+        """Return the host staging kept for a device buffer, or None on the host."""
+        if not xp.is_gpu(self._data):
+            return None
+        key = ("staging", *key)
+        staging = self._halo_buffers.get(key)
+        if staging is None:
+            staging = xp.mpi.MPIStaging(shape, self.dtype)
+            self._halo_buffers[key] = staging
+        return staging
+
+    def _post_axis(
+        self,
+        axis: int,
+        accumulate: bool,
+        corners: bool,
+        requests: list,
+        arrivals: list[tuple[tuple[slice, ...], Array]],
+        stack: contextlib.ExitStack,
+    ) -> None:
+        """Post the two receives and two sends of a halo exchange along ``axis``.
+
+        Fills ``requests`` with the MPI requests and ``arrivals`` with the
+        ``(storage region, buffer)`` pairs whose received values are written
+        (update) or added (accumulate) once the requests are done.
+        """
+        layout = self._layout
+        # Exchanges only run between different ranks, so under a real MPI
+        # (cunumpy's serial stand-in has no point-to-point calls).
+        comm = cast("MPI.Comm", layout.comm)
+        left, right = layout.neighbours[axis]
+        tag = (_ACCUMULATE_TAG if accumulate else _UPDATE_TAG) + 2 * axis
+        if accumulate:
+            # halo cells go to the neighbour whose block they belong to
+            transfers = [
+                ("lower_halo", left, "upper_interior", right, tag),
+                ("upper_halo", right, "lower_interior", left, tag + 1),
+            ]
+        else:
+            # boundary layers go to the neighbour whose halo they fill
+            transfers = [
+                ("upper_interior", right, "lower_halo", left, tag),
+                ("lower_interior", left, "upper_halo", right, tag + 1),
+            ]
+        in_place = self._sends_in_place()
+        for send_name, dest, recv_name, source, message_tag in transfers:
+            starts, sizes = self._region_bounds(axis, recv_name, corners)
+            if in_place and not accumulate:
+                datatype = _subarray(self._data.shape, starts, sizes, self.dtype.str)
+                requests.append(
+                    comm.Irecv(
+                        [self._data, 1, datatype], source=source, tag=message_tag
+                    )
+                )
+            else:
+                key = (axis, recv_name, corners)
+                buffer = self._buffer(key, sizes)
+                receiving = xp.mpi.mpi_buffer(
+                    buffer, send=False, recv=True, staging=self._staging(key, sizes)
+                )
+                requests.append(
+                    comm.Irecv(
+                        stack.enter_context(receiving), source=source, tag=message_tag
+                    )
+                )
+                if source != MPI.PROC_NULL:
+                    arrivals.append((self._region(axis, recv_name, corners), buffer))
+
+            starts, sizes = self._region_bounds(axis, send_name, corners)
+            if in_place:
+                datatype = _subarray(self._data.shape, starts, sizes, self.dtype.str)
+                requests.append(
+                    comm.Isend([self._data, 1, datatype], dest=dest, tag=message_tag)
+                )
+            else:
+                key = (axis, send_name, corners, "send")
+                buffer = self._buffer(key, sizes)
+                buffer[...] = self._data[self._region(axis, send_name, corners)]
+                sending = xp.mpi.mpi_buffer(buffer, staging=self._staging(key, sizes))
+                requests.append(
+                    comm.Isend(stack.enter_context(sending), dest=dest, tag=message_tag)
+                )
+
+    def _exchange(
+        self, axes: Sequence[int], accumulate: bool, corners: bool
+    ) -> HaloUpdate:
+        """Start the halo exchange along ``axes``; return the handle that finishes it."""
+        requests: list = []
+        arrivals: list[tuple[tuple[slice, ...], Array]] = []
+        stack = contextlib.ExitStack()
+        for axis in axes:
+            self._post_axis(axis, accumulate, corners, requests, arrivals, stack)
+
+        def finish() -> None:
+            MPI.Request.Waitall(requests)
+            stack.close()  # copies staged receives back to the device
+            for region, buffer in arrivals:
+                if accumulate:
+                    self._data[region] += buffer
+                else:
+                    self._data[region] = buffer
+            if accumulate:
+                for axis in axes:
+                    self.clear_halos(axis)
+
+        return HaloUpdate(finish)
+
+    def _exchanged_axes(self, axis: int | None) -> list[int]:
+        """Return the axes with halo cells that exchange with other ranks.
+
+        Axes held whole by this rank are handled locally right away: their
+        periodic halos are copies of the block's own boundary layers.
+        """
+        axes = []
+        for ax in self._axes(axis):
+            if self._layout.halo[ax] == 0:
+                continue
+            if self._layout.distributed and not self._is_self_neighbour(ax):
+                axes.append(ax)
+            elif self._layout.periodic[ax]:
+                self._data[self._region(ax, "lower_halo")] = self._data[
+                    self._region(ax, "upper_interior")
+                ]
+                self._data[self._region(ax, "upper_halo")] = self._data[
+                    self._region(ax, "lower_interior")
+                ]
+        return axes
+
+    def update_halos(
+        self, axis: int | None = None, *, wait: bool = True
+    ) -> HaloUpdate | None:
         """Copy the neighbours' boundary values into the halo cells.
 
         This is what a finite-difference stencil needs before it is applied.
-        Axes are updated one after the other, so corner halos are filled too.
         At walls (non-periodic boundaries) the halo cells are left unchanged.
+        Both directions of an axis are exchanged at the same time, and host
+        storage is sent and received in place, without copies.
+
+        With ``wait=True`` the axes are updated one after the other, so the
+        corner halo cells are filled too. With ``wait=False`` every axis is
+        started at once and a handle is returned: compute on the block, then
+        call its ``wait()`` before reading the halo cells. In that mode the
+        corner halo cells are not updated, and the array must not be written
+        until ``wait()`` returns.
 
         Collective.
 
         Args:
             axis: The axis to update; default: every axis.
+            wait: Whether to finish before returning.
+
+        Returns:
+            ``None``, or with ``wait=False`` the `HaloUpdate` to wait for.
         """
-        for ax in self._axes(axis):
-            self._update_halo(ax)
-
-    def _update_halo(self, axis: int) -> None:
-        """Update the halo cells along one axis; see `update_halos`."""
-        if self._layout.halo[axis] == 0:
-            return
-        regions = self._halo_regions(axis)
-        left, right = self._layout.neighbours[axis]
-
-        if not self._layout.distributed or self._is_self_neighbour(axis):
-            if self._layout.periodic[axis]:
-                self._data[regions["lower_halo"]] = self._data[
-                    regions["upper_interior"]
-                ]
-                self._data[regions["upper_halo"]] = self._data[
-                    regions["lower_interior"]
-                ]
-            return
-
-        # Upper interior goes right; the left neighbour's upper interior fills our lower halo.
-        recv = self._sendrecv(
-            self._data[regions["upper_interior"]],
-            dest=right,
-            source=left,
-            tag=_UPDATE_TAG + 2 * axis,
-        )
-        if left != MPI.PROC_NULL:
-            self._data[regions["lower_halo"]] = recv
-        # Lower interior goes left; the right neighbour's lower interior fills our upper halo.
-        recv = self._sendrecv(
-            self._data[regions["lower_interior"]],
-            dest=left,
-            source=right,
-            tag=_UPDATE_TAG + 2 * axis + 1,
-        )
-        if right != MPI.PROC_NULL:
-            self._data[regions["upper_halo"]] = recv
+        if wait:
+            for ax in self._axes(axis):
+                self._exchange(self._exchanged_axes(ax), False, corners=True).wait()
+            return None
+        return self._exchange(self._exchanged_axes(axis), False, corners=False)
 
     def accumulate_halos(self, axis: int | None = None) -> None:
         """Add the halo cells into the neighbours' boundary cells, then zero them.
 
         This is the scatter-add after depositing particles near the edges of a
         block. At walls (non-periodic boundaries) the halo values are dropped.
+        Axes are handled one after the other, so values deposited in corner
+        halo cells reach the diagonal neighbour.
 
         Collective.
 
@@ -493,44 +737,18 @@ class DistributedArray:
             axis: The axis to accumulate along; default: every axis.
         """
         for ax in self._axes(axis):
-            self._accumulate_halo(ax)
-
-    def _accumulate_halo(self, axis: int) -> None:
-        """Accumulate the halo cells along one axis; see `accumulate_halos`."""
-        if self._layout.halo[axis] == 0:
-            return
-        regions = self._halo_regions(axis)
-        left, right = self._layout.neighbours[axis]
-
-        if not self._layout.distributed or self._is_self_neighbour(axis):
-            if self._layout.periodic[axis]:
-                lower_halo = self._data[regions["lower_halo"]].copy()
-                self._data[regions["lower_interior"]] += self._data[
-                    regions["upper_halo"]
+            if self._layout.halo[ax] == 0:
+                continue
+            if self._layout.distributed and not self._is_self_neighbour(ax):
+                self._exchange([ax], True, corners=True).wait()
+                continue
+            if self._layout.periodic[ax]:
+                lower_halo = self._data[self._region(ax, "lower_halo")].copy()
+                self._data[self._region(ax, "lower_interior")] += self._data[
+                    self._region(ax, "upper_halo")
                 ]
-                self._data[regions["upper_interior"]] += lower_halo
-            self.clear_halos(axis)
-            return
-
-        # Lower halo goes left; the right neighbour's lower halo lands in our upper interior.
-        recv = self._sendrecv(
-            self._data[regions["lower_halo"]],
-            dest=left,
-            source=right,
-            tag=_ACCUMULATE_TAG + 2 * axis,
-        )
-        if right != MPI.PROC_NULL:
-            self._data[regions["upper_interior"]] += recv
-        # Upper halo goes right; the left neighbour's upper halo lands in our lower interior.
-        recv = self._sendrecv(
-            self._data[regions["upper_halo"]],
-            dest=right,
-            source=left,
-            tag=_ACCUMULATE_TAG + 2 * axis + 1,
-        )
-        if left != MPI.PROC_NULL:
-            self._data[regions["lower_interior"]] += recv
-        self.clear_halos(axis)
+                self._data[self._region(ax, "upper_interior")] += lower_halo
+            self.clear_halos(ax)
 
     def clear_halos(self, axis: int | None = None) -> None:
         """Set the halo cells to zero; no communication.
@@ -540,9 +758,8 @@ class DistributedArray:
         """
         for ax in self._axes(axis):
             if self._layout.halo[ax]:
-                regions = self._halo_regions(ax)
-                self._data[regions["lower_halo"]] = 0
-                self._data[regions["upper_halo"]] = 0
+                self._data[self._region(ax, "lower_halo")] = 0
+                self._data[self._region(ax, "upper_halo")] = 0
 
     # ------------------------------------------------------------------ #
     # Elementwise operations
@@ -556,10 +773,6 @@ class DistributedArray:
         raise ValueError(
             f"Layouts must match: {self._layout!r} and {other._layout!r}",
         )
-
-    def _new_like(self, storage: Array) -> Self:
-        """Return an array with this layout around a ufunc result (always new memory)."""
-        return self._with_storage(xp.asarray(storage))
 
     def _axis_is_whole(self, axis: int) -> bool:
         """Return whether the storage spans the whole global extent of ``axis``."""
@@ -605,26 +818,74 @@ class DistributedArray:
         data[self._layout.interior] = global_view[self._layout.global_slices()]
         return data
 
+    def _interior_of(self, operand: Any) -> Any:
+        """Return the part of a coerced operand that lines up with the block."""
+        if xp.isscalar(operand) or operand.ndim == 0:
+            return operand
+        storage_shape = self._layout.storage_shape
+        offset = self.ndim - operand.ndim
+        return operand[
+            tuple(
+                self._layout.interior[offset + k]
+                if extent == storage_shape[offset + k]
+                else slice(None)
+                for k, extent in enumerate(operand.shape)
+            )
+        ]
+
+    def _elementwise(
+        self,
+        op: Callable,
+        inputs: tuple[Any, ...],
+        out: tuple[DistributedArray, ...] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Apply ``op`` to the blocks of ``inputs``; halo cells are not computed.
+
+        Without ``out`` the results get zero halo cells; with ``out`` the
+        results are written into the blocks of ``out``, whose halo cells are
+        left as they are.
+        """
+        local_inputs = [self._interior_of(self._coerce_other_data(x)) for x in inputs]
+        where = kwargs.get("where", True)
+        if where is not True:
+            kwargs["where"] = self._interior_of(self._coerce_other_data(where))
+        interior = self._layout.interior
+        if out is not None:
+            for item in out:
+                self._check_compatibility(item)
+            views = tuple(item._data[interior] for item in out)
+            op(*local_inputs, out=views[0] if len(views) == 1 else views, **kwargs)
+            return out[0] if len(out) == 1 else out
+        result = op(*local_inputs, **kwargs)
+        wrapped = []
+        for block in result if isinstance(result, tuple) else (result,):
+            block = xp.asarray(block)
+            storage = xp.zeros(self._layout.storage_shape, dtype=block.dtype)
+            storage[interior] = block
+            wrapped.append(self._with_storage(storage))
+        return tuple(wrapped) if isinstance(result, tuple) else wrapped[0]
+
     def _binary_op(self, other: Any, op: Callable) -> Self:
         """Apply an elementwise binary operation."""
-        return self._new_like(op(self._data, self._coerce_other_data(other)))
+        return self._elementwise(op, (self, other))
 
     def _binary_rop(self, other: Any, op: Callable) -> Self:
         """Apply a reflected elementwise binary operation."""
-        return self._new_like(op(self._coerce_other_data(other), self._data))
+        return self._elementwise(op, (other, self))
 
     def _binary_iop(self, other: Any, op: Callable) -> Self:
-        """Apply an in-place elementwise binary operation."""
-        op(self._data, self._coerce_other_data(other), out=self._data)
-        return self
+        """Apply an in-place elementwise binary operation; halo cells are kept."""
+        return self._elementwise(op, (self, other), out=(self,))
 
     def __array_ufunc__(
         self, ufunc: np.ufunc, method: str, *inputs: Any, **kwargs: Any
     ) -> DistributedArray | tuple[DistributedArray, ...] | NotImplementedType:
-        """Apply a NumPy ufunc elementwise to the local storage.
+        """Apply a NumPy ufunc elementwise to the blocks.
 
-        ``out=`` accepts distributed arrays with the same layout and writes in
-        place, so ``np.multiply(a, 2.0, out=a)`` allocates nothing.
+        The result gets zero halo cells. ``out=`` accepts distributed arrays
+        with the same layout and writes into their blocks in place (their halo
+        cells are kept), so ``np.multiply(a, 2.0, out=a)`` allocates nothing.
 
         Args:
             ufunc: The ufunc being called.
@@ -643,23 +904,11 @@ class DistributedArray:
             self,
         )
         out = kwargs.pop("out", None)
-        if out is not None:
-            if not all(isinstance(item, DistributedArray) for item in out):
-                return NotImplemented
-            for item in out:
-                template._check_compatibility(item)
-            kwargs["out"] = tuple(item._data for item in out)
-        where = kwargs.get("where", True)
-        if where is not True:
-            kwargs["where"] = template._coerce_other_data(where)
-        local_inputs = [template._coerce_other_data(item) for item in inputs]
-
-        result = getattr(ufunc, method)(*local_inputs, **kwargs)
-        if out is not None:
-            return out[0] if len(out) == 1 else out
-        if isinstance(result, tuple):
-            return tuple(template._new_like(item) for item in result)
-        return template._new_like(result)
+        if out is not None and not all(
+            isinstance(item, DistributedArray) for item in out
+        ):
+            return NotImplemented
+        return template._elementwise(ufunc, inputs, out=out, **kwargs)
 
     def __array__(
         self, dtype: DTypeLike | None = None, copy: bool | None = None
@@ -693,40 +942,21 @@ class DistributedArray:
             return local_value
         return self._layout.comm.allreduce(local_value, op=mpi_op)
 
-    def _extremum_identity(self, mpi_op: MPI.Op) -> Scalar:
-        """Return the neutral element of ``MPI.MIN``/``MPI.MAX`` for this dtype."""
-        dtype: np.dtype[Any] = np.dtype(self.dtype)
-        is_min = mpi_op == MPI.MIN
-        if dtype.kind == "b":
-            return np.True_ if is_min else np.False_
-        if dtype.kind in "iu":
-            info = np.iinfo(dtype)
-            return dtype.type(info.max if is_min else info.min)
-        if dtype.kind == "f":
-            return dtype.type(np.inf if is_min else -np.inf)
-        raise TypeError(f"min/max are not supported for dtype {dtype}")
-
     def _global_reduction(
         self, op: Callable, mpi_op: MPI.Op, **op_kwargs: Any
     ) -> Scalar:
-        """Reduce all owned cells to one host scalar on every rank.
+        """Reduce all blocks to one host scalar on every rank.
 
-        A rank that owns no cells contributes the neutral element, so layouts
-        that leave some ranks empty still reduce correctly.
+        Every rank owns at least one cell of a non-empty array (see `Layout`),
+        so each one reduces its own block and the results are combined.
         """
-        identity = None
         if mpi_op in (MPI.MIN, MPI.MAX):
             # Raised on every rank alike, so that no rank waits in allreduce.
             if self.size == 0:
                 raise ValueError("zero-size array has no minimum or maximum")
-            identity = self._extremum_identity(mpi_op)
-        local = self.local
-        if identity is not None and local.size == 0:
-            value = identity
-        else:
-            # sum/prod of an empty block already return their neutral element.
-            value = op(local, **op_kwargs)
-        return self._allreduce(value, mpi_op)
+            if self.dtype.kind == "c":
+                raise TypeError(f"min/max are not supported for dtype {self.dtype}")
+        return self._allreduce(op(self.local, **op_kwargs), mpi_op)
 
     def _finish(self, value: Scalar, keepdims: bool) -> Scalar | Array:
         """Apply ``keepdims`` to the result of a whole-array reduction."""
@@ -928,11 +1158,28 @@ class DistributedArray:
                 correction=ddof,  # the array API name of numpy's ddof
                 keepdims=keepdims,
             )
-        mean = self.mean(dtype=dtype)
-        local = xp.sum(xp.abs(self.local - mean) ** 2, dtype=dtype)
-        return self._finish(
-            self._allreduce(local, MPI.SUM) / (self.size - ddof), keepdims
-        )
+        # Each rank's count, mean and sum of squared deviations, combined in
+        # one collective with Chan et al.'s parallel update (numerically like
+        # two passes, but one round of communication).
+        local = self.local
+        count = int(local.size)
+        local_mean = _host(xp.sum(local, dtype=dtype)) / count if count else 0.0
+        deviation = local - local_mean
+        if deviation.dtype.kind == "c":
+            squares = xp.sum(deviation.real**2 + deviation.imag**2, dtype=dtype)
+        else:
+            squares = xp.sum(deviation * deviation, dtype=dtype)
+        squares = _host(squares)
+        stats = [(count, local_mean, squares)]
+        if self._layout.distributed:
+            stats = self._layout.comm.allgather(stats[0])
+        total, mean, m2 = 0, 0.0, 0.0
+        for n, block_mean, block_m2 in stats:
+            delta = block_mean - mean
+            mean = mean + delta * n / (total + n)
+            m2 = m2 + block_m2 + abs(delta) ** 2 * total * n / (total + n)
+            total += n
+        return self._finish(m2 / (total - ddof), keepdims)
 
     def std(
         self,
@@ -1128,11 +1375,21 @@ class DistributedArray:
             )
         return bool(self.get((0,) * self.ndim))
 
+    def _summary(self, edge: int = 3) -> str:
+        """Return this rank's block as text, copying at most ``2 * edge`` values."""
+        block = self.local
+        if block.size <= 2 * edge:
+            return np.array2string(xp.to_numpy(block), separator=", ")
+        flat = block.reshape(-1)
+        head = np.array2string(xp.to_numpy(flat[:edge]), separator=", ")[1:-1]
+        tail = np.array2string(xp.to_numpy(flat[-edge:]), separator=", ")[1:-1]
+        return f"[{head}, ..., {tail}] ({block.size} values)"
+
     def __repr__(self) -> str:
         """Return the layout and this rank's block; no communication."""
         layout = self._layout
         bounds = ", ".join(f"{start}:{end}" for start, end in layout.index_bounds)
-        local = np.array2string(xp.to_numpy(self.local), separator=", ", threshold=20)
+        local = self._summary()
         return (
             f"{type(self).__name__}(shape={self.shape}, dtype={self.dtype}, "
             f"split={layout.split}, rank {layout.rank} of {layout.size} holds "
@@ -1205,15 +1462,15 @@ class DistributedArray:
 
     def __neg__(self) -> Self:
         """Negate elementwise."""
-        return self._with_storage(-self._data)
+        return self._elementwise(xp.negative, (self,))
 
     def __pos__(self) -> Self:
-        """Return a copy."""
-        return self.copy()
+        """Return the values elementwise (a new array)."""
+        return self._elementwise(xp.positive, (self,))
 
     def __abs__(self) -> Self:
         """Return the absolute values."""
-        return self._with_storage(xp.abs(self._data))
+        return self._elementwise(xp.abs, (self,))
 
     def __lt__(self, other: Any) -> Self:
         """Compare elementwise."""
