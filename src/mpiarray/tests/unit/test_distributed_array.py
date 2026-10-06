@@ -1,12 +1,14 @@
 """Tests for DistributedArray: gathers, indexing, halos, operators and reductions.
 
-Every test runs serially and under ``mpiexec -n N`` for any N.
+Lengths scale with the number of ranks, since a split axis needs at least one
+element per rank; every test runs serially and under ``mpiexec -n N``.
 """
 
 from __future__ import annotations
 
 import math
-from typing import Any
+import warnings
+from typing import Any, cast
 
 import cunumpy as xp
 import numpy as np
@@ -14,10 +16,13 @@ import pytest
 
 import mpiarray as mpa
 from mpiarray import DistributedArray, Layout
+from mpiarray.tests.unit._mpi_jobs import SERIAL_RUN, run_job
 
 MPI = xp.mpi.get_mpi()
 comm = MPI.COMM_WORLD
 rank, size = comm.Get_rank(), comm.Get_size()
+N = size + 3  # an axis length that every rank count up to N can split
+W = 2 * size + 3  # long enough for halo width 2 on every rank
 
 
 def _np(data: Any) -> np.ndarray:
@@ -37,7 +42,7 @@ def _halo_mask(a: DistributedArray) -> np.ndarray:
 
 
 def test_constructor_checks_the_storage_shape() -> None:
-    layout = Layout((4, 3), halo=1)
+    layout = Layout((N, 3), halo=1)
     a = DistributedArray(layout, xp.zeros(layout.storage_shape))
     assert a.layout is layout
     with pytest.raises(ValueError, match="storage shape"):
@@ -45,12 +50,12 @@ def test_constructor_checks_the_storage_shape() -> None:
 
 
 def test_properties() -> None:
-    a = mpa.zeros((5, 3), dtype=np.int32, halo=1)
-    assert (a.shape, a.ndim, a.size) == ((5, 3), 2, 15)
-    assert (a.dtype, a.itemsize, a.nbytes) == (np.dtype(np.int32), 4, 60)
+    a = mpa.zeros((N, 3), dtype=np.int32, halo=1)
+    assert (a.shape, a.ndim, a.size) == ((N, 3), 2, 3 * N)
+    assert (a.dtype, a.itemsize, a.nbytes) == (np.dtype(np.int32), 4, 12 * N)
     assert a.local.shape == a.layout.local_shape
     assert a.local_with_halos.shape == a.layout.storage_shape
-    assert len(a) == 5
+    assert len(a) == N
     with pytest.raises(TypeError, match="unsized"):
         len(mpa.zeros(()))
 
@@ -59,7 +64,7 @@ def test_properties() -> None:
 @pytest.mark.parametrize("halo", [0, 2])
 @pytest.mark.parametrize("split", [0, (0, 1), None])
 def test_gather_reassembles_uneven_blocks(dtype: type, halo: int, split) -> None:
-    data = (np.arange(7 * 5 * 2).reshape(7, 5, 2) % 3).astype(dtype)
+    data = (np.arange(W * (W + 1) * 2).reshape(W, W + 1, 2) % 3).astype(dtype)
     a = mpa.array(data, split=split, halo=(halo, halo, 0))
     gathered = a.gather()
     assert gathered.dtype == np.dtype(dtype)
@@ -113,12 +118,17 @@ def test_copy_astype_and_subclasses() -> None:
 
 
 def test_repr_shows_the_layout_and_the_local_block_only() -> None:
-    a = mpa.array(np.arange(4))
-    start, end = a.layout.index_bounds[0]
+    a = mpa.array(np.arange(size))  # one element per rank: shown whole
     text = repr(a)
-    assert text.startswith("DistributedArray(shape=(4,), dtype=int64, split=(0,)")
-    assert f"rank {rank} of {size} holds [{start}:{end}]" in text
-    assert str(list(range(start, end))) in text
+    assert text.startswith(f"DistributedArray(shape=({size},), dtype=int64, split=(0,)")
+    assert text.endswith(f"rank {rank} of {size} holds [{rank}:{rank + 1}]: [{rank}])")
+
+    big = mpa.arange(100 * size)  # 100 per rank: only the edges are copied
+    start, end = big.layout.index_bounds[0]
+    assert repr(big).endswith(
+        f"[{start}, {start + 1}, {start + 2}, ..., {end - 3}, {end - 2}, {end - 1}] "
+        f"(100 values))"
+    )
 
 
 # -------------------------------------------------------------------------- #
@@ -137,7 +147,7 @@ def test_get_and_getitem_return_the_same_value_on_every_rank() -> None:
         assert a.get(index) == data[index]
         assert a[index] == data[index]
         assert comm.allgather(a[index]) == [data[index]] * size
-    assert mpa.arange(5).get(-2) == 3
+    assert mpa.arange(N).get(-2) == N - 2
     np.testing.assert_array_equal(_np(a[4]), data[4])
     np.testing.assert_array_equal(_np(a[-1, 2]), data[-1, 2])
     np.testing.assert_array_equal(_np(a[::-2, 1:4]), data[::-2, 1:4])
@@ -176,6 +186,20 @@ BASIC_INDICES = [
     slice(None, None, 2),
     np.int64(3),
 ]
+
+
+@pytest.mark.parametrize("index", BASIC_INDICES)
+@pytest.mark.parametrize("split", [(0, 1), None])
+def test_basic_selections_gather_like_numpy(index: Any, split) -> None:
+    data = np.arange(9 * 7 * 3, dtype=float).reshape(9, 7, 3)
+    a = mpa.array(data, split=split, halo=(2, 2, 0))
+    expected = data[index]
+    result = a[index]
+    if np.ndim(expected) == 0:
+        assert result == expected
+    else:
+        assert result.shape == expected.shape
+        np.testing.assert_array_equal(_np(result), expected)
 
 
 @pytest.mark.parametrize("index", BASIC_INDICES)
@@ -226,15 +250,15 @@ def test_advanced_assignment_gathers() -> None:
 
 
 def test_iteration_and_truth_value() -> None:
-    data = np.arange(6.0).reshape(3, 2)
+    data = np.arange(2.0 * N).reshape(N, 2)
     rows = list(mpa.array(data))
-    assert len(rows) == 3
+    assert len(rows) == N
     np.testing.assert_array_equal(_np(rows[1]), data[1])
-    assert bool(mpa.array([3.0]))
-    assert not mpa.zeros(1)
+    assert bool(mpa.array([3.0], split=None))
+    assert not mpa.zeros(1, split=None)
     assert bool(mpa.full((), True))
     with pytest.raises(ValueError, match="ambiguous"):
-        bool(mpa.zeros(2))
+        bool(mpa.zeros(N))
 
 
 # -------------------------------------------------------------------------- #
@@ -243,6 +267,7 @@ def test_iteration_and_truth_value() -> None:
 # (shape, split, halo per unit width)
 HALO_LAYOUTS = [
     ((16,), 0, (1,)),
+    ((2 * size,), 0, (1,)),  # with width 2: every block exactly as wide as the halo
     ((12, 10), (0, 1), (1, 1)),
     ((12, 10, 3), (0, 1), (1, 1, 0)),
     ((8, 6, 6), (0, 1, 2), (1, 1, 1)),
@@ -358,6 +383,60 @@ def test_update_halos_matches_the_global_neighbours(
     np.testing.assert_array_equal(_np(a.local_with_halos), expected)
 
 
+def test_cartesian_layout_matches_mpi_and_updates_halos() -> None:
+    layout = Layout((W, W), split=(0, 1), halo=1, periodic=(True, False), reorder=True)
+    assert layout == Layout(
+        (W, W), split=(0, 1), halo=1, periodic=(True, False), reorder=True
+    )
+    if size > 1:
+        assert layout.comm is not comm
+        for axis in range(2):
+            assert layout.neighbours[axis] == cast(Any, layout.comm).Shift(axis, 1)
+    data = np.arange(W * W, dtype=float).reshape(W, W)
+    a = mpa.array(data, layout=layout)
+    a.update_halos()
+    indices, valid = _storage_indices(a, layout.rank)
+    expected = np.zeros(layout.storage_shape)
+    expected[np.ix_(*valid)] = data[
+        np.ix_(*[i[m] for i, m in zip(indices, valid, strict=True)])
+    ]
+    np.testing.assert_array_equal(_np(a.local_with_halos), expected)
+    np.testing.assert_array_equal(a.to_numpy(), data)
+
+
+@pytest.mark.parametrize("layout_order", ["C", "F"])
+@pytest.mark.parametrize(("shape", "split", "halo"), HALO_LAYOUTS)
+def test_update_halos_without_waiting_skips_only_the_corners(
+    shape, split, halo, layout_order
+) -> None:
+    """``wait=False`` updates the faces; storage in Fortran order goes via buffers."""
+    data = np.arange(math.prod(shape), dtype=float).reshape(shape) + 1.0
+    periodic = tuple(bool(h) for h in halo)
+    layout = Layout(shape, split=split, halo=halo, periodic=periodic)
+    storage = xp.zeros(layout.storage_shape)
+    if layout_order == "F":
+        storage = xp.asfortranarray(storage)
+    a = DistributedArray(layout, storage)
+    a[...] = xp.asarray(data)
+    pending = a.update_halos(wait=False)
+    assert pending is not None
+    interior_sum = a.local.sum()  # work on the block while the halos travel
+    pending.wait()
+    pending.wait()  # a second wait does nothing
+    assert pending.done and interior_sum == _np(a.local).sum()
+
+    reference = mpa.array(data, layout=layout)
+    reference.update_halos()
+    got, want = _np(a.local_with_halos), _np(reference.local_with_halos)
+    in_halo = np.zeros(layout.storage_shape, dtype=int)  # along how many axes
+    for axis, (n, h) in enumerate(zip(layout.storage_shape, layout.halo, strict=True)):
+        along = np.zeros(n, dtype=int)
+        along[:h] = along[n - h :] = 1
+        in_halo += along.reshape([-1 if ax == axis else 1 for ax in range(len(shape))])
+    corner = in_halo >= 2
+    np.testing.assert_array_equal(got[~corner], want[~corner])  # corners: undefined
+
+
 def test_halo_methods_work_per_axis() -> None:
     data = np.arange(12.0).reshape(4, 3) + 1
     a = mpa.array(data, split=None, halo=1, periodic=True)
@@ -404,10 +483,34 @@ def test_array_operands_broadcast_like_numpy_on_the_global_shape(operand_shape) 
     np.testing.assert_allclose(a.to_numpy(), data + operand)
 
 
-def test_storage_shaped_operands_are_used_as_they_are() -> None:
-    a = mpa.ones((6, 2), halo=1)
-    b = a + xp.full(a.layout.storage_shape, 2.0)
-    assert (_np(b.local_with_halos) == 3.0).all()
+def test_storage_shaped_operands_line_up_with_the_storage() -> None:
+    a = mpa.ones((N, 2), halo=1)
+    operand = xp.full(a.layout.storage_shape, 2.0)
+    operand[a.layout.interior] = xp.arange(float(a.local.size)).reshape(a.local.shape)
+    b = a + operand
+    np.testing.assert_array_equal(_np(b.local), 1 + _np(operand[a.layout.interior]))
+
+
+def test_results_have_zero_halos_and_in_place_operations_keep_them() -> None:
+    a = mpa.ones((W, 3), halo=1)
+    mask = _halo_mask(a)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")  # 0 / 0 in the halo cells would warn
+        quotient = a / a
+        np.testing.assert_array_equal(_np(quotient.local), 1.0)
+        assert not _np(quotient.local_with_halos)[mask].any()
+        results = cast(
+            "tuple[DistributedArray, ...]",
+            (-a, +a, abs(a), np.sqrt(a), a > 0, *np.divmod(a, 2.0)),
+        )
+        for result in results:
+            assert not _np(result.local_with_halos)[mask].any()
+    b = a.copy()
+    b.local_with_halos[xp.asarray(mask)] = 7.0
+    b += 1
+    np.add(b, 1, out=b)  # ty: ignore[no-matching-overload]
+    np.testing.assert_array_equal(_np(b.local), 3.0)
+    assert (_np(b.local_with_halos)[mask] == 7.0).all()
 
 
 @pytest.mark.parametrize("operand_shape", [(5,), (7, 1, 1), (2, 8, 6, 3)])
@@ -418,18 +521,18 @@ def test_operands_that_do_not_broadcast_raise(operand_shape) -> None:
 
 
 def test_operands_with_another_layout_raise() -> None:
-    a = mpa.zeros((4, 3), halo=1)
+    a = mpa.zeros((W, 3), halo=1)
     with pytest.raises(ValueError, match="Shapes must match"):
-        a + mpa.zeros((3, 4), halo=1)
+        a + mpa.zeros((W, 4), halo=1)
     with pytest.raises(ValueError, match="Layouts must match"):
-        a + mpa.zeros((4, 3), halo=2)
+        a + mpa.zeros((W, 3), halo=2)
     with pytest.raises(ValueError, match="Layouts must match"):
-        a + mpa.zeros((4, 3), halo=1, comm=MPI.COMM_SELF)
+        a + mpa.zeros((W, 3), halo=1, comm=MPI.COMM_SELF)
 
 
 def test_operators_match_numpy() -> None:
-    x = np.arange(1, 13).reshape(4, 3)
-    y = np.arange(12, 0, -1).reshape(4, 3)
+    x = np.arange(1, 3 * N + 1).reshape(N, 3)
+    y = x[::-1, ::-1].copy()
     a, b = mpa.array(x), mpa.array(y)
     cases = {
         "a + b": (a + b, x + y),
@@ -468,7 +571,7 @@ def test_operators_match_numpy() -> None:
 
 
 def test_ufuncs_with_out_where_and_several_outputs() -> None:
-    data = np.arange(1, 25, dtype=float).reshape(6, 4)
+    data = np.arange(1, 4 * N + 1, dtype=float).reshape(N, 4)
     a = mpa.array(data, halo=1)
     storage = a.local_with_halos
     assert np.multiply(a, 2.0, out=a) is a  # ty: ignore[no-matching-overload]
@@ -480,7 +583,8 @@ def test_ufuncs_with_out_where_and_several_outputs() -> None:
     np.testing.assert_array_equal(target.to_numpy(), data * 2 + 1)
 
     quotient, remainder = mpa.zeros_like(a), mpa.zeros_like(a)
-    outputs = np.divmod(a, 5.0, out=(quotient, remainder))  # ty: ignore[no-matching-overload]
+    pair = (quotient, remainder)
+    outputs = np.divmod(a, 5.0, out=pair)  # ty: ignore[no-matching-overload]
     assert outputs[0] is quotient and outputs[1] is remainder
     np.testing.assert_array_equal(quotient.to_numpy(), (data * 2) // 5)
     q, r = np.divmod(a, 5.0)
@@ -493,15 +597,17 @@ def test_ufuncs_with_out_where_and_several_outputs() -> None:
     )
 
     with pytest.raises(ValueError, match="Shapes must match"):
-        np.add(a, 1.0, out=mpa.zeros((4, 6), halo=1))  # ty: ignore[no-matching-overload]
+        wrong = mpa.zeros((N, 5), halo=1)
+        np.add(a, 1.0, out=wrong)  # ty: ignore[no-matching-overload]
     with pytest.raises(TypeError):
-        np.add(a, 1.0, out=np.zeros((6, 4)))
+        np.add(a, 1.0, out=np.zeros((N, 4)))
     with pytest.raises(TypeError):
-        np.add.reduce(a)  # ty: ignore[no-matching-overload]  # only plain ufunc calls are distributed
+        # only plain ufunc calls are distributed
+        np.add.reduce(a)  # ty: ignore[no-matching-overload]
 
 
 def test_array_protocol_gathers() -> None:
-    data = np.arange(6.0).reshape(2, 3)
+    data = np.arange(3.0 * N).reshape(N, 3)
     a = mpa.array(data)
     np.testing.assert_array_equal(_np(a.__array__()), data)
     np.testing.assert_array_equal(_np(a.__array__(copy=True)), data)
@@ -514,17 +620,32 @@ def test_array_protocol_gathers() -> None:
 
 
 @pytest.mark.parametrize("dtype", [np.float64, np.int64, np.bool_])
-@pytest.mark.parametrize("shape", [(1,), (1, 3), (2, 1)])
-def test_reductions_with_ranks_owning_no_cells(dtype, shape) -> None:
-    data = (np.arange(math.prod(shape)).reshape(shape) + 2).astype(dtype)
-    a = mpa.array(data, split=tuple(range(len(shape))), halo=1)
+@pytest.mark.parametrize("shape", [(size,), (size, 3), (size, 1)])
+def test_reductions_with_one_cell_per_rank(dtype, shape) -> None:
+    data = (np.arange(math.prod(shape)).reshape(shape) % 5 + 1).astype(dtype)
+    a = mpa.array(data, halo=1)
     assert a.sum() == data.sum()
     assert a.prod() == data.prod()
     assert a.min() == data.min()
     assert a.max() == data.max()
     assert np.isclose(a.mean(), data.mean())
+    assert np.isclose(a.var(), data.var())
     assert a.all() == data.all()
     assert a.any() == data.any()
+
+
+@pytest.mark.parametrize("dtype", [np.float64, np.int64, np.complex128])
+@pytest.mark.parametrize("ddof", [0, 1])
+def test_var_and_std_combine_uneven_blocks_in_one_collective(dtype, ddof) -> None:
+    rng = np.random.default_rng(7)
+    data = rng.normal(1e6, 3.0, size=(W, 3))  # a large mean: needs the stable update
+    if dtype is np.complex128:
+        data = data + 1j * rng.normal(-2.0, 1.0, size=(W, 3))
+    data = data.astype(dtype)
+    a = mpa.array(data, split=(0, 1) if size > 1 else 0)
+    assert a.var(ddof=ddof) == pytest.approx(np.var(data, ddof=ddof), rel=1e-9)
+    assert a.std(ddof=ddof) == pytest.approx(np.std(data, ddof=ddof), rel=1e-9)
+    assert mpa.array(data, split=None).var() == pytest.approx(np.var(data), rel=1e-9)
 
 
 def test_whole_array_reductions_return_host_scalars() -> None:
@@ -536,14 +657,14 @@ def test_whole_array_reductions_return_host_scalars() -> None:
 
 
 def test_zero_size_and_complex_min_max_raise_on_every_rank() -> None:
-    empty = mpa.zeros((0, 3))
+    empty = mpa.zeros((0, 3), split=None)
     with pytest.raises(ValueError, match="zero-size"):
         empty.min()
     with pytest.raises(ValueError, match="zero-size"):
         empty.max()
     assert empty.sum() == 0
     # with more ranks than cells some ranks own nothing; all of them must raise
-    complex_array = mpa.zeros(1, dtype=np.complex128)
+    complex_array = mpa.zeros(size, dtype=np.complex128)
     for reduction in (complex_array.min, complex_array.max):
         with pytest.raises(TypeError, match="min/max are not supported"):
             reduction()
@@ -570,7 +691,7 @@ def test_numpy_reduction_functions_dispatch_to_the_methods() -> None:
 
 @pytest.mark.parametrize("axis", [0, 1, (0, 1)])
 def test_reductions_along_an_axis_match_numpy(axis) -> None:
-    data = np.arange(1.0, 13.0).reshape(4, 3)
+    data = np.arange(1.0, N * N + 1).reshape(N, N)
     a = mpa.array(data, split=(0, 1))
     for name in ("sum", "prod", "min", "max", "mean", "var", "std", "all", "any"):
         operand, reference = (a > 6, data > 6) if name in ("all", "any") else (a, data)
@@ -587,7 +708,7 @@ def test_reductions_along_an_axis_match_numpy(axis) -> None:
 
 @pytest.mark.parametrize("dtype", [np.float64, np.complex128, np.int64])
 @pytest.mark.parametrize(
-    ("shape", "split"), [((9, 7, 2), (0, 1)), ((1,), 0), ((6, 4), None)]
+    ("shape", "split"), [((W, W, 2), (0, 1)), ((size,), 0), ((6, 4), None)]
 )
 def test_vdot_and_norm_cover_every_cell_once(shape, split, dtype) -> None:
     rng = np.random.default_rng(3)
@@ -607,11 +728,11 @@ def test_vdot_and_norm_cover_every_cell_once(shape, split, dtype) -> None:
 
 
 def test_vdot_and_norm_reject_bad_arguments() -> None:
-    a = mpa.zeros((6, 4))
+    a = mpa.zeros((N, 4))
     with pytest.raises(ValueError, match="Shapes must match"):
-        a.vdot(mpa.zeros((4, 6)))
+        a.vdot(mpa.zeros((N, 5)))
     with pytest.raises(TypeError, match="DistributedArray"):
-        a.vdot(np.zeros((6, 4)))  # ty: ignore[invalid-argument-type]
+        a.vdot(np.zeros((N, 4)))  # ty: ignore[invalid-argument-type]
     with pytest.raises(ValueError, match="norm order"):
         a.norm(3)
 
@@ -681,38 +802,24 @@ np.savez(
 """
 
 
-@pytest.mark.skipif(size != 1, reason="starts its own 2-rank MPI job")
+@pytest.mark.skipif(not SERIAL_RUN, reason="starts its own 2-rank MPI job")
 def test_host_staged_communication_matches_direct(tmp_path) -> None:
     """CuPy arrays staged through the host (no CUDA-aware MPI) give NumPy's results.
 
     Runs on cunumpy's fake CuPy, so it needs no GPU, only an MPI launcher.
     """
-    import os
-    import shutil
-    import subprocess
-    import sys
     from pathlib import Path
 
-    pytest.importorskip("mpi4py", reason="needs mpi4py (the mpi extra)")
-    launcher = shutil.which("mpiexec") or shutil.which("mpirun")
-    if launcher is None:
-        pytest.skip("needs mpiexec to start a 2-rank job")
     src_dir = str(Path(__file__).resolve().parents[3])
     script = tmp_path / "staging.py"
     script.write_text(_STAGING_SCRIPT)
 
     def run(backend: str) -> list[Any]:
-        env = {**os.environ, "CUNUMPY_BACKEND": backend}
-        env.pop("CUNUMPY_FAKE_CUPY", None)
+        env = {"CUNUMPY_BACKEND": backend, "CUNUMPY_FAKE_CUPY": "0"}
         if backend == "cupy":
             env["CUNUMPY_FAKE_CUPY"] = "1"
         prefix = str(tmp_path / backend)
-        subprocess.run(
-            [launcher, "-n", "2", sys.executable, str(script), prefix, src_dir],
-            env=env,
-            check=True,
-            timeout=120,
-        )
+        run_job(2, [str(script), prefix, src_dir], env=env)
         return [np.load(f"{prefix}_{r}.npz") for r in range(2)]
 
     direct, staged = run("numpy"), run("cupy")
