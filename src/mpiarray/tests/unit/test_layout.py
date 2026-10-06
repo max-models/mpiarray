@@ -233,6 +233,22 @@ def test_split_axes_need_an_element_per_rank() -> None:
     assert Layout((0, 5), comm=fake_comm(2, 0), split=None).replicated
 
 
+def test_grids_that_do_not_fit_fall_back_to_one_that_does() -> None:
+    from mpiarray.layout import _fitting_grid
+
+    # (2, 2) gives axis 0 two ranks for one element; (1, 4) fits
+    assert Layout((1, 1000), comm=fake_comm(4, 0), split=(0, 1)).process_grid == (1, 4)
+    layout = Layout((1, 6, 1000), comm=fake_comm(8, 0), split=(0, 1, 2))
+    assert layout.process_grid == (1, 1, 8)
+    # among grids that fit, the smallest halo surface wins
+    assert _fitting_grid(6, (4, 100, 100), (0, 1, 2)) == (1, 2, 3)
+    assert _fitting_grid(8, (2, 2), (0, 1)) is None
+    with pytest.raises(ValueError, match="split over"):
+        Layout((2, 2), comm=fake_comm(8, 0), split=(0, 1))
+    # when the usual choice fits, it is kept
+    assert Layout((10, 7), comm=fake_comm(4, 0), split=(0, 1)).process_grid == (2, 2)
+
+
 def test_halos_must_fit_in_the_smallest_block() -> None:
     # 10 elements on 4 ranks: blocks of 3, 3, 2, 2
     assert Layout(10, comm=fake_comm(4, 0), halo=2).halo == (2,)

@@ -36,8 +36,28 @@ rank 3: [3 | 4 4 | 1]
 ```
 
 Without periodicity the outer halo cells of rank 0 and rank 3 keep their previous value
-(`0` for a new array). Zero halo cells at a wall act as a homogeneous Dirichlet boundary
-for a stencil; write other boundary values into them yourself after `update_halos()`.
+(`0` for a new array), unless a boundary condition is given.
+
+### Boundary conditions
+
+At walls there is no neighbour to copy from. `update_halos(boundary=...)` fills those halo
+cells, after the exchange along the same axis (so corners stay consistent):
+
+| `boundary`      | halo cells at a wall                                   | as `numpy.pad` mode |
+| --------------- | ------------------------------------------------------ | ------------------- |
+| `None`          | left as they are (default)                             |                     |
+| a number, `"zero"` | that constant: a Dirichlet condition                | `constant`          |
+| `"edge"`        | the nearest value of the block: zero gradient (Neumann) | `edge`             |
+| `"symmetric"`   | the block mirrored, edge value included                | `symmetric`         |
+| `"reflect"`     | the block mirrored about the edge value                | `reflect`           |
+
+```python
+u.update_halos(boundary="edge")  # insulated walls: no flux
+u.update_halos(boundary=1.0)  # walls held at 1
+```
+
+The result equals `numpy.pad` of the global array, axis after axis. Periodic axes have no
+walls; for other conditions per wall, write the halo cells yourself after `update_halos()`.
 
 ### Example: a Laplacian
 

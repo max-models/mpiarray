@@ -22,13 +22,13 @@ from __future__ import annotations
 import hashlib
 import math
 from collections.abc import Callable, Sequence
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import cunumpy as xp
 import numpy as np
 from numpy.typing import DTypeLike
 
-from mpiarray._mpi import Comm, debug_checks
+from mpiarray._mpi import MPI, Comm, check_collective, debug_checks, default_comm
 from mpiarray.distributed_array import Array, DistributedArray
 from mpiarray.layout import (
     DEFAULT,
@@ -391,6 +391,139 @@ def asarray(
         process_grid=process_grid,
         layout=layout,
     )
+
+
+def from_local(
+    block: Any,
+    *,
+    split: int | None = 0,
+    halo: HaloLike = 0,
+    periodic: PeriodicLike = False,
+    comm: Comm | None = None,
+    layout: Layout | None = None,
+    with_halos: bool = False,
+) -> DistributedArray:
+    """Return a distributed array made of the blocks the ranks already hold.
+
+    The inverse of ``a.local``: each rank passes its own piece, and nothing
+    global is ever built. Without ``layout``, the pieces are stacked in rank
+    order along the ``split`` axis (their other extents must agree), the
+    global shape is the result, and pieces whose lengths differ from the
+    near-even split are redistributed (one ``Alltoallv``). With ``split=None``
+    every rank passes the whole array.
+
+    Collective.
+
+    Args:
+        block: This rank's piece, a NumPy or CuPy array (or anything
+            ``asarray`` takes).
+        split: The axis along which the pieces are stacked, or ``None``.
+        halo: The halo width of the result; the halo cells start at zero.
+        periodic: Whether each axis wraps around.
+        comm: The communicator.
+        layout: An existing layout; then ``block`` must have its local shape
+            (its storage shape with ``with_halos``) and is used as it is.
+        with_halos: Whether ``block`` includes the halo cells (only with
+            ``layout``).
+
+    Returns:
+        The array; the pieces are copied, except with ``layout``.
+
+    Raises:
+        ValueError: On every rank, if the pieces do not fit together or do not
+            match ``layout``.
+    """
+    block = xp.asarray(block)
+    if layout is not None:
+        expected = layout.storage_shape if with_halos else layout.local_shape
+        fits = tuple(block.shape) == expected
+        if layout.distributed:
+            check_collective(layout.comm, "from_local")
+            fits = bool(layout.comm.allreduce(fits, op=MPI.LAND))
+        if not fits:
+            raise ValueError(
+                f"the blocks do not match the layout's {'storage' if with_halos else 'local'} "
+                f"shapes (rank {layout.rank}: {tuple(block.shape)}, expected {expected})",
+            )
+        if with_halos:
+            return DistributedArray(layout, block)
+        storage = xp.zeros(layout.storage_shape, dtype=block.dtype)
+        storage[layout.interior] = block
+        return DistributedArray(layout, storage)
+    if with_halos:
+        raise ValueError("with_halos=True needs a layout")
+
+    comm = default_comm() if comm is None else comm
+    size = comm.Get_size()
+    if split is not None and not -block.ndim <= split < block.ndim:
+        raise ValueError(
+            f"the blocks cannot be stacked along axis {split}: they have "
+            f"{block.ndim} dimensions",
+        )
+    if split is None or size == 1:
+        layout = Layout(
+            block.shape,
+            comm=comm,
+            split=None if split is None else split % block.ndim,
+            halo=halo,
+            periodic=periodic,
+        )
+        return from_local(block, layout=layout)
+
+    axis = split % block.ndim
+    check_collective(comm, "from_local")
+    pieces = comm.allgather((tuple(block.shape), block.dtype.str))
+    shapes = [shape for shape, _ in pieces]
+    others = {shape[:axis] + shape[axis + 1 :] for shape in shapes if len(shape) > axis}
+    if (
+        len({len(shape) for shape in shapes}) != 1
+        or len(others) != 1
+        or len({dtype for _, dtype in pieces}) != 1
+    ):
+        raise ValueError(
+            f"the blocks cannot be stacked along axis {split}: shapes "
+            f"{shapes}, dtypes {[dtype for _, dtype in pieces]}",
+        )
+    lengths = [shape[axis] for shape in shapes]
+    shape = list(shapes[0])
+    shape[axis] = sum(lengths)
+    layout = Layout(tuple(shape), comm=comm, split=axis, halo=halo, periodic=periodic)
+    if lengths == [layout.local_shape_of(r)[axis] for r in range(size)]:
+        return from_local(block, layout=layout)
+
+    # Redistribute along the axis: send each rank the rows it owns.
+    rank = comm.Get_rank()
+    row = math.prod(shape) // shape[axis] if shape[axis] else 0
+    starts = [sum(lengths[:r]) for r in range(size)]
+    mine = (starts[rank], starts[rank] + lengths[rank])
+    targets = [layout.index_bounds_of(r)[axis] for r in range(size)]
+
+    def overlaps(
+        have: tuple[int, int], owners: list[tuple[int, int]]
+    ) -> tuple[list, list]:
+        """Return element counts and offsets in ``have`` for each range of ``owners``."""
+        counts, displacements = [], []
+        for start, end in owners:
+            low, high = max(have[0], start), min(have[1], end)
+            counts.append(max(0, high - low) * row)
+            displacements.append(max(0, low - have[0]) * row)
+        return counts, displacements
+
+    send_counts, send_displacements = overlaps(mine, targets)
+    target = targets[rank]
+    sources = [(starts[r], starts[r] + lengths[r]) for r in range(size)]
+    recv_counts, recv_displacements = overlaps(target, sources)
+    send = xp.ascontiguousarray(xp.moveaxis(block, axis, 0)).reshape(-1)
+    received = xp.empty((target[1] - target[0]) * row, dtype=block.dtype)
+    receiving = xp.mpi.mpi_buffer(received, send=False, recv=True)
+    with xp.mpi.mpi_buffer(send) as sendbuf, receiving as recvbuf:
+        cast("MPI.Comm", comm).Alltoallv(
+            [sendbuf, (send_counts, send_displacements)],
+            [recvbuf, (recv_counts, recv_displacements)],
+        )
+    moved_shape = (target[1] - target[0], *shape[:axis], *shape[axis + 1 :])
+    local = xp.moveaxis(received.reshape(moved_shape), 0, axis)
+    return from_local(local, layout=layout)
 
 
 def arange(
