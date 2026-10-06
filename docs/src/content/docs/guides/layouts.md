@@ -44,7 +44,10 @@ mpa.process_grid(7, 2, (0, 1))  # (1, 7)
 The split axes are filled in order. Each gets the largest divisor of the ranks still to
 place that is not above their $d$-th root ($d$ being the number of split axes left); the
 last one takes what is left. A prime number of ranks therefore ends up on the last split
-axis. Choose a rank count with small factors (4, 8, 12, 16, …) for a balanced grid.
+axis. Choose a rank count with small factors (4, 8, 12, 16, …) for a balanced grid. If
+this choice gives an axis more ranks than elements (a $1 \times 1000$ array on 4 ranks
+would get $2 \times 2$), the layout uses the grid that fits with the smallest halo
+surface instead ($1 \times 4$).
 
 To choose the grid yourself, pass `process_grid`; its product must be the number of ranks,
 and the axes with more than one rank become the split axes (if you also pass `split`, they

@@ -17,12 +17,14 @@ backend call ``xp.mpi.mpi_is_cuda_aware(comm)`` or
 ``xp.mpi.set_mpi_cuda_aware(...)`` once at startup.
 """
 
+from mpiarray._mpi import default_comm
 from mpiarray.creation import (
     arange,
     array,
     asarray,
     empty,
     empty_like,
+    from_local,
     fromfunction,
     full,
     full_like,
@@ -32,28 +34,34 @@ from mpiarray.creation import (
     zeros,
     zeros_like,
 )
-from mpiarray.distributed_array import DistributedArray
+from mpiarray.distributed_array import DistributedArray, HaloUpdate
+from mpiarray.io import load, save
 from mpiarray.layout import Layout, chunk_bounds, process_grid
 
 __version__ = "0.1.0"  # x-release-please-version
 
 __all__ = [
     "DistributedArray",
+    "HaloUpdate",
     "Layout",
     "__version__",
     "arange",
     "array",
     "asarray",
     "chunk_bounds",
+    "default_comm",
     "empty",
     "empty_like",
+    "from_local",
     "fromfunction",
     "full",
     "full_like",
     "linspace",
+    "load",
     "ones",
     "ones_like",
     "process_grid",
+    "save",
     "zeros",
     "zeros_like",
 ]

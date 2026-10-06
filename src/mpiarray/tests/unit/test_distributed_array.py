@@ -789,6 +789,15 @@ accumulated = updated.copy()
 accumulated.accumulate_halos()
 replicated = mpa.array(xp.asarray(data), split=None)
 replicated.allreduce_replicated()
+arithmetic = 2 * updated - xp.asarray(data[0, 0])
+selection = updated[2:7, 1:5, 1]
+along = (updated.sum(axis=(0, 2)), updated.max(axis=1), updated.mean(axis=0))
+pieces = mpa.from_local(xp.arange(comm.rank + 2.0) + 10 * comm.rank)
+walls = mpa.array(xp.asarray(data), split=(0, 1), halo=(1, 1, 0))
+walls.update_halos(boundary="edge")
+path = comm.bcast(sys.argv[1] + "_file.npy", root=0)
+mpa.save(path, updated)
+loaded = mpa.load(path, split=1)
 np.savez(
     f"{sys.argv[1]}_{comm.rank}.npz",
     backend=xp.get_backend(),
@@ -796,6 +805,15 @@ np.savez(
     accumulated=xp.to_numpy(accumulated.gather()),
     rooted=xp.to_numpy(rooted) if (rooted := accumulated.gather(root=0)) is not None else 0,
     replicated=xp.to_numpy(replicated.gather()),
+    arithmetic=xp.to_numpy(arithmetic.gather()),
+    selection=xp.to_numpy(selection),
+    along_sum=xp.to_numpy(along[0]),
+    along_max=xp.to_numpy(along[1]),
+    along_mean=xp.to_numpy(along[2]),
+    pieces=xp.to_numpy(pieces.gather()),
+    walls=xp.to_numpy(walls.local_with_halos),
+    loaded=xp.to_numpy(loaded.gather()),
+    variance=np.asarray(updated.var()),
     total=np.asarray(updated.sum()),
     element=np.asarray(updated.get((5, 4, 1))),
 )
@@ -826,12 +844,7 @@ def test_host_staged_communication_matches_direct(tmp_path) -> None:
     for expected, actual in zip(direct, staged, strict=True):
         assert str(expected["backend"]) == "numpy"
         assert str(actual["backend"]) == "cupy"
-        for key in (
-            "updated",
-            "accumulated",
-            "rooted",
-            "replicated",
-            "total",
-            "element",
-        ):
-            np.testing.assert_array_equal(actual[key], expected[key], err_msg=key)
+        assert set(actual.files) == set(expected.files)
+        for key in expected.files:
+            if key != "backend":
+                np.testing.assert_array_equal(actual[key], expected[key], err_msg=key)

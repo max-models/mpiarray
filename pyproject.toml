@@ -37,12 +37,14 @@ optional-dependencies.dev = [
 optional-dependencies.docs = [
   "griffe",
   "ipykernel",
+  "matplotlib",
   "nbclient>=0.10",
   "nbformat>=5.10",
 ]
 # without mpi4py, mpiarray runs serially on cunumpy's stand-in for mpi4py.MPI
 optional-dependencies.mpi = [ "mpi4py" ]
-optional-dependencies.test = [ "pytest", "pytest-cov" ]
+# matplotlib and nbformat: the tutorials are also run as tests, under MPI
+optional-dependencies.test = [ "matplotlib", "nbformat>=5.10", "pytest", "pytest-cov" ]
 urls."Source" = "https://github.com/max-models/mpiarray"
 
 [tool.setuptools.packages.find]

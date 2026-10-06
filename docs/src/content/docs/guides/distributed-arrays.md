@@ -35,8 +35,13 @@ everything, without importing mpi4py.
 - `mpa.arange`, `mpa.linspace` and `mpa.fromfunction` compute only the local block on each
   rank, so no rank ever holds the whole array. `fromfunction` gets the global indices of
   the block, as `numpy.fromfunction` does.
+- `mpa.from_local(block)` builds the array from the pieces the ranks already hold, stacked
+  in rank order along `split` (default: the first axis). Pieces of any length are
+  redistributed to the near-even split with one `Alltoallv`; with `layout=` the pieces must
+  already match it and are used as they are (`with_halos=True` for storage with halos).
 - `mpa.zeros` / `mpa.empty`, then writing `a.local`, lets each rank fill its block from its
   own data.
+- `mpa.load(path)` reads a `.npy` file, each rank reading only its block (see below).
 
 `zeros_like`, `ones_like`, `full_like` and `empty_like` create an array with the layout of
 another one. Given a distributed array, `mpa.array(a)` copies it with its layout, and
@@ -124,3 +129,15 @@ Printing does not communicate: `repr(a)` shows the layout and this rank's block 
 
 `copy()` returns an independent array with the same layout, and `astype(dtype)` a converted
 one.
+
+## Saving to files
+
+```python
+mpa.save("field.npy", a)  # an ordinary .npy file, written in parallel
+b = mpa.load("field.npy", split=1, halo=2)  # any layout; the shape and dtype from the file
+```
+
+With several ranks both use MPI-IO: rank 0 writes the header, and every rank writes or
+reads only its own block, so nothing global is ever built. The files are plain NumPy files:
+`numpy.load` reads what `mpa.save` writes, and `mpa.load` reads what `numpy.save` writes.
+The file must be on a file system that all ranks see. Both calls are collective.
