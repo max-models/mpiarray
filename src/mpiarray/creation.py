@@ -2,8 +2,10 @@
 
 Every function takes the same keyword arguments for the layout:
 
-- ``split``: the axis or axes split over the ranks (default ``0``); ``None``
-  makes every rank hold the whole array.
+- ``split``: the axis or axes split over the ranks (default: axis ``0``);
+  ``None`` makes every rank hold the whole array. A split axis needs at least
+  as many elements as ranks, and a halo must fit in the smallest block, or
+  `Layout` raises.
 - ``halo``: the halo width, for every axis or one per axis (default ``0``).
 - ``periodic``: whether each axis wraps around in halo updates.
 - ``comm``: the communicator (default: ``MPI.COMM_WORLD``, or cunumpy's serial
@@ -20,7 +22,7 @@ from __future__ import annotations
 import hashlib
 import math
 from collections.abc import Callable, Sequence
-from typing import Any
+from typing import Any, Literal
 
 import cunumpy as xp
 import numpy as np
@@ -28,13 +30,26 @@ from numpy.typing import DTypeLike
 
 from mpiarray._mpi import Comm, debug_checks
 from mpiarray.distributed_array import Array, DistributedArray
-from mpiarray.layout import HaloLike, Layout, PeriodicLike, ShapeLike, SplitLike
+from mpiarray.layout import (
+    DEFAULT,
+    HaloLike,
+    Layout,
+    PeriodicLike,
+    ShapeLike,
+    SplitArg,
+    _Default,
+)
+
+# `array` and `asarray` tell "not given" from a value, to keep a distributed
+# input's layout unless an option is given.
+_HaloArg = HaloLike | Literal[_Default.DEFAULT]
+_PeriodicArg = PeriodicLike | Literal[_Default.DEFAULT]
 
 
 def _make_layout(
     shape: ShapeLike | None,
     layout: Layout | None,
-    split: SplitLike,
+    split: SplitArg,
     halo: HaloLike,
     periodic: PeriodicLike,
     comm: Comm | None,
@@ -63,7 +78,7 @@ def empty(
     shape: ShapeLike | None = None,
     dtype: DTypeLike = float,
     *,
-    split: SplitLike = 0,
+    split: SplitArg = DEFAULT,
     halo: HaloLike = 0,
     periodic: PeriodicLike = False,
     comm: Comm | None = None,
@@ -93,7 +108,7 @@ def zeros(
     shape: ShapeLike | None = None,
     dtype: DTypeLike = float,
     *,
-    split: SplitLike = 0,
+    split: SplitArg = DEFAULT,
     halo: HaloLike = 0,
     periodic: PeriodicLike = False,
     comm: Comm | None = None,
@@ -123,7 +138,7 @@ def ones(
     shape: ShapeLike | None = None,
     dtype: DTypeLike = float,
     *,
-    split: SplitLike = 0,
+    split: SplitArg = DEFAULT,
     halo: HaloLike = 0,
     periodic: PeriodicLike = False,
     comm: Comm | None = None,
@@ -154,7 +169,7 @@ def full(
     fill_value: Any,
     dtype: DTypeLike | None = None,
     *,
-    split: SplitLike = 0,
+    split: SplitArg = DEFAULT,
     halo: HaloLike = 0,
     periodic: PeriodicLike = False,
     comm: Comm | None = None,
@@ -240,13 +255,43 @@ def _check_identical(data: Array, comm: Comm) -> None:
         )
 
 
+def _layout_for(
+    source: DistributedArray,
+    split: SplitArg,
+    halo: _HaloArg,
+    periodic: _PeriodicArg,
+    comm: Comm | None,
+    process_grid: Sequence[int] | None,
+) -> Layout | None:
+    """Return ``source``'s layout with the given options changed, or None if none is."""
+    if (
+        split is DEFAULT
+        and halo is DEFAULT
+        and periodic is DEFAULT
+        and comm is None
+        and process_grid is None
+    ):
+        return None
+    old = source.layout
+    if split is DEFAULT and process_grid is None:
+        split = old.split if old.split else None
+    return Layout(
+        old.shape,
+        comm=old.comm if comm is None else comm,
+        split=split,
+        halo=old.halo if halo is DEFAULT else halo,
+        periodic=old.periodic if periodic is DEFAULT else periodic,
+        process_grid=process_grid,
+    )
+
+
 def array(
     obj: Any,
     dtype: DTypeLike | None = None,
     *,
-    split: SplitLike = 0,
-    halo: HaloLike = 0,
-    periodic: PeriodicLike = False,
+    split: SplitArg = DEFAULT,
+    halo: _HaloArg = DEFAULT,
+    periodic: _PeriodicArg = DEFAULT,
     comm: Comm | None = None,
     process_grid: Sequence[int] | None = None,
     layout: Layout | None = None,
@@ -260,15 +305,16 @@ def array(
     ``MPIARRAY_DEBUG=1`` the ranks check, collectively, that their data is the
     same.
 
-    A `DistributedArray` is copied; with a different ``layout`` it is
-    redistributed, which gathers it (collective).
+    A `DistributedArray` is copied, keeping its layout except for the options
+    given; if they change the layout, the array is redistributed, which
+    gathers it (collective).
 
     Args:
-        obj: The global array.
+        obj: The global array, or a distributed array.
         dtype: The element type; default: that of ``obj``.
         split: The split axis or axes; see the module docstring.
-        halo: The halo width; the halo cells start at zero.
-        periodic: Whether each axis wraps around.
+        halo: The halo width (default 0); the halo cells start at zero.
+        periodic: Whether each axis wraps around (default ``False``).
         comm: The communicator.
         process_grid: Explicit process counts per axis.
         layout: An existing layout, instead of the arguments above.
@@ -281,11 +327,21 @@ def array(
             passed different data.
     """
     if isinstance(obj, DistributedArray):
+        if layout is None:
+            layout = _layout_for(obj, split, halo, periodic, comm, process_grid)
         if layout is None or layout == obj.layout:
             return obj.astype(obj.dtype if dtype is None else dtype)
         obj = obj.gather()
     data = xp.asarray(obj, dtype=dtype)
-    layout = _make_layout(data.shape, layout, split, halo, periodic, comm, process_grid)
+    layout = _make_layout(
+        data.shape,
+        layout,
+        split,
+        0 if halo is DEFAULT else halo,
+        False if periodic is DEFAULT else periodic,
+        comm,
+        process_grid,
+    )
     if debug_checks():
         _check_identical(data, layout.comm)
     storage = xp.zeros(layout.storage_shape, dtype=data.dtype)
@@ -297,17 +353,17 @@ def asarray(
     obj: Any,
     dtype: DTypeLike | None = None,
     *,
-    split: SplitLike = 0,
-    halo: HaloLike = 0,
-    periodic: PeriodicLike = False,
+    split: SplitArg = DEFAULT,
+    halo: _HaloArg = DEFAULT,
+    periodic: _PeriodicArg = DEFAULT,
     comm: Comm | None = None,
     process_grid: Sequence[int] | None = None,
     layout: Layout | None = None,
 ) -> DistributedArray:
     """Return ``obj`` as a distributed array, without a copy if it already is one.
 
-    A `DistributedArray` with the requested ``dtype`` (and ``layout``, if
-    given) is returned as it is; anything else goes through `array`.
+    A `DistributedArray` is returned as it is if it already has the requested
+    ``dtype`` and layout options; anything else goes through `array`.
 
     Args:
         obj: A distributed array, or a global array.
@@ -319,12 +375,12 @@ def asarray(
         process_grid: Explicit process counts per axis.
         layout: An existing layout, instead of the arguments above.
     """
-    if (
-        isinstance(obj, DistributedArray)
-        and (dtype is None or xp.dtype(dtype) == obj.dtype)
-        and (layout is None or layout == obj.layout)
+    if isinstance(obj, DistributedArray) and (
+        dtype is None or xp.dtype(dtype) == obj.dtype
     ):
-        return obj
+        wanted = layout or _layout_for(obj, split, halo, periodic, comm, process_grid)
+        if wanted is None or wanted == obj.layout:
+            return obj
     return array(
         obj,
         dtype,
@@ -343,7 +399,7 @@ def arange(
     step: float = 1,
     *,
     dtype: DTypeLike | None = None,
-    split: SplitLike = 0,
+    split: SplitArg = DEFAULT,
     halo: HaloLike = 0,
     periodic: PeriodicLike = False,
     comm: Comm | None = None,
@@ -399,7 +455,7 @@ def linspace(
     endpoint: bool = True,
     *,
     dtype: DTypeLike | None = None,
-    split: SplitLike = 0,
+    split: SplitArg = DEFAULT,
     halo: HaloLike = 0,
     periodic: PeriodicLike = False,
     comm: Comm | None = None,
@@ -456,7 +512,7 @@ def fromfunction(
     shape: ShapeLike,
     *,
     dtype: DTypeLike = float,
-    split: SplitLike = 0,
+    split: SplitArg = DEFAULT,
     halo: HaloLike = 0,
     periodic: PeriodicLike = False,
     comm: Comm | None = None,

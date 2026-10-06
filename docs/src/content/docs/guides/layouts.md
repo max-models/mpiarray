@@ -21,8 +21,11 @@ layout.neighbours  # ((left, right), ...) per axis
 layout.index_bounds  # this rank's (start, end) per axis
 ```
 
-Layouts compare by value. Two arrays with equal layouts combine without communication;
-otherwise elementwise operations raise.
+Layouts compare by value: the shape, process grid, halo widths, periodicity and
+communicator. Two arrays with equal layouts combine without communication; otherwise
+elementwise operations raise. Communicators must be the same object, or equal for MPI: an
+array on `comm.Dup()` does not combine with one on `comm`, because the two communicators
+keep their messages apart.
 
 ## The process grid
 
@@ -44,14 +47,17 @@ last one takes what is left. A prime number of ranks therefore ends up on the la
 axis. Choose a rank count with small factors (4, 8, 12, 16, …) for a balanced grid.
 
 To choose the grid yourself, pass `process_grid`; its product must be the number of ranks,
-and the axes with more than one rank become the split axes:
+and the axes with more than one rank become the split axes (if you also pass `split`, they
+must be among its axes):
 
 ```python
 a = mpa.zeros((120, 60), process_grid=(3, 2))  # on 6 ranks
 ```
 
 Give the most ranks to the longest axis, so that the blocks stay close to square and the
-halo surfaces small. Leave unsplit the axes that are short, or that an algorithm needs
+halo surfaces small. Every split axis needs at least as many elements as ranks along it,
+and every halo must fit in the smallest block; otherwise `Layout` raises a `ValueError` on
+every rank. Leave unsplit the axes that are short, or that an algorithm needs
 whole on every rank (a component axis, an axis you transform with an FFT).
 
 ## Neighbours
@@ -82,7 +88,26 @@ element more. On the $2 \times 2$ grid above, a $10 \times 7$ array is split int
 layout.index_bounds  # this rank
 layout.index_bounds_of(3)  # another rank
 layout.owner((6, 2))  # the rank that owns an element: 2
+layout.owners(indices)  # vectorized: ranks for an (n, 2) integer array
+layout.owners(indices, clip=True)  # outside the array: the nearest block
 mpa.chunk_bounds(7, 2, 1)  # one axis on its own: (4, 7)
+```
+
+`owners` works on NumPy and CuPy arrays without a loop, for example to find where
+particles have to be sent after a push.
+
+## Cartesian communicators
+
+`Layout(..., reorder=True)` builds an MPI Cartesian communicator for the process grid
+(`MPI_Cart_create` with reordering), so that the MPI library can place neighbouring blocks
+on nearby cores and nodes. The layout's `comm` is then that communicator, and `rank`,
+`neighbours` and `owner` number the ranks in it: send your own messages (for example
+particles) over `layout.comm`. Layouts made with the same arguments share the communicator,
+so their arrays still combine.
+
+```python
+layout = Layout((4096, 4096), split=(0, 1), halo=2, reorder=True)
+u = mpa.zeros(layout=layout)
 ```
 
 ## Replicated arrays

@@ -9,16 +9,36 @@ decomposition without an array, e.g. for particle ownership or a PETSc DMDA.
 
 from __future__ import annotations
 
+import enum
 import math
 from collections.abc import Sequence
-from typing import TypeAlias
+from typing import Any, Literal, TypeAlias, cast
+
+import cunumpy as xp
 
 from mpiarray._mpi import MPI, Comm, default_comm
+
+
+class _Default(enum.Enum):
+    """The marker of an argument that was not given."""
+
+    DEFAULT = "DEFAULT"
+
+    def __repr__(self) -> str:
+        """Return ``DEFAULT``, as shown in signatures."""
+        return "DEFAULT"
+
+
+#: The default of ``split`` (and, in `mpiarray.array`, of the other layout
+#: options): distinguishes "not given" from an explicit value such as ``0``.
+DEFAULT = _Default.DEFAULT
 
 #: An int for a 1-D shape, or one int per axis.
 ShapeLike: TypeAlias = int | Sequence[int]
 #: An axis, several axes, or ``None`` for an array every rank holds whole.
 SplitLike: TypeAlias = int | Sequence[int] | None
+#: `SplitLike`, or `DEFAULT` for "not given" (axis 0, or the process grid's axes).
+SplitArg: TypeAlias = SplitLike | Literal[_Default.DEFAULT]
 #: One value for every axis, or one per axis.
 HaloLike: TypeAlias = int | Sequence[int]
 PeriodicLike: TypeAlias = bool | Sequence[bool]
@@ -77,6 +97,38 @@ def process_grid(size: int, ndim: int, split: Sequence[int]) -> tuple[int, ...]:
 _automatic_process_grid = process_grid
 
 
+def _chunk_of(index: Any, length: int, nchunks: int) -> Any:
+    """Return which `chunk_bounds` chunk holds ``index`` (an int or an int array).
+
+    Needs ``nchunks <= length``, which `Layout` guarantees for split axes.
+    """
+    if nchunks == 1:
+        return index * 0
+    base, extra = divmod(length, nchunks)
+    # chunks 0 .. extra-1 have base + 1 elements, the others base
+    return xp.get_array_module(index).maximum(
+        index // (base + 1), (index - extra) // base
+    )
+
+
+# Cartesian communicators already made, so that layouts with equal arguments
+# share one (and compare equal): (comm, grid, periodic) -> (comm, cartesian).
+_CARTESIAN: dict[tuple, tuple[Any, Any]] = {}
+
+
+def _cartesian(comm: Comm, grid: tuple[int, ...], periodic: tuple[bool, ...]) -> Any:
+    """Return the Cartesian communicator over ``comm`` for ``grid`` (collective once)."""
+    key = (id(comm), grid, periodic)
+    cached = _CARTESIAN.get(key)
+    if cached is None or cached[0] is not comm:
+        # only reached with several ranks, so under a real MPI
+        cartesian = cast("MPI.Intracomm", comm).Create_cart(
+            dims=list(grid), periods=list(periodic), reorder=True
+        )
+        cached = _CARTESIAN[key] = (comm, cartesian)
+    return cached[1]
+
+
 def _per_axis(value: object, ndim: int, name: str) -> tuple:
     """Return ``value`` repeated for every axis, or checked to have one per axis."""
     if isinstance(value, Sequence) and not isinstance(value, str):
@@ -111,25 +163,37 @@ class Layout:
     block with ``halo`` extra cells on both sides of every axis, which the
     arrays fill from, or accumulate into, the neighbouring ranks.
 
-    A layout is immutable and compares by value: arrays with equal layouts
-    can be combined elementwise without communication.
+    A layout is immutable and compares by value (shape, process grid, halo
+    widths, periodicity and communicator): arrays with equal layouts can be
+    combined elementwise without communication.
 
     Args:
         shape: The global shape.
         comm: The communicator; default: ``MPI.COMM_WORLD`` (cunumpy's serial
             stand-in when not started by an MPI launcher).
         split: The axis or axes split over the ranks; ``None`` makes every
-            rank hold the whole array. A 0-d shape is never split.
+            rank hold the whole array. Default: axis 0, or with
+            ``process_grid`` the axes it gives more than one rank. A 0-d shape
+            is never split.
         halo: Halo width, for every axis or one per axis.
         periodic: Whether each axis wraps around in halo exchanges.
         process_grid: Explicit process counts per axis, whose product must be
-            the number of ranks; it takes precedence over ``split``, which
-            becomes the axes with more than one process.
+            the number of ranks. Its axes with more than one rank must be
+            among ``split``, if ``split`` is given.
+        reorder: Let MPI renumber the ranks for the process grid, with a
+            Cartesian communicator (``MPI_Cart_create``), so that neighbouring
+            blocks can sit on nearby cores and nodes. The layout's `comm` is
+            then that communicator, and `rank`, `neighbours` and `owner`
+            number the ranks in it; send messages over ``layout.comm``.
+            Collective the first time; ignored on one rank or when every rank
+            holds the whole array.
 
     Raises:
         ValueError: For negative extents or halo widths, bad split axes,
-            per-axis values of the wrong length, or a process grid that does
-            not match the number of ranks.
+            per-axis values of the wrong length, a process grid that does not
+            match the number of ranks or ``split``, a split axis with fewer
+            elements than ranks, or a halo wider than the smallest block along
+            an axis that exchanges halos. Every rank raises alike.
     """
 
     def __init__(
@@ -137,10 +201,11 @@ class Layout:
         shape: ShapeLike,
         *,
         comm: Comm | None = None,
-        split: SplitLike = 0,
+        split: SplitArg = DEFAULT,
         halo: HaloLike = 0,
         periodic: PeriodicLike = False,
         process_grid: Sequence[int] | None = None,
+        reorder: bool = False,
     ) -> None:
         """Compute the decomposition; see the class docstring."""
         self._shape = (
@@ -158,6 +223,9 @@ class Layout:
             raise ValueError(f"halo widths must not be negative: {self._halo}")
         self._periodic = tuple(bool(p) for p in _per_axis(periodic, ndim, "periodic"))
 
+        given_split = None
+        if split is not DEFAULT and ndim > 0:
+            given_split = _normalize_axes(split, ndim)
         if process_grid is not None:
             grid = tuple(int(n) for n in _per_axis(process_grid, ndim, "process_grid"))
             if any(n < 1 for n in grid) or math.prod(grid) != self._size:
@@ -165,10 +233,21 @@ class Layout:
                     f"process_grid {grid} does not multiply to the {self._size} ranks",
                 )
             self._split = tuple(axis for axis, n in enumerate(grid) if n > 1)
+            if given_split is not None and not set(self._split) <= set(given_split):
+                raise ValueError(
+                    f"process_grid {grid} splits axes {self._split}, "
+                    f"but split is {given_split}",
+                )
         else:
-            self._split = () if ndim == 0 else _normalize_axes(split, ndim)
+            if given_split is None:
+                given_split = (0,) if ndim > 0 else ()
+            self._split = given_split
             grid = _automatic_process_grid(self._size, ndim, self._split)
         self._grid = grid
+        self._check_blocks()
+        if reorder and self._size > 1 and math.prod(grid) > 1:
+            self._comm = _cartesian(self._comm, grid, self._periodic)
+            self._rank = self._comm.Get_rank()
 
         # Without a split axis every rank holds the whole array.
         self._replicated = self._size > 1 and math.prod(grid) == 1
@@ -184,6 +263,25 @@ class Layout:
                 for axis in range(ndim)
             )
         self._index_bounds = self.index_bounds_of(self._rank)
+
+    def _check_blocks(self) -> None:
+        """Raise unless every rank owns cells and every halo fits in a block."""
+        for axis, (length, n, h, periodic) in enumerate(
+            zip(self._shape, self._grid, self._halo, self._periodic, strict=True)
+        ):
+            if n > 1 and n > length:
+                raise ValueError(
+                    f"axis {axis} has {length} elements but is split over {n} ranks; "
+                    "use fewer ranks, split=None, another split axis, or a "
+                    "process_grid",
+                )
+            # A halo is filled from the neighbouring block only, so it must
+            # not be wider than any block it is exchanged with.
+            if h and (n > 1 or periodic) and length // n < h:
+                raise ValueError(
+                    f"halo {h} along axis {axis} is wider than the smallest block "
+                    f"({length // n} elements); use a smaller halo or fewer ranks",
+                )
 
     def _shifted(self, axis: int, step: int) -> int:
         """Return the rank one step along ``axis``, or ``PROC_NULL`` past a wall."""
@@ -277,10 +375,51 @@ class Layout:
                 raise IndexError(
                     f"index {i} is out of bounds for axis {axis} with size {length}",
                 )
-            coord.append(
-                next(c for c in range(n) if position < chunk_bounds(length, n, c)[1])
-            )
+            coord.append(int(_chunk_of(position, length, n)))
         return self.rank_of(coord)
+
+    def owners(self, indices: Any, *, clip: bool = False) -> Any:
+        """Return the owning ranks of many global indices at once.
+
+        Vectorized, on the array's own backend (NumPy or CuPy), for example to
+        find where particles must be sent.
+
+        Args:
+            indices: An integer array of shape ``(..., ndim)``; for a 1-D
+                layout also of shape ``(...)``. Negative values count from
+                the end, unless ``clip``.
+            clip: Give indices outside the array (on either side) to the
+                nearest block instead of raising.
+
+        Returns:
+            An integer array of ranks, of shape ``indices.shape[:-1]`` (or
+            ``indices.shape`` for the 1-D form).
+
+        Raises:
+            ValueError: If the last axis of ``indices`` is not ``ndim`` long.
+            IndexError: Without ``clip``, if any index is out of bounds.
+        """
+        module = xp.get_array_module(indices)
+        indices = module.asarray(indices)
+        if self.ndim == 1 and (indices.ndim == 0 or indices.shape[-1] != 1):
+            indices = indices[..., None]
+        if indices.ndim == 0 or indices.shape[-1] != self.ndim:
+            raise ValueError(
+                f"indices of shape {tuple(indices.shape)} do not end in {self.ndim} axes"
+            )
+        ranks = module.zeros(indices.shape[:-1], dtype=module.int64)
+        for axis, (length, n) in enumerate(zip(self._shape, self._grid, strict=True)):
+            position = indices[..., axis]
+            if clip:
+                position = module.clip(position, 0, length - 1)
+            else:
+                position = module.where(position < 0, position + length, position)
+                if bool(module.any((position < 0) | (position >= length))):
+                    raise IndexError(
+                        f"an index is out of bounds for axis {axis} with size {length}",
+                    )
+            ranks = ranks * n + _chunk_of(position, length, n)
+        return ranks
 
     # ------------------------------------------------------------------ #
     # Properties
@@ -389,8 +528,12 @@ class Layout:
     # Value semantics
 
     def _key(self) -> tuple:
-        """Return everything that defines the layout, except the communicator."""
-        return (self._shape, self._split, self._halo, self._periodic, self._grid)
+        """Return what defines the blocks, except the communicator.
+
+        ``split`` is left out: it only matters through the process grid, so
+        ``split=0`` and ``split=None`` on one rank give equal layouts.
+        """
+        return (self._shape, self._halo, self._periodic, self._grid)
 
     def __eq__(self, other: object) -> bool:
         """Return whether ``other`` describes the same decomposition."""

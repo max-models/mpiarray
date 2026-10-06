@@ -39,7 +39,9 @@ everything, without importing mpi4py.
   own data.
 
 `zeros_like`, `ones_like`, `full_like` and `empty_like` create an array with the layout of
-another one, and `mpa.asarray(x)` returns `x` itself if it already is a distributed array.
+another one. Given a distributed array, `mpa.array(a)` copies it with its layout, and
+`mpa.array(a, halo=2)` or `mpa.array(a, split=None)` changes only the options given and
+redistributes it; `mpa.asarray(a)` returns `a` itself unless an option changes.
 
 ## How the array is split
 
@@ -61,6 +63,11 @@ p = mpa.zeros((64, 48, 3), split=(0, 1), halo=(2, 2, 0), periodic=(True, False, 
 splits a vector field over its two spatial axes, with two halo layers in space and none
 along the component axis. Each axis is cut near-evenly: when the length does not divide,
 the first ranks get one element more.
+
+A split axis needs at least as many elements as ranks, and a halo must fit in the
+smallest block along its axis; otherwise creating the array raises a `ValueError` (on
+every rank), instead of leaving ranks without data. Use `split=None` for small arrays that
+every rank should hold whole.
 
 Arrays created with the same arguments have equal layouts and combine without
 communication. To combine arrays, create the second one with `zeros_like(first)` or with

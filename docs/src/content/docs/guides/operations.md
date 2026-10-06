@@ -38,7 +38,8 @@ np.add(a, b, where=mask, out=a)
 `out=` must be a distributed array with the same layout. Ufunc methods such as
 `np.add.reduce` or `np.add.at` are not supported; use the reductions below.
 
-Elementwise operations also act on the halo cells; see
+Elementwise operations are computed on the blocks: a new result has zero halo cells, and
+`out=` or an in-place operator leaves the halo cells of the target alone; see
 [Halo cells and other operations](/mpiarray/guides/halo-exchange/#halo-cells-and-other-operations).
 
 ### Broadcasting
@@ -69,7 +70,8 @@ Reading with global indices is collective and returns the same result on every r
 | Expression                    | Result                                    |
 | ----------------------------- | ----------------------------------------- |
 | `a[i, j]`, `a.get((i, j))`    | the element, broadcast from its owner     |
-| `a[1:3, :]`, `a[mask]`, …     | the selection of the gathered array       |
+| `a[1:3, :]`, `a[..., 0]`, …   | the selection; only its cells are sent    |
+| `a[mask]`, `a[[0, 5]]`, …     | the selection of the gathered array       |
 | `a.local_index((i, j))`       | the index into `a.local_with_halos`, or `None` if this rank does not own it (no communication) |
 
 Assignment works the other way round: every rank passes the same value and writes the part

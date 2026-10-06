@@ -6,6 +6,9 @@ sidebar:
 ---
 
 Halo cells hold copies of, or contributions to, cells that belong to a neighbouring rank.
+A halo can be at most as wide as the smallest block along its axis (it is filled from the
+neighbouring block only), so `mpa.zeros(10, halo=3)` raises on four ranks, whose blocks
+have 3, 3, 2 and 2 elements.
 mpiarray moves data through them in both directions:
 
 |                     | `update_halos()`                       | `accumulate_halos()`                        |
@@ -60,6 +63,24 @@ The axes are updated one after the other, so the corner halo cells are filled to
 second axis exchanges rows that already contain the first axis's halo cells. A 9-point
 stencil in 2D therefore works after a single `update_halos()`.
 
+### Overlapping the update with computation
+
+Both directions of an axis are exchanged at the same time, and on the CPU the halo slabs
+go to and from MPI straight out of the storage (as MPI subarray types), without copies;
+receive and GPU staging buffers are kept and reused between calls. To also hide the
+latency, start the update, work on the cells that do not need halos, then wait:
+
+```python
+pending = u.update_halos(wait=False)  # all axes started at once
+inner = v[2:-2]  # e.g. the part of the stencil that needs no halo cells
+...
+pending.wait()  # now the halo cells are up to date
+```
+
+In this mode the corner halo cells are not updated (the axes run at the same time, not one
+after the other), and the array must not be written until `wait()` returns. A 5-point
+stencil needs no corners; for a 9-point stencil use the default `wait=True`.
+
 ## Accumulating halo cells
 
 When particles are deposited on a grid, a particle near the edge of a block also
@@ -81,10 +102,10 @@ the halo cells before accumulating if they should be reflected or kept.
 
 ## Halo cells and other operations
 
-- Arithmetic (`a + b`, `np.sin(a)`, …) acts on the whole storage, halo cells included, so
-  the halo cells of a result hold the operation applied to the operands' halo cells. They
-  are meaningful only if the operands' halo cells were; call `update_halos()` on the
-  result before using its halo cells.
+- Arithmetic (`a + b`, `np.sin(a)`, …) is computed on the blocks only. A new result has
+  zero halo cells, and an in-place operation (`a += b`, `np.add(a, b, out=a)`) leaves the
+  halo cells of `a` as they were. Call `update_halos()` on a result before using its halo
+  cells.
 - `mpa.array(...)` starts with zero halo cells, and assignments with array or mask indices
   zero them.
 - Reductions, norms, `gather()` and `get()` never read the halo cells.
