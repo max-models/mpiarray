@@ -24,7 +24,11 @@ def _launcher() -> list[str] | None:
         [launcher, "--version"], capture_output=True, text=True, check=False
     ).stdout
     # Open MPI refuses more ranks than cores without it; MPICH has no such flag.
-    return [launcher, "--oversubscribe"] if "Open MPI" in version else [launcher]
+    # Open MPI 5 calls itself "Open MPI", Open MPI 4 (Ubuntu's) "OpenRTE".
+    is_open_mpi = any(
+        name in version.lower() for name in ("open mpi", "openrte", "open-mpi")
+    )
+    return [launcher, "--oversubscribe"] if is_open_mpi else [launcher]
 
 
 def run_job(nranks: int, args: list[str], env: dict[str, str] | None = None) -> str:
