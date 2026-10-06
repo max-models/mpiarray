@@ -31,10 +31,17 @@ def _launcher() -> list[str] | None:
     return [launcher, "--oversubscribe"] if is_open_mpi else [launcher]
 
 
-def run_job(nranks: int, args: list[str], env: dict[str, str] | None = None) -> str:
-    """Run ``python args`` on ``nranks`` ranks; return its output, fail on errors or hangs.
+def run_job(
+    nranks: int,
+    args: list[str],
+    env: dict[str, str] | None = None,
+    *,
+    expect_failure: bool = False,
+) -> str:
+    """Run ``python args`` on ``nranks`` ranks and return its output (stdout and stderr).
 
-    Skips the test without mpi4py or an MPI launcher.
+    Fails the test if the job fails (or, with ``expect_failure``, succeeds) or
+    hangs. Skips it without mpi4py or an MPI launcher.
     """
     pytest.importorskip("mpi4py", reason="needs mpi4py (the mpi extra)")
     launcher = _launcher()
@@ -48,5 +55,6 @@ def run_job(nranks: int, args: list[str], env: dict[str, str] | None = None) -> 
         timeout=120,
         check=False,
     )
-    assert result.returncode == 0, result.stdout + result.stderr
-    return result.stdout
+    output = result.stdout + result.stderr
+    assert (result.returncode != 0) == expect_failure, output
+    return output

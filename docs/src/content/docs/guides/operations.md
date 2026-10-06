@@ -104,11 +104,14 @@ a.std(ddof=1)
 np.sum(a)  # NumPy's functions call the methods
 ```
 
-With `axis=...` the array is gathered and reduced with NumPy, so the result is a regular
-array on every rank:
+With `axis=...` the result is a regular NumPy (or CuPy) array on every rank. The array is
+not gathered: every rank reduces its own block, and only these partial results are sent
+and combined (`sum`, `prod`, `min`, `max`, `mean`, `all`, `any`; `var` and `std` along an
+axis gather the array):
 
 ```python
 a.sum(axis=0)  # numpy/cupy array of shape (3,)
+a.max(axis=(0, 1), keepdims=True)
 ```
 
 All reductions are collective: every rank must call them, even ranks that own no cells.
@@ -151,4 +154,24 @@ the program hangs. A collective call inside `if rank == 0:` is the classic mista
 | operators and ufuncs                                        | reductions, `vdot`, `norm`                    |
 | `a[...] = v` with ints and slices                           | `a[...]`, `get`, `bool(a)`                    |
 | `repr(a)`, `print(a)`, `a.layout`, `local_index`, `clear_halos` | `a[...] = v` with arrays or masks         |
-|                                                             | `allreduce_replicated`                        |
+| `layout.owners`                                              | `allreduce_replicated`, `from_local`          |
+|                                                             | `mpa.save`, `mpa.load`                        |
+
+## Debugging hangs
+
+With `MPIARRAY_DEBUG=1` in the environment, every collective call first checks that all
+ranks are in the same call. Ranks in different calls raise an error naming both, and a
+rank left waiting (because the others never make the call) raises after
+`MPIARRAY_DEBUG_TIMEOUT` seconds (default 30) instead of hanging:
+
+```bash
+MPIARRAY_DEBUG=1 MPIARRAY_DEBUG_TIMEOUT=10 mpiexec -n 4 python simulation.py
+```
+
+```text
+RuntimeError: rank 0 waited 10 s in gather (collective call 7) for the other ranks. ...
+```
+
+The checks cost one barrier and one small `allgather` per collective call, so leave them
+off in production runs. They also make `mpa.array` check that every rank passed the same
+data.

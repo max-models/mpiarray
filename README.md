@@ -51,6 +51,13 @@ mpiexec -n 2 python example.py   # or just: python example.py
 - **With or without MPI:** without an MPI launcher the script runs as
   one rank on cunumpy’s stand-in for `mpi4py.MPI`, without importing
   mpi4py.
+- **Data in and out:** `from_local` builds an array from the pieces the
+  ranks hold; `save`/`load` write and read ordinary `.npy` files in
+  parallel with MPI-IO.
+- **Halo boundary conditions** at walls: constant, `"edge"`,
+  `"symmetric"`, `"reflect"`.
+- **Debugging:** with `MPIARRAY_DEBUG=1`, a collective called on only
+  some ranks raises an error instead of hanging.
 
 Each array has a `layout` (a `mpa.Layout`) with its process grid,
 neighbours and owned index ranges; most code only reads it.

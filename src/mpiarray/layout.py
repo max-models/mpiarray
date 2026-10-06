@@ -97,6 +97,48 @@ def process_grid(size: int, ndim: int, split: Sequence[int]) -> tuple[int, ...]:
 _automatic_process_grid = process_grid
 
 
+def _fitting_grid(
+    size: int, shape: tuple[int, ...], split: Sequence[int]
+) -> tuple[int, ...] | None:
+    """Return the process grid for ``shape`` that fits and has the smallest halo surface.
+
+    Used when `process_grid`'s choice gives an axis more ranks than elements:
+    searches every way to write ``size`` as a product over the ``split`` axes
+    with at most ``shape[axis]`` ranks per axis, and picks the one whose
+    blocks have the smallest total face area across split axes (ties: the
+    smallest grid tuple). Returns ``None`` if no grid fits.
+    """
+    axes = sorted(set(split))
+    best: tuple[float, tuple[int, ...]] | None = None
+
+    def search(position: int, remaining: int, grid: list[int]) -> None:
+        nonlocal best
+        if position == len(axes):
+            if remaining != 1:
+                return
+            blocks = [
+                math.ceil(length / n) for length, n in zip(shape, grid, strict=True)
+            ]
+            surface = sum(
+                math.prod(blocks[:axis] + blocks[axis + 1 :])
+                for axis in axes
+                if grid[axis] > 1
+            )
+            candidate = (surface, tuple(grid))
+            if best is None or candidate < best:
+                best = candidate
+            return
+        axis = axes[position]
+        for n in range(1, min(remaining, shape[axis]) + 1):
+            if remaining % n == 0:
+                grid[axis] = n
+                search(position + 1, remaining // n, grid)
+        grid[axis] = 1
+
+    search(0, size, [1] * len(shape))
+    return None if best is None else best[1]
+
+
 def _chunk_of(index: Any, length: int, nchunks: int) -> Any:
     """Return which `chunk_bounds` chunk holds ``index`` (an int or an int array).
 
@@ -179,7 +221,9 @@ class Layout:
         periodic: Whether each axis wraps around in halo exchanges.
         process_grid: Explicit process counts per axis, whose product must be
             the number of ranks. Its axes with more than one rank must be
-            among ``split``, if ``split`` is given.
+            among ``split``, if ``split`` is given. Without it the grid is
+            `process_grid`'s choice, or, if that gives an axis more ranks than
+            elements, the fitting grid with the smallest halo surface.
         reorder: Let MPI renumber the ranks for the process grid, with a
             Cartesian communicator (``MPI_Cart_create``), so that neighbouring
             blocks can sit on nearby cores and nodes. The layout's `comm` is
@@ -243,6 +287,8 @@ class Layout:
                 given_split = (0,) if ndim > 0 else ()
             self._split = given_split
             grid = _automatic_process_grid(self._size, ndim, self._split)
+            if any(n > length for n, length in zip(grid, self._shape, strict=True)):
+                grid = _fitting_grid(self._size, self._shape, self._split) or grid
         self._grid = grid
         self._check_blocks()
         if reorder and self._size > 1 and math.prod(grid) > 1:
