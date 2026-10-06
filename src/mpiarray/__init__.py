@@ -38,7 +38,7 @@ from mpiarray.distributed_array import DistributedArray, HaloUpdate
 from mpiarray.io import load, save
 from mpiarray.layout import Layout, chunk_bounds, process_grid
 
-__version__ = "0.1.0"  # x-release-please-version
+__version__ = "0.2.0"  # x-release-please-version
 
 __all__ = [
     "DistributedArray",
