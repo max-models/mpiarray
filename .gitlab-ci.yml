@@ -1,6 +1,5 @@
-# GPU CI on gitlab.mpcdf.mpg.de. GitHub pushes every commit there to
-# gpu-test-<branch> or gpu-test-pr-<number> (.github/workflows/gpu_ci_trigger.yml) and
-# waits for this pipeline. The CPU jobs, docs and releases run on GitHub Actions.
+# GPU CI on gitlab.mpcdf.mpg.de, for a copy of the repository there. The CPU jobs, docs
+# and releases run on GitHub Actions.
 variables:
   CUDA_IMAGE: "gitlab-registry.mpcdf.mpg.de/mpcdf/ci-module-image/nvhpcsdk_26:2026"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
