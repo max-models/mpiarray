@@ -126,9 +126,8 @@ make coverage   # serial and 2, 3, 4, 6 ranks, combined; fails below 100% line a
 ```
 
 The CuPy code paths run on the CPU with cunumpy’s fake CuPy
-(`CUNUMPY_FAKE_CUPY=1 CUNUMPY_BACKEND=cupy`), and on NVIDIA GPUs in a
-GitLab pipeline that GitHub Actions starts for every push and pull
-request (`.github/workflows/gpu_ci_trigger.yml`).
+(`CUNUMPY_FAKE_CUPY=1 CUNUMPY_BACKEND=cupy`); `.gitlab-ci.yml` runs the
+tests on NVIDIA GPUs.
 
 Commit messages follow [Conventional
 Commits](https://www.conventionalcommits.org/); see
