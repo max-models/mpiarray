@@ -24,7 +24,7 @@ classifiers = [
 # to a version range ("cunumpy>=0.6") before a release
 dependencies = [
   "cunumpy @ git+https://github.com/max-models/cunumpy.git@devel",
-  "maybempi>=0.1.1",
+  "maybempi>=0.1.2",
   "numpy",
 ]
 
