@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import cunumpy as xp
+import maybempi
 import numpy as np
 import pytest
 
 import mpiarray as mpa
 
-MPI = xp.mpi.get_mpi()
+MPI = maybempi.get_mpi()
 size = MPI.COMM_WORLD.Get_size()
 N = size + 2
 SHAPE = (N + 1, N, 3)
@@ -36,7 +37,7 @@ def test_axis_reductions_match_numpy(dtype, split, axis, keepdims) -> None:
             continue
         result = getattr(a, name)(axis=axis, keepdims=keepdims)
         expected = getattr(np, name)(data, axis=axis, keepdims=keepdims)
-        assert result.shape == expected.shape, name
+        assert np.shape(result) == expected.shape, name
         np.testing.assert_allclose(xp.to_numpy(result), expected, err_msg=name)
 
 

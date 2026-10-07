@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import cunumpy as xp
+import maybempi
 import numpy as np
 import pytest
 
 import mpiarray as mpa
 from mpiarray import DistributedArray
 
-MPI = xp.mpi.get_mpi()
+MPI = maybempi.get_mpi()
 size = MPI.COMM_WORLD.Get_size()
 L = 3 * size + 3  # blocks of at least 3, enough for halo 2 with "reflect"
 

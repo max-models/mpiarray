@@ -83,7 +83,8 @@ MPI calls with `PROC_NULL` do nothing, so halo code needs no special case for wa
 
 ## Owned index ranges
 
-Each axis is cut near-evenly: when the length does not divide, the first ranks get one
+Each axis is cut near-evenly unless the layout has explicit cuts (see
+[Uneven blocks](#uneven-blocks)): when the length does not divide, the first ranks get one
 element more. On the $2 \times 2$ grid above, a $10 \times 7$ array is split into rows
 `0:5` and `5:10` and columns `0:4` and `4:7`.
 
@@ -98,6 +99,61 @@ mpa.chunk_bounds(7, 2, 1)  # one axis on its own: (4, 7)
 
 `owners` works on NumPy and CuPy arrays without a loop, for example to find where
 particles have to be sent after a push.
+
+## Uneven blocks
+
+The near-even split is the default, not a requirement. Three ways to cut differently:
+
+```python
+from mpiarray import Layout
+
+Layout(10, bounds=[(0, 2, 5, 10)])  # on 3 ranks: blocks 0:2, 2:5, 5:10
+cells = Layout(64)
+nodes = cells.aligned(65)  # same block starts as `cells`, the last block one longer
+balanced = Layout.weighted((n, n), cost)  # blocks of about equal total cost
+```
+
+- `bounds=` gives the cut points per axis (`None` for an axis that is not split); the
+  process grid follows from them. `layout.bounds` returns the cuts of any layout.
+- `layout.aligned(shape)` makes a layout for a different shape whose blocks start where
+  this layout's do, for arrays that belong together but differ in length, such as values
+  at the $n$ cells and $n + 1$ nodes of a grid: a node array and a cell array then hold
+  matching indices on every rank.
+- `Layout.weighted(shape, weights)` cuts each split axis so that every block gets about
+  the same share of the weight (summed over the other axes). `weights` is an array of
+  `shape` (NumPy, CuPy or a distributed array) or one 1-D profile per axis. A block keeps
+  at least one element and at least its halo width.
+
+`owner`, `owners` and everything else work the same on uneven layouts. Arrays combine only
+when their layouts are equal, cut points included.
+
+## Changing the layout
+
+`a.redistribute(layout)` moves an array to another layout of the same shape: every rank
+sends each other rank only the part of its block that the other owns in the new layout,
+in one `Alltoallv`; nothing global is built. `a.rebalance(weights)` redistributes to
+`Layout.weighted` with the array's own split, halo and periodicity, for example when the
+particles have moved and the cost per cell has changed:
+
+```python
+rho = rho.rebalance(particles_per_cell)  # a new array; the halo cells start at zero
+```
+
+Arrays that are combined with the moved one must be moved too, to `rho.layout`.
+
+## Moving particles between ranks
+
+`mpa.migrate(destinations, *arrays)` sends row `i` of every array to rank
+`destinations[i]` and returns the rows this rank receives, ordered by source rank. It
+sends the arrays as raw buffers (one `Alltoallv` each, NumPy or CuPy), not pickled
+objects. With `layout.owners` it keeps particles with the block that owns their cell:
+
+```python
+cells = xp.floor(positions / dx).astype(int)
+positions, velocities = mpa.migrate(layout.owners(cells), positions, velocities)
+```
+
+The [particles tutorial](/mpiarray/tutorials/particles/) does this in a periodic box.
 
 ## Cartesian communicators
 
@@ -125,7 +181,7 @@ the copies.
 ## A layout without an array
 
 A `Layout` can be built on its own, for example to decide which rank a particle belongs
-to, or to create a PETSc DMDA with the same decomposition:
+to:
 
 ```python
 from mpiarray import Layout
@@ -140,6 +196,6 @@ It takes the same arguments as the creation functions, the shape first.
 
 ## Without MPI
 
-Without an MPI launcher, `comm` defaults to cunumpy's serial stand-in for
+Without an MPI launcher, `comm` defaults to maybempi's serial stand-in for
 `MPI.COMM_WORLD`: one rank that owns everything. The same code therefore runs unchanged
 with `python script.py` and with `mpiexec -n 8 python script.py`.

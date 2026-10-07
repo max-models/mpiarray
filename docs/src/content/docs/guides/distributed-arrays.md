@@ -41,12 +41,15 @@ everything, without importing mpi4py.
   already match it and are used as they are (`with_halos=True` for storage with halos).
 - `mpa.zeros` / `mpa.empty`, then writing `a.local`, lets each rank fill its block from its
   own data.
-- `mpa.load(path)` reads a `.npy` file, each rank reading only its block (see below).
+- `mpa.load(path)` reads a `.npy` file, each rank reading only its block, and
+  `mpa.load_hdf5(path)` the datasets of an HDF5 file (see below).
 
 `zeros_like`, `ones_like`, `full_like` and `empty_like` create an array with the layout of
 another one. Given a distributed array, `mpa.array(a)` copies it with its layout, and
 `mpa.array(a, halo=2)` or `mpa.array(a, split=None)` changes only the options given and
 redistributes it; `mpa.asarray(a)` returns `a` itself unless an option changes.
+`a.redistribute(layout)` moves an array to any other layout of the same shape, uneven ones
+included (see [Changing the layout](/mpiarray/guides/layouts/#changing-the-layout)).
 
 ## How the array is split
 
@@ -118,6 +121,7 @@ full = a.gather(root=0)  # on rank 0 only; None on the other ranks
 full = a.to_numpy()  # the same, as numpy.ndarray
 value = a.get((3, 2))  # one element, the same on every rank
 value = a[3, 2]  # the same as get
+part = a[:10, 5]  # a new distributed array of the selected cells
 ```
 
 All of these are **collective**: every rank must call them, even when only rank 0 wants
@@ -143,3 +147,20 @@ With several ranks both use MPI-IO: rank 0 writes the header, and every rank wri
 reads only its own block, so nothing global is ever built. The files are plain NumPy files:
 `numpy.load` reads what `mpa.save` writes, and `mpa.load` reads what `numpy.save` writes.
 The file must be on a file system that all ranks see. Both calls are collective.
+
+### HDF5
+
+With h5py installed (`pip install "mpiarray[hdf5]"`), several arrays and attributes go into
+one HDF5 file:
+
+```python
+mpa.save_hdf5("state.h5", {"rho": rho, "phi": phi}, attrs={"time": t, "step": step})
+arrays, attrs = mpa.load_hdf5("state.h5", split=(0, 1), halo=1)
+rho = arrays["rho"]
+```
+
+With an MPI-enabled h5py build (`h5py.get_config().mpi`), all ranks write and read their
+own blocks of one file at once. With an ordinary build `save_hdf5` gathers each array on
+rank 0, which writes the file, so it must fit in rank 0's memory; `load_hdf5` lets every
+rank read only its block in both cases. The datasets are ordinary HDF5 datasets of the
+global shape, without halo cells.

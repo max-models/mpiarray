@@ -5,6 +5,7 @@ from __future__ import annotations
 import textwrap
 
 import cunumpy as xp
+import maybempi
 import numpy as np
 import pytest
 
@@ -12,7 +13,7 @@ import mpiarray as mpa
 from mpiarray import _mpi
 from mpiarray.tests.unit._mpi_jobs import SERIAL_RUN, run_job
 
-MPI = xp.mpi.get_mpi()
+MPI = maybempi.get_mpi()
 size = MPI.COMM_WORLD.Get_size()
 N = size + 3
 
@@ -29,8 +30,9 @@ def test_matching_collectives_pass_the_checks(monkeypatch: pytest.MonkeyPatch) -
     assert (rooted is None) == (a.layout.rank != 0)
     assert a.sum() == data.sum() and a.var() == pytest.approx(data.var())
     assert a.norm(1) == np.abs(data).sum() and a.vdot(a) == data @ data
-    assert a.get(1) == 1.0 and a[1:3].tolist() == [1.0, 2.0]
+    assert a.get(1) == 1.0 and a[1:3].gather().tolist() == [1.0, 2.0]
     assert a.sum(axis=0) == data.sum()
+    assert a.argmax() == N - 1 and a.max(axis=0) == N - 1
     mpa.zeros(N, split=None).allreduce_replicated()
 
 

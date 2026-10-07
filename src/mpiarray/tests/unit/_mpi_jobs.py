@@ -8,10 +8,10 @@ import shutil
 import subprocess
 import sys
 
-import cunumpy as xp
+import maybempi
 import pytest
 
-SERIAL_RUN = not xp.mpi.launched_under_mpi()
+SERIAL_RUN = not maybempi.launched_under_mpi()
 
 
 @functools.cache

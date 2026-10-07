@@ -65,13 +65,16 @@ full global arrays only when they fit in memory on every rank.
 
 ## Indexing
 
-Reading with global indices is collective and returns the same result on every rank:
+Reading with global indices is collective. A single element comes back as a number on
+every rank; every other selection is a new distributed array (split like `a` where it
+can be, otherwise near-evenly), so slicing a large array never builds it on one rank.
+Use `.gather()` or `.to_numpy()` on the result for a plain array:
 
 | Expression                    | Result                                    |
 | ----------------------------- | ----------------------------------------- |
 | `a[i, j]`, `a.get((i, j))`    | the element, broadcast from its owner     |
-| `a[1:3, :]`, `a[..., 0]`, …   | the selection; only its cells are sent    |
-| `a[mask]`, `a[[0, 5]]`, …     | the selection of the gathered array       |
+| `a[1:3, :]`, `a[..., 0]`, …   | a new distributed array; only the selected cells are sent, to the ranks that own them in the result |
+| `a[mask]`, `a[[0, 5]]`, …     | a new distributed array, made from the gathered array |
 | `a.local_index((i, j))`       | the index into `a.local_with_halos`, or `None` if this rank does not own it (no communication) |
 
 Assignment works the other way round: every rank passes the same value and writes the part
@@ -104,18 +107,53 @@ a.std(ddof=1)
 np.sum(a)  # NumPy's functions call the methods
 ```
 
-With `axis=...` the result is a regular NumPy (or CuPy) array on every rank. The array is
-not gathered: every rank reduces its own block, and only these partial results are sent
-and combined (`sum`, `prod`, `min`, `max`, `mean`, `all`, `any`; `var` and `std` along an
-axis gather the array):
+With `axis=...` the result is again a distributed array, unless every axis is reduced
+(then a scalar, as above). The array is not gathered: every rank reduces its own block,
+and only these partial results travel, to the ranks that own them in the result. `var`
+and `std` combine per-block means and variances (Chan et al.'s parallel formula), so they
+are as accurate as NumPy's two-pass result:
 
 ```python
-a.sum(axis=0)  # numpy/cupy array of shape (3,)
-a.max(axis=(0, 1), keepdims=True)
+a.sum(axis=0)  # a distributed array of shape (3,)
+a.var(axis=1, ddof=1)
+a.max(axis=(0, 1), keepdims=True)  # shape (1, 1)
+a.sum(axis=0).to_numpy()  # a numpy.ndarray on every rank
+```
+
+### Positions and running totals
+
+`argmin` and `argmax` return the flat index of the first extreme element, a Python `int`
+on every rank (NaN counts as the extreme, as in NumPy); with `axis=` a distributed array
+of indices along that axis. `cumsum` and `cumprod` along an axis return a distributed
+array with the same layout; each rank adds the totals of the blocks before it, which is
+one exchange along the split axis. Without `axis` they work only on 1-D arrays, since
+NumPy would flatten.
+
+```python
+i = a.argmax()  # e.g. np.unravel_index(i, a.shape)
+c = a.cumsum(axis=0)
 ```
 
 All reductions are collective: every rank must call them, even ranks that own no cells.
 `out=` is not supported.
+
+## NumPy functions
+
+NumPy's functions dispatch to mpiarray (`__array_function__`), so code written for NumPy
+arrays often runs unchanged:
+
+| Kind            | Functions                                                        |
+| --------------- | ---------------------------------------------------------------- |
+| reductions      | `np.sum`, `prod`, `min`/`amin`, `max`/`amax`, `mean`, `var`, `std`, `all`, `any`, `argmin`, `argmax` |
+| running totals  | `np.cumsum`, `np.cumprod`                                        |
+| elementwise     | `np.where`, `clip`, `round`/`around`, `real`, `imag`, `isclose`  |
+| comparisons     | `np.allclose`, `np.array_equal` (a `bool` on every rank)         |
+| linear algebra  | `np.vdot`, `np.linalg.norm`                                      |
+| creation, shape | `np.zeros_like`, `ones_like`, `empty_like`, `full_like`, `copy`, `shape`, `ndim`, `size`, `astype` |
+
+Any other function raises `TypeError` instead of silently gathering the array; call it on
+`a.gather()` when that is what you want. `np.asarray(a)` gathers explicitly (a
+`numpy.ndarray`, also with CuPy storage).
 
 ## Inner products and norms
 
@@ -153,9 +191,11 @@ the program hangs. A collective call inside `if rank == 0:` is the classic mista
 | `copy`, `astype`, writes to `local`                         | `gather`, `to_numpy`, `np.asarray(a)`, iteration |
 | operators and ufuncs                                        | reductions, `vdot`, `norm`                    |
 | `a[...] = v` with ints and slices                           | `a[...]`, `get`, `bool(a)`                    |
+|                                                             | `redistribute`, `rebalance`, `mpa.migrate`    |
+|                                                             | `argmin`, `argmax`, `cumsum`, `cumprod`       |
 | `repr(a)`, `print(a)`, `a.layout`, `local_index`, `clear_halos` | `a[...] = v` with arrays or masks         |
 | `layout.owners`                                              | `allreduce_replicated`, `from_local`          |
-|                                                             | `mpa.save`, `mpa.load`                        |
+|                                                             | `mpa.save`, `mpa.load`, `save_hdf5`, `load_hdf5` |
 
 ## Debugging hangs
 

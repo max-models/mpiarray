@@ -9,12 +9,14 @@ decomposition without an array, e.g. for particle ownership or a PETSc DMDA.
 
 from __future__ import annotations
 
+import bisect
 import enum
 import math
 from collections.abc import Sequence
 from typing import Any, Literal, TypeAlias, cast
 
 import cunumpy as xp
+import numpy as np
 
 from mpiarray._mpi import MPI, Comm, default_comm
 
@@ -139,18 +141,69 @@ def _fitting_grid(
     return None if best is None else best[1]
 
 
-def _chunk_of(index: Any, length: int, nchunks: int) -> Any:
-    """Return which `chunk_bounds` chunk holds ``index`` (an int or an int array).
+def _balanced_cuts(profile: Any, nchunks: int, minimum: int) -> tuple[int, ...]:
+    """Return cut points that give ``nchunks`` chunks of about equal total weight.
 
-    Needs ``nchunks <= length``, which `Layout` guarantees for split axes.
+    Each chunk gets at least ``minimum`` elements. A profile without weight
+    gives the near-even split.
     """
-    if nchunks == 1:
-        return index * 0
-    base, extra = divmod(length, nchunks)
-    # chunks 0 .. extra-1 have base + 1 elements, the others base
-    return xp.get_array_module(index).maximum(
-        index // (base + 1), (index - extra) // base
-    )
+    weights = np.asarray(profile, dtype=float)
+    length = len(weights)
+    if length < nchunks * minimum:
+        raise ValueError(
+            f"{length} elements cannot be cut into {nchunks} chunks of at least "
+            f"{minimum}",
+        )
+    if (weights < 0).any():
+        raise ValueError("weights must not be negative")
+    cumulative = np.concatenate([[0.0], np.cumsum(weights)])
+    if cumulative[-1] == 0:
+        return (*(chunk_bounds(length, nchunks, i)[0] for i in range(nchunks)), length)
+    cuts = [0]
+    for k in range(1, nchunks):
+        target = cumulative[-1] * k / nchunks
+        cut = int(np.searchsorted(cumulative, target))
+        if cut > 0 and abs(cumulative[cut - 1] - target) <= abs(
+            cumulative[cut] - target
+        ):
+            cut -= 1
+        lowest = cuts[-1] + minimum
+        highest = length - (nchunks - k) * minimum
+        cuts.append(min(max(cut, lowest), highest))
+    return (*cuts, length)
+
+
+def _weight_profiles(weights: Any, shape: tuple[int, ...]) -> list[Any]:
+    """Return one 1-D weight profile per axis (``None`` where none is given)."""
+    ndim = len(shape)
+    if (
+        ndim > 1
+        and isinstance(weights, Sequence)
+        and len(weights) == ndim
+        and all(w is None or np.ndim(w) == 1 for w in weights)
+    ):
+        profiles = [None if w is None else xp.to_numpy(xp.asarray(w)) for w in weights]
+    elif hasattr(weights, "layout"):  # a DistributedArray: reduce along the other axes
+        profiles = [
+            np.asarray(
+                cast(Any, weights).sum(axis=tuple(a for a in range(ndim) if a != axis))
+            )
+            for axis in range(ndim)
+        ]
+    else:
+        array = xp.to_numpy(xp.asarray(weights))
+        if tuple(array.shape) != shape:
+            raise ValueError(f"weights of shape {array.shape} do not match {shape}")
+        profiles = [
+            array.sum(axis=tuple(a for a in range(ndim) if a != axis))
+            for axis in range(ndim)
+        ]
+    for axis, (profile, length) in enumerate(zip(profiles, shape, strict=True)):
+        if profile is not None and len(profile) != length:
+            raise ValueError(
+                f"weight profile of length {len(profile)} along axis {axis}, expected {length}"
+            )
+    return profiles
 
 
 # Cartesian communicators already made, so that layouts with equal arguments
@@ -211,7 +264,7 @@ class Layout:
 
     Args:
         shape: The global shape.
-        comm: The communicator; default: ``MPI.COMM_WORLD`` (cunumpy's serial
+        comm: The communicator; default: ``MPI.COMM_WORLD`` (maybempi's serial
             stand-in when not started by an MPI launcher).
         split: The axis or axes split over the ranks; ``None`` makes every
             rank hold the whole array. Default: axis 0, or with
@@ -224,6 +277,12 @@ class Layout:
             among ``split``, if ``split`` is given. Without it the grid is
             `process_grid`'s choice, or, if that gives an axis more ranks than
             elements, the fitting grid with the smallest halo surface.
+        bounds: Explicit cut points per axis, instead of the near-even split:
+            for each axis ``None`` (not split) or the increasing indices
+            ``[0, c1, ..., length]`` where its blocks start and end. The
+            process grid follows from them (``len(cuts) - 1`` ranks along each
+            axis) and must multiply to the number of ranks. See also
+            `Layout.aligned` and `Layout.weighted`.
         reorder: Let MPI renumber the ranks for the process grid, with a
             Cartesian communicator (``MPI_Cart_create``), so that neighbouring
             blocks can sit on nearby cores and nodes. The layout's `comm` is
@@ -249,6 +308,7 @@ class Layout:
         halo: HaloLike = 0,
         periodic: PeriodicLike = False,
         process_grid: Sequence[int] | None = None,
+        bounds: Sequence[Sequence[int] | None] | None = None,
         reorder: bool = False,
     ) -> None:
         """Compute the decomposition; see the class docstring."""
@@ -270,6 +330,15 @@ class Layout:
         given_split = None
         if split is not DEFAULT and ndim > 0:
             given_split = _normalize_axes(split, ndim)
+        cuts = None
+        if bounds is not None:
+            cuts = self._explicit_cuts(bounds)
+            implied = tuple(1 if c is None else len(c) - 1 for c in cuts)
+            if process_grid is not None and tuple(process_grid) != implied:
+                raise ValueError(
+                    f"bounds imply the process grid {implied}, not {tuple(process_grid)}"
+                )
+            process_grid = implied
         if process_grid is not None:
             grid = tuple(int(n) for n in _per_axis(process_grid, ndim, "process_grid"))
             if any(n < 1 for n in grid) or math.prod(grid) != self._size:
@@ -290,6 +359,12 @@ class Layout:
             if any(n > length for n, length in zip(grid, self._shape, strict=True)):
                 grid = _fitting_grid(self._size, self._shape, self._split) or grid
         self._grid = grid
+        self._cuts = tuple(
+            explicit
+            if cuts is not None and (explicit := cuts[axis]) is not None
+            else (*(chunk_bounds(length, n, i)[0] for i in range(n)), length)
+            for axis, (length, n) in enumerate(zip(self._shape, grid, strict=True))
+        )
         self._check_blocks()
         if reorder and self._size > 1 and math.prod(grid) > 1:
             self._comm = _cartesian(self._comm, grid, self._periodic)
@@ -310,10 +385,42 @@ class Layout:
             )
         self._index_bounds = self.index_bounds_of(self._rank)
 
+    def _explicit_cuts(
+        self, bounds: Sequence[Sequence[int] | None]
+    ) -> tuple[tuple[int, ...] | None, ...]:
+        """Return ``bounds`` checked: per axis None or cuts increasing from 0 to the length."""
+        checked: list[tuple[int, ...] | None] = []
+        for axis, (cuts, length) in enumerate(
+            zip(_per_axis(bounds, self.ndim, "bounds"), self._shape, strict=True)
+        ):
+            if cuts is None:
+                checked.append(None)
+                continue
+            cuts = tuple(int(c) for c in cuts)
+            if (
+                len(cuts) < 2
+                or cuts[0] != 0
+                or cuts[-1] != length
+                or any(b <= a for a, b in zip(cuts, cuts[1:], strict=False))
+            ):
+                raise ValueError(
+                    f"bounds {cuts} along axis {axis} must increase from 0 to {length}, "
+                    "with at least one element per block",
+                )
+            checked.append(cuts)
+        return tuple(checked)
+
     def _check_blocks(self) -> None:
         """Raise unless every rank owns cells and every halo fits in a block."""
-        for axis, (length, n, h, periodic) in enumerate(
-            zip(self._shape, self._grid, self._halo, self._periodic, strict=True)
+        for axis, (length, n, h, periodic, cuts) in enumerate(
+            zip(
+                self._shape,
+                self._grid,
+                self._halo,
+                self._periodic,
+                self._cuts,
+                strict=True,
+            )
         ):
             if n > 1 and n > length:
                 raise ValueError(
@@ -323,10 +430,11 @@ class Layout:
                 )
             # A halo is filled from the neighbouring block only, so it must
             # not be wider than any block it is exchanged with.
-            if h and (n > 1 or periodic) and length // n < h:
+            smallest = min(b - a for a, b in zip(cuts, cuts[1:], strict=False))
+            if h and (n > 1 or periodic) and smallest < h:
                 raise ValueError(
                     f"halo {h} along axis {axis} is wider than the smallest block "
-                    f"({length // n} elements); use a smaller halo or fewer ranks",
+                    f"({smallest} elements); use a smaller halo or fewer ranks",
                 )
 
     def _shifted(self, axis: int, step: int) -> int:
@@ -387,8 +495,7 @@ class Layout:
         """Return the global ``(start, end)`` index range ``rank`` owns, per axis."""
         coord = self.coord_of(rank)
         return tuple(
-            chunk_bounds(length, n, c)
-            for length, n, c in zip(self._shape, self._grid, coord, strict=True)
+            (cuts[c], cuts[c + 1]) for cuts, c in zip(self._cuts, coord, strict=True)
         )
 
     def local_shape_of(self, rank: int) -> tuple[int, ...]:
@@ -413,15 +520,15 @@ class Layout:
         if len(index) != self.ndim:
             raise IndexError(f"expected {self.ndim} indices, got {len(index)}")
         coord = []
-        for axis, (i, length, n) in enumerate(
-            zip(index, self._shape, self._grid, strict=True)
+        for axis, (i, length, cuts) in enumerate(
+            zip(index, self._shape, self._cuts, strict=True)
         ):
             position = i + length if i < 0 else i
             if not 0 <= position < length:
                 raise IndexError(
                     f"index {i} is out of bounds for axis {axis} with size {length}",
                 )
-            coord.append(int(_chunk_of(position, length, n)))
+            coord.append(bisect.bisect_right(cuts, position) - 1)
         return self.rank_of(coord)
 
     def owners(self, indices: Any, *, clip: bool = False) -> Any:
@@ -454,7 +561,9 @@ class Layout:
                 f"indices of shape {tuple(indices.shape)} do not end in {self.ndim} axes"
             )
         ranks = module.zeros(indices.shape[:-1], dtype=module.int64)
-        for axis, (length, n) in enumerate(zip(self._shape, self._grid, strict=True)):
+        for axis, (length, n, cuts) in enumerate(
+            zip(self._shape, self._grid, self._cuts, strict=True)
+        ):
             position = indices[..., axis]
             if clip:
                 position = module.clip(position, 0, length - 1)
@@ -464,7 +573,8 @@ class Layout:
                     raise IndexError(
                         f"an index is out of bounds for axis {axis} with size {length}",
                     )
-            ranks = ranks * n + _chunk_of(position, length, n)
+            inner = module.asarray(cuts[1:-1], dtype=position.dtype)
+            ranks = ranks * n + module.searchsorted(inner, position, side="right")
         return ranks
 
     # ------------------------------------------------------------------ #
@@ -514,6 +624,11 @@ class Layout:
     def process_grid(self) -> tuple[int, ...]:
         """The number of processes along each axis."""
         return self._grid
+
+    @property
+    def bounds(self) -> tuple[tuple[int, ...], ...]:
+        """The cut points along each axis: where the blocks start, and the length."""
+        return self._cuts
 
     @property
     def process_coord(self) -> tuple[int, ...]:
@@ -579,7 +694,7 @@ class Layout:
         ``split`` is left out: it only matters through the process grid, so
         ``split=0`` and ``split=None`` on one rank give equal layouts.
         """
-        return (self._shape, self._halo, self._periodic, self._grid)
+        return (self._shape, self._halo, self._periodic, self._grid, self._cuts)
 
     def __eq__(self, other: object) -> bool:
         """Return whether ``other`` describes the same decomposition."""
@@ -592,10 +707,137 @@ class Layout:
         """Return a hash consistent with ``==``."""
         return hash(self._key())
 
+    def _uneven(self) -> bool:
+        """Return whether the cuts differ from the near-even split."""
+        return any(
+            cuts != (*(chunk_bounds(length, n, i)[0] for i in range(n)), length)
+            for cuts, length, n in zip(self._cuts, self._shape, self._grid, strict=True)
+        )
+
     def __repr__(self) -> str:
         """Return the defining values; no communication."""
+        bounds = f"bounds={self._cuts}, " if self._uneven() else ""
         return (
             f"Layout(shape={self._shape}, split={self._split}, halo={self._halo}, "
-            f"periodic={self._periodic}, process_grid={self._grid}, "
+            f"periodic={self._periodic}, process_grid={self._grid}, {bounds}"
             f"rank={self._rank} of {self._size})"
+        )
+
+    # ------------------------------------------------------------------ #
+    # Related layouts
+
+    def aligned(
+        self,
+        shape: ShapeLike,
+        *,
+        halo: HaloLike | None = None,
+        periodic: PeriodicLike | None = None,
+    ) -> Layout:
+        """Return a layout for another shape whose blocks start where this one's do.
+
+        For arrays that belong together but differ in length, such as values
+        at the ``n`` cells and the ``n + 1`` nodes of a grid: every block
+        starts at the same global index as here, and the last block along
+        each axis takes the difference. Same communicator and process grid.
+
+        Args:
+            shape: The other shape, with the same number of axes.
+            halo: The halo widths; default: this layout's.
+            periodic: The periodicity; default: this layout's.
+
+        Returns:
+            The aligned layout.
+
+        Raises:
+            ValueError: If the shape has a different number of axes, or would
+                leave the last block along an axis empty.
+        """
+        shape = (shape,) if isinstance(shape, int) else tuple(int(n) for n in shape)
+        if len(shape) != self.ndim:
+            raise ValueError(f"shape {shape} does not have {self.ndim} axes")
+        bounds = []
+        for axis, (cuts, length) in enumerate(zip(self._cuts, shape, strict=True)):
+            if length <= cuts[-2]:
+                raise ValueError(
+                    f"length {length} along axis {axis} leaves the last block empty; "
+                    f"it starts at {cuts[-2]}",
+                )
+            bounds.append((*cuts[:-1], length))
+        return Layout(
+            shape,
+            comm=self._comm,
+            split=None if self._replicated else DEFAULT,
+            halo=self._halo if halo is None else halo,
+            periodic=self._periodic if periodic is None else periodic,
+            bounds=None if self._replicated else bounds,
+        )
+
+    @classmethod
+    def weighted(
+        cls,
+        shape: ShapeLike,
+        weights: Any,
+        *,
+        comm: Comm | None = None,
+        split: SplitArg = DEFAULT,
+        halo: HaloLike = 0,
+        periodic: PeriodicLike = False,
+        process_grid: Sequence[int] | None = None,
+        reorder: bool = False,
+    ) -> Layout:
+        """Return a layout whose blocks carry about equal weight, for load balancing.
+
+        The process grid is chosen as usual; then each split axis is cut so
+        that every chunk gets about the same share of the weight summed over
+        the other axes. A block keeps at least one element, and at least its
+        halo width where halos are exchanged.
+
+        Args:
+            shape: The global shape.
+            weights: The cost of each element: an array of ``shape`` (NumPy,
+                CuPy, or a `DistributedArray`, whose sums along the other axes
+                are used), or one 1-D profile per axis (``None`` for axes that
+                are not split).
+            comm: The communicator.
+            split: The split axis or axes.
+            halo: The halo widths.
+            periodic: Whether each axis wraps around.
+            process_grid: Explicit process counts per axis.
+            reorder: Use a Cartesian communicator; see `Layout`.
+
+        Returns:
+            The layout, with explicit `bounds`.
+
+        Raises:
+            ValueError: If the weights do not match the shape, are negative, or
+                an axis is too short for its chunks.
+        """
+        even = cls(
+            shape,
+            comm=comm,
+            split=split,
+            halo=halo,
+            periodic=periodic,
+            process_grid=process_grid,
+        )
+        if even.replicated or even.size == 1:
+            return even
+        profiles = _weight_profiles(weights, even.shape)
+        bounds: list[tuple[int, ...] | None] = []
+        for axis, n in enumerate(even.process_grid):
+            if n == 1:
+                bounds.append(None)
+            elif profiles[axis] is None:
+                bounds.append(even.bounds[axis])
+            else:
+                bounds.append(
+                    _balanced_cuts(profiles[axis], n, max(1, even.halo[axis]))
+                )
+        return cls(
+            even.shape,
+            comm=even.comm,
+            halo=halo,
+            periodic=periodic,
+            bounds=bounds,
+            reorder=reorder,
         )

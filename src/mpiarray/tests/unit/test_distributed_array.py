@@ -11,6 +11,7 @@ import warnings
 from typing import Any, cast
 
 import cunumpy as xp
+import maybempi
 import numpy as np
 import pytest
 
@@ -18,7 +19,7 @@ import mpiarray as mpa
 from mpiarray import DistributedArray, Layout
 from mpiarray.tests.unit._mpi_jobs import SERIAL_RUN, run_job
 
-MPI = xp.mpi.get_mpi()
+MPI = maybempi.get_mpi()
 comm = MPI.COMM_WORLD
 rank, size = comm.Get_rank(), comm.Get_size()
 N = size + 3  # an axis length that every rank count up to N can split
@@ -656,18 +657,16 @@ def test_whole_array_reductions_return_host_scalars() -> None:
     assert isinstance(a.all(), bool)
 
 
-def test_zero_size_and_complex_min_max_raise_on_every_rank() -> None:
+def test_zero_size_min_max_raise_and_complex_min_max_follow_numpy() -> None:
     empty = mpa.zeros((0, 3), split=None)
     with pytest.raises(ValueError, match="zero-size"):
         empty.min()
     with pytest.raises(ValueError, match="zero-size"):
         empty.max()
     assert empty.sum() == 0
-    # with more ranks than cells some ranks own nothing; all of them must raise
-    complex_array = mpa.zeros(size, dtype=np.complex128)
-    for reduction in (complex_array.min, complex_array.max):
-        with pytest.raises(TypeError, match="min/max are not supported"):
-            reduction()
+    values = np.array([1 + 5j, 3 - 1j, 3 + 2j, -2 + 9j] * size)
+    a = mpa.array(values)
+    assert a.min() == values.min() and a.max() == values.max()
 
 
 def test_numpy_reduction_functions_dispatch_to_the_methods() -> None:
@@ -772,12 +771,13 @@ import sys
 import numpy as np
 
 import cunumpy as xp
+import maybempi
 
 sys.path.insert(0, sys.argv[2])
 import mpiarray as mpa
 
-MPI = xp.mpi.get_mpi()
-assert not isinstance(MPI, xp.mpi.SerialMPI), "expected a real MPI run"
+MPI = maybempi.get_mpi()
+assert not maybempi.is_serial(MPI), "expected a real MPI run"
 comm = MPI.COMM_WORLD
 xp.mpi.set_mpi_cuda_aware(False)
 data = np.arange(8 * 6 * 2, dtype=float).reshape(8, 6, 2)
@@ -798,6 +798,15 @@ walls.update_halos(boundary="edge")
 path = comm.bcast(sys.argv[1] + "_file.npy", root=0)
 mpa.save(path, updated)
 loaded = mpa.load(path, split=1)
+moved = updated.redistribute(mpa.Layout(updated.shape, split=2))
+ids = xp.arange(6) + 10 * comm.rank
+(migrated,) = mpa.migrate(ids % comm.size, ids)
+overlapped = mpa.array(xp.asarray(data), split=(0, 1), halo=(1, 1, 0), periodic=True)
+overlapped.update_halos(wait=False).wait()
+overlapped.update_halos(wait=False).wait()  # the kept staging buffers again
+updated.update_halos()
+overlapped.accumulate_halos(wait=False).wait()
+spread = (updated.argmax(axis=1), updated.cumsum(axis=0), updated.var(axis=(0, 1)))
 np.savez(
     f"{sys.argv[1]}_{comm.rank}.npz",
     backend=xp.get_backend(),
@@ -806,14 +815,20 @@ np.savez(
     rooted=xp.to_numpy(rooted) if (rooted := accumulated.gather(root=0)) is not None else 0,
     replicated=xp.to_numpy(replicated.gather()),
     arithmetic=xp.to_numpy(arithmetic.gather()),
-    selection=xp.to_numpy(selection),
-    along_sum=xp.to_numpy(along[0]),
-    along_max=xp.to_numpy(along[1]),
-    along_mean=xp.to_numpy(along[2]),
+    selection=xp.to_numpy(selection.gather()),
+    along_sum=xp.to_numpy(along[0].gather()),
+    along_max=xp.to_numpy(along[1].gather()),
+    along_mean=xp.to_numpy(along[2].gather()),
     pieces=xp.to_numpy(pieces.gather()),
     walls=xp.to_numpy(walls.local_with_halos),
     loaded=xp.to_numpy(loaded.gather()),
     variance=np.asarray(updated.var()),
+    moved=xp.to_numpy(moved.gather()),
+    migrated=xp.to_numpy(xp.sort(migrated)),
+    overlapped=xp.to_numpy(overlapped.local_with_halos),
+    argmax=xp.to_numpy(spread[0].gather()),
+    cumsum=xp.to_numpy(spread[1].gather()),
+    var_axes=xp.to_numpy(spread[2].gather()),
     total=np.asarray(updated.sum()),
     element=np.asarray(updated.get((5, 4, 1))),
 )

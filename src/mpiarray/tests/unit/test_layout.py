@@ -6,7 +6,7 @@ import itertools
 import math
 from typing import TYPE_CHECKING, cast
 
-import cunumpy as xp
+import maybempi
 import numpy as np
 import pytest
 
@@ -16,7 +16,7 @@ from mpiarray import Layout, chunk_bounds, process_grid
 if TYPE_CHECKING:
     from mpiarray._mpi import Comm
 
-MPI = xp.mpi.get_mpi()
+MPI = maybempi.get_mpi()
 
 
 class FakeComm:
