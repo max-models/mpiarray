@@ -345,6 +345,40 @@ class DistributedArray:
         gathered = self.gather(root)
         return None if gathered is None else xp.to_numpy(gathered)
 
+    def to_petsc(self, vec: Any = None) -> Any:
+        """Copy this rank's block into a global PETSc vector (needs petsc4py).
+
+        Local, without communication; halo cells are left out. See
+        `mpiarray.petsc.copy_to_petsc`.
+
+        Args:
+            vec: The ``PETSc.Vec`` to fill; default: a new global vector of
+                ``self.layout.dmda()`` (the cached DMDA; collective the first
+                time it is built for this layout).
+
+        Returns:
+            The filled vector.
+        """
+        from mpiarray.petsc import copy_to_petsc
+
+        if vec is None:
+            vec = self._layout.dmda().createGlobalVec()
+        copy_to_petsc(self, vec)
+        return vec
+
+    def copy_from_petsc(self, vec: Any) -> None:
+        """Overwrite this rank's block from a global PETSc vector (needs petsc4py).
+
+        Local; halo cells are left untouched. See
+        `mpiarray.petsc.copy_from_petsc`.
+
+        Args:
+            vec: A global vector of ``self.layout.dmda()``.
+        """
+        from mpiarray.petsc import copy_from_petsc
+
+        copy_from_petsc(vec, self)
+
     def local_index(self, index: int | tuple[int, ...]) -> tuple[int, ...] | None:
         """Return where a global index lies in this rank's storage.
 

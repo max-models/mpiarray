@@ -2153,11 +2153,11 @@ wheels = [
 
 [[package]]
 name = "maybempi"
-version = "0.1.1"
+version = "0.1.2"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/e8/67/a6b9baace877ad6a0efc7ca52323e34d5269e9a3728d486fbc476c46b3fb/maybempi-0.1.1.tar.gz", hash = "sha256:bb1757c98345b9bb6182398fdf69c2e9dd6ba761abb48380825a4e9c6557c0d1", size = 22847, upload-time = "2026-10-06T21:38:27.687Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c4/0d/ed782142085f56da45eb4511dd3fb2a7b1ed167fe5495dd429c61272774e/maybempi-0.1.2.tar.gz", hash = "sha256:0b0fadd2897281df50a2cf3f08ddf080d1ca00c9d2e4e5aee2af7cf5222ba04d", size = 42851, upload-time = "2026-10-07T05:38:48.594Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/64/25/3af615b85ad04b94a13f4a6725b10316361bd0ebccf708d35d20118ea240/maybempi-0.1.1-py3-none-any.whl", hash = "sha256:a9eea52715ca4168fc39d6cea7e7f6a72c3aaab03f35d560273505673d0f8012", size = 24172, upload-time = "2026-10-06T21:38:26.34Z" },
+    { url = "https://files.pythonhosted.org/packages/88/d3/b161669937ee87dba4c61a6ac2be70bd1399269c76c66524e3f8be071839/maybempi-0.1.2-py3-none-any.whl", hash = "sha256:1fc9a2eb7e4f55a6b91da32e8e77bade35df157e6ce5de3b228cdf799e99970b", size = 47478, upload-time = "2026-10-07T05:38:47.046Z" },
 ]
 
 [[package]]
@@ -2222,7 +2222,7 @@ wheels = [
 
 [[package]]
 name = "mpiarray"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "cunumpy" },
@@ -2286,7 +2286,7 @@ requires-dist = [
     { name = "jupyterlab", marker = "extra == 'dev'" },
     { name = "matplotlib", marker = "extra == 'docs'" },
     { name = "matplotlib", marker = "extra == 'test'" },
-    { name = "maybempi", specifier = ">=0.1.1" },
+    { name = "maybempi", specifier = ">=0.1.2" },
     { name = "mpi4py", marker = "extra == 'mpi'" },
     { name = "mpiarray", extras = ["test", "docs", "mpi"], marker = "extra == 'dev'" },
     { name = "nbclient", marker = "extra == 'docs'", specifier = ">=0.10" },

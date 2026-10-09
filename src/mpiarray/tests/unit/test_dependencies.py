@@ -15,6 +15,7 @@ ALLOWED = {
     "numpy",
     "cupy",  # lazily, in DistributedArray.to_cupy()
     "h5py",  # lazily, for save_hdf5/load_hdf5 (the hdf5 extra)
+    "petsc4py",  # lazily, in mpiarray.petsc (installed separately)
     "typing_extensions",  # under TYPE_CHECKING only
 }
 
@@ -55,6 +56,7 @@ a.update_halos()
 assert a.sum() == 15.0
 assert xp.to_numpy(a.local_with_halos).tolist() == [5, 0, 1, 2, 3, 4, 5, 0]
 assert "mpi4py" not in sys.modules, "a serial run imported mpi4py"
+assert "petsc4py" not in sys.modules, "import mpiarray imported petsc4py"
 """
 
 
