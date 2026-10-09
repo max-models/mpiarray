@@ -7,10 +7,11 @@ sidebar:
 
 `mpiarray.petsc` connects layouts and arrays to [petsc4py](https://petsc.org/release/petsc4py/),
 so that KSP, SNES and TS can work on mpiarray data without a second, hand-made
-decomposition. It needs the optional extra:
+decomposition. It needs petsc4py, which is not a dependency of mpiarray (it builds
+PETSc from source where no wheel fits); install it separately:
 
 ```bash
-pip install "mpiarray[petsc]"
+pip install petsc4py  # or: conda install -c conda-forge petsc4py
 ```
 
 petsc4py is imported on first use only; `import mpiarray` works without it.

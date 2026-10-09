@@ -20,7 +20,8 @@ order of its C-ordered mpiarray block, so the transfer is one local copy.
 PETSc's *natural* ordering (x fastest over the reversed axes) is mpiarray's
 global C order.
 
-This module needs petsc4py (``pip install "mpiarray[petsc]"``); it is imported
+This module needs petsc4py, installed separately (``pip install petsc4py``,
+or with conda, which has binaries); it is imported
 lazily, so ``import mpiarray`` works without it.
 """
 
@@ -56,13 +57,13 @@ _DMDA_CACHE: dict[tuple, Any] = {}
 
 
 def _petsc() -> Any:
-    """Return ``petsc4py.PETSc``, or raise an ImportError naming the extra."""
+    """Return ``petsc4py.PETSc``, or raise an ImportError saying how to install it."""
     try:
         from petsc4py import PETSc  # pyright: ignore[reportMissingImports]
     except ImportError as error:
         raise ImportError(
             "PETSc interoperability needs petsc4py; install it with "
-            '`pip install "mpiarray[petsc]"`',
+            "`pip install petsc4py` (or `conda install -c conda-forge petsc4py`)",
         ) from error
     return PETSc
 

@@ -15,7 +15,7 @@ ALLOWED = {
     "numpy",
     "cupy",  # lazily, in DistributedArray.to_cupy()
     "h5py",  # lazily, for save_hdf5/load_hdf5 (the hdf5 extra)
-    "petsc4py",  # lazily, in mpiarray.petsc (the petsc extra)
+    "petsc4py",  # lazily, in mpiarray.petsc (installed separately)
     "typing_extensions",  # under TYPE_CHECKING only
 }
 

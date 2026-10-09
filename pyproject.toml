@@ -49,7 +49,6 @@ optional-dependencies.docs = [
 optional-dependencies.hdf5 = [ "h5py" ]
 optional-dependencies.mpi = [ "mpi4py" ]
 # PETSc interoperability (mpiarray.petsc): DMDAs with a layout's decomposition
-optional-dependencies.petsc = [ "petsc4py" ]
 # matplotlib and nbformat: the tutorials are also run as tests, under MPI
 optional-dependencies.test = [ "h5py", "matplotlib", "nbformat>=5.10", "pytest", "pytest-cov" ]
 urls."Source" = "https://github.com/max-models/mpiarray"

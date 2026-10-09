@@ -1,7 +1,8 @@
 # PETSc interoperability
 
-Planned 2026-10-06, implemented 2026-10-09 in `src/mpiarray/petsc.py` (optional extra
-`mpiarray[petsc]`, petsc4py imported lazily). Goal: solve on mpiarray data with PETSc (KSP,
+Planned 2026-10-06, implemented 2026-10-09 in `src/mpiarray/petsc.py` (petsc4py imported
+lazily and installed separately: there is no `petsc` extra, because `uv sync` resolves every
+extra and petsc4py builds PETSc from source where no wheel fits, which fails in CI). Goal: solve on mpiarray data with PETSc (KSP,
 SNES, TS) without building a second decomposition by hand.
 
 ## Done

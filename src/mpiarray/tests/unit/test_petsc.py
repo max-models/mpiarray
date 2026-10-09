@@ -113,9 +113,9 @@ def test_methods_without_petsc4py(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "petsc4py.PETSc", None)
     a = mpa.zeros((size * 2, 3), halo=1)
     a.local[...] = np.arange(a.size).reshape(a.shape)[a.layout.global_slices()]
-    with pytest.raises(ImportError, match=r"mpiarray\[petsc\]"):
+    with pytest.raises(ImportError, match="pip install petsc4py"):
         a.layout.dmda()
-    with pytest.raises(ImportError, match=r"mpiarray\[petsc\]"):
+    with pytest.raises(ImportError, match="pip install petsc4py"):
         a.to_petsc()
     # a given vector needs no PETSc: the copies are local
     vec = FakeVec(a.local.size, a.size)

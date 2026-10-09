@@ -7,7 +7,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- PETSc interoperability (`mpiarray.petsc`, optional extra `mpiarray[petsc]`): `Layout.dmda()`
+- PETSc interoperability (`mpiarray.petsc`, needs petsc4py installed separately): `Layout.dmda()`
   builds a `PETSc.DMDA` with exactly the layout's decomposition (cached per layout);
   `DistributedArray.to_petsc()`, `copy_from_petsc()`, `mpa.copy_to_petsc`,
   `mpa.copy_from_petsc` and `mpa.from_petsc` move blocks to and from global vectors;
