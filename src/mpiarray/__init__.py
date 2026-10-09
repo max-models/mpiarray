@@ -36,7 +36,10 @@ from mpiarray.creation import (
 )
 from mpiarray.distributed_array import DistributedArray, HaloUpdate
 from mpiarray.io import load, load_hdf5, save, save_hdf5
-from mpiarray.layout import Layout, chunk_bounds, process_grid
+from mpiarray.layout import Layout, block_numbering, chunk_bounds, process_grid
+
+# petsc4py is imported only when a PETSc function is called
+from mpiarray.petsc import copy_from_petsc, copy_to_petsc, from_petsc, petsc_numbering
 from mpiarray.points import migrate
 
 __version__ = "0.1.0"
@@ -49,11 +52,15 @@ __all__ = [
     "arange",
     "array",
     "asarray",
+    "block_numbering",
     "chunk_bounds",
+    "copy_from_petsc",
+    "copy_to_petsc",
     "default_comm",
     "empty",
     "empty_like",
     "from_local",
+    "from_petsc",
     "fromfunction",
     "full",
     "full_like",
@@ -63,6 +70,7 @@ __all__ = [
     "migrate",
     "ones",
     "ones_like",
+    "petsc_numbering",
     "process_grid",
     "save",
     "save_hdf5",

@@ -48,6 +48,8 @@ optional-dependencies.docs = [
 # HDF5 files: save_hdf5/load_hdf5 (parallel with an MPI-enabled h5py build)
 optional-dependencies.hdf5 = [ "h5py" ]
 optional-dependencies.mpi = [ "mpi4py" ]
+# PETSc interoperability (mpiarray.petsc): DMDAs with a layout's decomposition
+optional-dependencies.petsc = [ "petsc4py" ]
 # matplotlib and nbformat: the tutorials are also run as tests, under MPI
 optional-dependencies.test = [ "h5py", "matplotlib", "nbformat>=5.10", "pytest", "pytest-cov" ]
 urls."Source" = "https://github.com/max-models/mpiarray"
@@ -89,7 +91,9 @@ addopts = "-ra"
 source = [ "mpiarray" ]
 # every `if` must be seen going both ways
 branch = true
-omit = [ "*/tests/*" ]
+# mpiarray/petsc.py: CI has no petsc4py (it builds PETSc from source without a matching
+# wheel), so its tests skip there; run them locally with petsc4py (see PETSC.md)
+omit = [ "*/tests/*", "*/mpiarray/petsc.py" ]
 # one data file per process (every MPI rank, and the jobs tests start), for `coverage combine`
 parallel = true
 patch = [ "subprocess" ]
@@ -105,5 +109,5 @@ python-version = "3.10"
 include = [ "src" ]
 
 [tool.ty.analysis]
-# CuPy is optional and not installed in CI
-allowed-unresolved-imports = [ "cupy" ]
+# CuPy and petsc4py are optional and not installed in CI
+allowed-unresolved-imports = [ "cupy", "petsc4py" ]

@@ -99,6 +99,71 @@ def process_grid(size: int, ndim: int, split: Sequence[int]) -> tuple[int, ...]:
 _automatic_process_grid = process_grid
 
 
+def block_numbering(shape: ShapeLike, cuts: Sequence[Sequence[int]]) -> np.ndarray:
+    """Return the position of every element when the blocks are stored one after another.
+
+    The array of ``shape`` is cut into blocks along every axis at ``cuts``;
+    the blocks are numbered row-major over the process grid (the last axis
+    fastest, like the ranks of a `Layout`), stored consecutively in that
+    order, and each is C-ordered inside. This is the row numbering of a PETSc
+    DMDA's global vectors (see `mpiarray.petsc.petsc_numbering`).
+
+    Unlike a `Layout`, blocks may be empty (repeated cut points), as when a
+    coarse multigrid level leaves a rank without elements. Computed locally
+    with NumPy.
+
+    Args:
+        shape: The global shape.
+        cuts: One sequence per axis, ``(0, c1, ..., length)``, non-decreasing;
+            ``len(cuts[axis]) - 1`` blocks along that axis. `Layout.bounds`
+            gives a layout's.
+
+    Returns:
+        An int64 NumPy array of ``shape``: the position of each element.
+
+    Raises:
+        ValueError: If ``cuts`` does not have one entry per axis, or an
+            entry does not go from 0 to the axis length without decreasing.
+    """
+    shape = (shape,) if isinstance(shape, int) else tuple(int(n) for n in shape)
+    if len(cuts) != len(shape):
+        raise ValueError(f"cuts has {len(cuts)} entries, expected {len(shape)}")
+    axis_cuts = [np.asarray(c, dtype=np.int64) for c in cuts]
+    for axis, (c, length) in enumerate(zip(axis_cuts, shape, strict=True)):
+        if (
+            c.ndim != 1
+            or len(c) < 2
+            or c[0] != 0
+            or c[-1] != length
+            or bool(np.any(c[1:] < c[:-1]))
+        ):
+            raise ValueError(
+                f"cuts {tuple(c.tolist())} along axis {axis} must go from 0 to "
+                f"{length} without decreasing",
+            )
+    lengths = [np.diff(c) for c in axis_cuts]
+    # elements before each block, over the grid of blocks in row-major order
+    sizes = np.ones((), dtype=np.int64)
+    for axis_lengths in lengths:
+        sizes = np.multiply.outer(sizes, axis_lengths)
+    starts = (np.cumsum(sizes.ravel()) - sizes.ravel()).reshape(sizes.shape)
+
+    numbering = np.zeros(shape, dtype=np.int64)
+    coords = []
+    for axis, (length, c) in enumerate(zip(shape, axis_cuts, strict=True)):
+        position = np.arange(length, dtype=np.int64)
+        # with empty blocks, the last block starting at or before the position
+        coord = np.searchsorted(c[1:-1], position, side="right")
+        view = [1] * len(shape)
+        view[axis] = length
+        coords.append(coord.reshape(view))
+        # Horner's scheme for the C-order index inside the element's block
+        numbering = numbering * lengths[axis][coord].reshape(view) + (
+            position - c[coord]
+        ).reshape(view)
+    return numbering + starts[tuple(coords)]
+
+
 def _fitting_grid(
     size: int, shape: tuple[int, ...], split: Sequence[int]
 ) -> tuple[int, ...] | None:
@@ -721,6 +786,39 @@ class Layout:
             f"Layout(shape={self._shape}, split={self._split}, halo={self._halo}, "
             f"periodic={self._periodic}, process_grid={self._grid}, {bounds}"
             f"rank={self._rank} of {self._size})"
+        )
+
+    # ------------------------------------------------------------------ #
+    # PETSc
+
+    def dmda(
+        self,
+        *,
+        stencil_width: int | None = None,
+        stencil_type: str = "star",
+        boundary_type: Any = None,
+    ) -> Any:
+        """Return a ``PETSc.DMDA`` with exactly this decomposition (needs petsc4py).
+
+        See `mpiarray.petsc.dmda`, which this calls: the DMDA has the axes in
+        reverse order and is cached per layout and options.
+
+        Args:
+            stencil_width: PETSc's ghost width; default ``max(halo)``, at least 1.
+            stencil_type: ``"star"`` or ``"box"``.
+            boundary_type: PETSc boundary types, for all axes or one per axis;
+                default from ``periodic``.
+
+        Returns:
+            The cached ``petsc4py.PETSc.DMDA``.
+        """
+        from mpiarray.petsc import dmda
+
+        return dmda(
+            self,
+            stencil_width=stencil_width,
+            stencil_type=stencil_type,
+            boundary_type=boundary_type,
         )
 
     # ------------------------------------------------------------------ #
