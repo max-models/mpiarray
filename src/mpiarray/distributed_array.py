@@ -2422,9 +2422,10 @@ def _concatenate(arrays: Sequence[Any], axis: int = 0, **kwargs: Any) -> Any:
         raise TypeError(
             "np.concatenate on distributed arrays takes no further keyword arguments"
         )
+    # NumPy's dispatch needs a relevant argument to route here at all, so
+    # ``arrays`` is never empty (``np.concatenate([])`` never reaches this
+    # function; it is NumPy's own ValueError, before any dispatch).
     arrays = list(arrays)
-    if not arrays:
-        raise ValueError("need at least one array to concatenate")
     if not all(isinstance(a, DistributedArray) for a in arrays):
         raise TypeError(
             "np.concatenate on distributed arrays needs every array to be one"
@@ -2459,9 +2460,8 @@ def _stack(arrays: Sequence[Any], axis: int = 0, **kwargs: Any) -> Any:
         raise TypeError(
             "np.stack on distributed arrays takes no further keyword arguments"
         )
+    # see _concatenate: NumPy's dispatch guarantees ``arrays`` is non-empty.
     arrays = list(arrays)
-    if not arrays:
-        raise ValueError("need at least one array to stack")
     if not all(isinstance(a, DistributedArray) for a in arrays):
         raise TypeError("np.stack on distributed arrays needs every array to be one")
     template = arrays[0]

@@ -106,6 +106,14 @@ def test_reductions_norms_and_shape_functions() -> None:
         np.dot(a, a)
     with pytest.raises(TypeError, match="DistributedArray"):
         np.dot(v, vdata)
+    with pytest.raises(TypeError, match="DistributedArray"):
+        v.dot(vdata)
+    with pytest.raises(TypeError, match="no out"):
+        np.dot(v, w, np.empty(()))
+    with pytest.raises(TypeError, match="no out"):
+        np.matmul(v, w, out=np.empty(()))
+    with pytest.raises(TypeError, match="NotImplemented"):
+        np.matmul(v, w, casting="unsafe")
     assert np.shape(a) == (N, 2) and np.ndim(a) == 2 and np.size(a) == 2 * N
     assert np.size(a, 1) == 2
     assert isinstance(np.copy(a), DistributedArray)
@@ -163,10 +171,14 @@ def test_concatenate_and_stack(split) -> None:
         np.testing.assert_array_equal(
             _g(np.stack([a, b], axis=axis)), np.stack([data, data + 100.0], axis=axis)
         )
-    with pytest.raises(ValueError, match="need at least one"):
-        np.concatenate([])
     with pytest.raises(TypeError, match="every array to be one"):
         np.concatenate([a, data])
+    with pytest.raises(TypeError, match="every array to be one"):
+        np.stack([a, data])
+    with pytest.raises(TypeError, match="no further keyword arguments"):
+        np.concatenate([a, b], dtype=np.float32)
+    with pytest.raises(TypeError, match="no further keyword arguments"):
+        np.stack([a, b], dtype=np.float32)
     mismatched_axis = next(axis for axis in range(3) if split is None or axis != split)
     with pytest.raises(ValueError, match="same layout"):
         np.concatenate([a, mpa.array(data, split=split, halo=0)], axis=mismatched_axis)
