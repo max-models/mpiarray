@@ -71,6 +71,15 @@ def test_reductions_norms_and_shape_functions() -> None:
     with pytest.raises(TypeError, match="axis"):
         np.linalg.norm(a, axis=0)
     assert np.vdot(a, a) == pytest.approx(np.vdot(data, data))
+    vdata = data[:, 0]
+    v, w = mpa.array(vdata), mpa.array(vdata + 1.0)
+    assert v.dot(w) == pytest.approx(np.dot(vdata, vdata + 1.0))
+    assert np.dot(v, w) == pytest.approx(np.dot(vdata, vdata + 1.0))
+    assert np.matmul(v, w) == pytest.approx(np.dot(vdata, vdata + 1.0))
+    with pytest.raises(TypeError, match="1-D"):
+        np.dot(a, a)
+    with pytest.raises(TypeError, match="DistributedArray"):
+        np.dot(v, vdata)
     assert np.shape(a) == (N, 2) and np.ndim(a) == 2 and np.size(a) == 2 * N
     assert np.size(a, 1) == 2
     assert isinstance(np.copy(a), DistributedArray)
@@ -89,7 +98,7 @@ def test_like_functions_and_unsupported_functions() -> None:
     with pytest.raises(TypeError, match="no shape or subok"):
         np.zeros_like(a, shape=(3,))
     with pytest.raises(TypeError, match="no implementation found"):
-        np.concatenate([a, a])
+        np.median(a)
 
 
 @pytest.mark.parametrize("split", [0, 1, (0, 1), None])
@@ -108,3 +117,32 @@ def test_cumsum_and_cumprod(split) -> None:
         a.cumsum()
     line = mpa.array(data[:, 0])
     np.testing.assert_allclose(_g(line.cumsum()), np.cumsum(data[:, 0]))
+
+
+@pytest.mark.parametrize("split", [0, 1, None])
+def test_concatenate_and_stack(split) -> None:
+    data = np.arange(2.0 * N * N).reshape(N, N, 2)
+    a = mpa.array(data, split=split, halo=1)
+    b = mpa.array(data + 100.0, split=split, halo=1)
+    for axis in range(3):
+        if size > 1 and split is not None and axis == split:
+            with pytest.raises(TypeError, match="split axes"):
+                np.concatenate([a, b], axis=axis)
+            continue
+        np.testing.assert_array_equal(
+            _g(np.concatenate([a, b], axis=axis)),
+            np.concatenate([data, data + 100.0], axis=axis),
+        )
+    for axis in (0, 1, -1):
+        np.testing.assert_array_equal(
+            _g(np.stack([a, b], axis=axis)), np.stack([data, data + 100.0], axis=axis)
+        )
+    with pytest.raises(ValueError, match="need at least one"):
+        np.concatenate([])
+    with pytest.raises(TypeError, match="every array to be one"):
+        np.concatenate([a, data])
+    mismatched_axis = next(axis for axis in range(3) if split is None or axis != split)
+    with pytest.raises(ValueError, match="same layout"):
+        np.concatenate([a, mpa.array(data, split=split, halo=0)], axis=mismatched_axis)
+    with pytest.raises(ValueError, match="same shape"):
+        np.stack([a, mpa.array(data[:-1])])

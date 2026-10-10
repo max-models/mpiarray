@@ -1323,6 +1323,14 @@ class DistributedArray:
         """
         if method != "__call__":
             return NotImplemented
+        if ufunc is np.matmul:
+            # a generalized ufunc, not a function, so __array_function__ never
+            # sees it; dispatched here instead, to the same `dot` as np.dot.
+            if kwargs.pop("out", None) is not None:
+                raise TypeError("np.matmul on distributed arrays takes no out")
+            if kwargs:
+                return NotImplemented
+            return _dot(*inputs)
         template = next(
             (item for item in inputs if isinstance(item, DistributedArray)),
             self,
@@ -2009,10 +2017,12 @@ class DistributedArray:
 
         Reductions, ``argmin``/``argmax``, ``cumsum``/``cumprod``, ``where``,
         ``clip``, ``round``, ``real``/``imag``, ``isclose``, ``allclose``,
-        ``array_equal``, ``linalg.norm``, ``vdot``, ``copy``, the ``*_like``
-        functions, ``shape``/``ndim``/``size`` and ``astype`` work like their
-        NumPy versions. Any other NumPy function raises ``TypeError`` instead
-        of quietly gathering the array; call ``gather()`` first for those.
+        ``array_equal``, ``linalg.norm``, ``vdot``, ``dot``/``matmul`` (two
+        1-D arrays), ``concatenate``/``stack`` (along an axis none of the
+        arrays split), ``copy``, the ``*_like`` functions,
+        ``shape``/``ndim``/``size`` and ``astype`` work like their NumPy
+        versions. Any other NumPy function raises ``TypeError`` instead of
+        quietly gathering the array; call ``gather()`` first for those.
 
         Args:
             func: The NumPy function.
@@ -2048,6 +2058,30 @@ class DistributedArray:
             raise TypeError("vdot needs another DistributedArray")
         self._check_compatibility(other)
         return self._allreduce(xp.vdot(self.local, other.local), MPI.SUM, "vdot")
+
+    def dot(self, other: DistributedArray) -> Scalar:
+        """Return ``sum(self * other)`` over the whole array, on every rank.
+
+        Like ``numpy.dot`` on two 1-D arrays: unlike `vdot`, complex values
+        are not conjugated. Halo cells are excluded. Collective.
+
+        Args:
+            other: A 1-D array with the same layout.
+
+        Returns:
+            The dot product, a host scalar.
+
+        Raises:
+            TypeError: If ``other`` is not a `DistributedArray`, or either
+                array is not 1-D.
+            ValueError: If the layouts differ.
+        """
+        if not isinstance(other, DistributedArray):
+            raise TypeError("dot needs another DistributedArray")
+        if self.ndim != 1 or other.ndim != 1:
+            raise TypeError("dot on distributed arrays needs two 1-D arrays (vectors)")
+        self._check_compatibility(other)
+        return self._allreduce(xp.dot(self.local, other.local), MPI.SUM, "dot")
 
     def norm(self, ord: float = 2) -> float:
         """Return the vector norm of the whole array, on every rank.
@@ -2336,6 +2370,127 @@ def _norm(
     )
 
 
+def _dot(a: Any, b: Any, out: Any = None) -> Scalar:
+    if out is not None:
+        raise TypeError("np.dot/np.matmul on distributed arrays take no out")
+    template = _template(a, b)
+    other = b if template is a else a
+    if not isinstance(other, DistributedArray):
+        raise TypeError(
+            "np.dot/np.matmul on distributed arrays need two DistributedArrays"
+        )
+    return template.dot(other)
+
+
+def _axis_matches(a: Layout, b: Layout, skip: int) -> bool:
+    """Return whether layouts ``a`` and ``b`` agree everywhere but axis ``skip``."""
+    same_comm = a.comm is b.comm or bool(a.comm == b.comm)
+    return (
+        same_comm
+        and a.halo == b.halo
+        and a.periodic == b.periodic
+        and a.process_grid == b.process_grid
+        and all(
+            a.bounds[axis] == b.bounds[axis] for axis in range(a.ndim) if axis != skip
+        )
+    )
+
+
+def _bounds_layout(
+    layout: Layout,
+    shape: tuple[int, ...],
+    bounds: Sequence[Sequence[int] | None],
+    halo: tuple[int, ...],
+    periodic: tuple[bool, ...],
+) -> Layout:
+    """Return a layout of ``shape``, replicated like ``layout`` or split at ``bounds``.
+
+    A non-distributed ``layout`` (one rank, or every rank holding everything)
+    has no process grid for explicit ``bounds`` to imply, so it is rebuilt
+    with ``split=None`` instead.
+    """
+    if not layout.distributed:
+        return Layout(shape, comm=layout.comm, split=None, halo=halo, periodic=periodic)
+    return Layout(shape, comm=layout.comm, bounds=bounds, halo=halo, periodic=periodic)
+
+
+def _concatenate(arrays: Sequence[Any], axis: int = 0, **kwargs: Any) -> Any:
+    if kwargs:
+        raise TypeError(
+            "np.concatenate on distributed arrays takes no further keyword arguments"
+        )
+    arrays = list(arrays)
+    if not arrays:
+        raise ValueError("need at least one array to concatenate")
+    if not all(isinstance(a, DistributedArray) for a in arrays):
+        raise TypeError(
+            "np.concatenate on distributed arrays needs every array to be one"
+        )
+    template = arrays[0]
+    ndim = template.ndim
+    axis = _normalize_axes(axis, ndim)[0]
+    layout = template._layout
+    if layout.distributed and axis in layout.split:
+        raise TypeError(
+            "np.concatenate on distributed arrays needs an axis outside the split axes"
+        )
+    for other in arrays[1:]:
+        if other.ndim != ndim or not _axis_matches(other._layout, layout, axis):
+            raise ValueError(
+                "np.concatenate needs arrays with the same layout except along axis"
+            )
+    local = xp.concatenate([a.local for a in arrays], axis=axis)
+    new_length = local.shape[axis]
+    shape = tuple(
+        new_length if ax == axis else template.shape[ax] for ax in range(ndim)
+    )
+    bounds = [
+        (0, new_length) if ax == axis else layout.bounds[ax] for ax in range(ndim)
+    ]
+    target = _bounds_layout(layout, shape, bounds, layout.halo, layout.periodic)
+    return template._with_layout(target, local)
+
+
+def _stack(arrays: Sequence[Any], axis: int = 0, **kwargs: Any) -> Any:
+    if kwargs:
+        raise TypeError(
+            "np.stack on distributed arrays takes no further keyword arguments"
+        )
+    arrays = list(arrays)
+    if not arrays:
+        raise ValueError("need at least one array to stack")
+    if not all(isinstance(a, DistributedArray) for a in arrays):
+        raise TypeError("np.stack on distributed arrays needs every array to be one")
+    template = arrays[0]
+    ndim = template.ndim + 1
+    axis = _normalize_axes(axis, ndim)[0]
+    layout = template._layout
+    for other in arrays[1:]:
+        if other.shape != template.shape:
+            raise ValueError("all input arrays must have the same shape")
+        template._check_compatibility(other)
+    local = xp.concatenate([xp.expand_dims(a.local, axis) for a in arrays], axis=axis)
+    shape: list[int] = []
+    bounds: list[tuple[int, ...]] = []
+    halo: list[int] = []
+    periodic: list[bool] = []
+    source = 0
+    for ax in range(ndim):
+        if ax == axis:
+            shape.append(len(arrays))
+            bounds.append((0, len(arrays)))
+            halo.append(0)
+            periodic.append(False)
+        else:
+            shape.append(template.shape[source])
+            bounds.append(layout.bounds[source])
+            halo.append(layout.halo[source])
+            periodic.append(layout.periodic[source])
+            source += 1
+    target = _bounds_layout(layout, tuple(shape), bounds, tuple(halo), tuple(periodic))
+    return template._with_layout(target, local)
+
+
 def _like(name: str) -> Callable:
     def create(a: DistributedArray, *args: Any, **kwargs: Any) -> Any:
         from mpiarray import creation
@@ -2390,6 +2545,10 @@ _ARRAY_FUNCTIONS: dict[Callable, Callable] = {
     np.array_equal: _array_equal,
     np.linalg.norm: _norm,
     np.vdot: lambda a, b: _template(a, b).vdot(b if _template(a, b) is a else a),
+    np.dot: _dot,
+    # np.matmul is a generalized ufunc, not a function: see __array_ufunc__.
+    np.concatenate: _concatenate,
+    np.stack: _stack,
     np.shape: lambda a: a.shape,
     np.ndim: lambda a: a.ndim,
     np.size: lambda a, axis=None: a.size if axis is None else a.shape[axis],
