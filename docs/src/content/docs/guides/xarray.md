@@ -37,7 +37,9 @@ This is collective, like `gather`: call it on every rank. `root=` gathers to one
 library whose functions only draw on rank 0, such as plasma-plots:
 
 ```python
-data = rho.to_xarray(("x", "y"), coords={"x": x, "y": y}, root=0)  # every rank calls this
+data = rho.to_xarray(
+    ("x", "y"), coords={"x": x, "y": y}, root=0
+)  # every rank calls this
 # ... then, only on rank 0 (plasma-plots does this for you):
 # plot_slice(data)
 ```
