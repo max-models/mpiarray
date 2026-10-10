@@ -642,6 +642,30 @@ class Layout:
             ranks = ranks * n + module.searchsorted(inner, position, side="right")
         return ranks
 
+    def boundary_values(self, axis: int, coordinate: Any) -> list[float]:
+        """Return the coordinate values where one rank's block ends and the next begins.
+
+        For marking the rank boundaries on a plot of the array, e.g. with
+        plasma-plots' ``overlays={"rank_boundaries": {name: layout.boundary_values(axis, coord)}}``.
+        mpiarray has no notion of what an axis means, so the coordinate values
+        are given here rather than stored on the layout.
+
+        Args:
+            axis: The axis.
+            coordinate: This axis's coordinate values, one per global index
+                (length `shape` [``axis``]).
+
+        Returns:
+            The coordinate values at the cuts between blocks, excluding the
+            domain's own two ends; empty if ``axis`` is not split.
+
+        Raises:
+            IndexError: If ``axis`` is out of range.
+        """
+        if not -self.ndim <= axis < self.ndim:
+            raise IndexError(f"axis {axis} is out of range for {self.ndim} dimensions")
+        return [float(coordinate[cut]) for cut in self._cuts[axis][1:-1]]
+
     # ------------------------------------------------------------------ #
     # Properties
 

@@ -345,6 +345,40 @@ class DistributedArray:
         gathered = self.gather(root)
         return None if gathered is None else xp.to_numpy(gathered)
 
+    def to_xarray(
+        self,
+        dims: Sequence[str],
+        *,
+        coords: Any = None,
+        name: str | None = None,
+        attrs: dict[str, Any] | None = None,
+        root: int | None = None,
+    ) -> Any:
+        """Return this array gathered and labeled as an ``xarray.DataArray`` (needs xarray).
+
+        mpiarray has no notion of what an axis means, so ``dims`` (and
+        ``coords``) are given here, not stored on the array. See
+        `mpiarray.xarray.to_xarray`. Collective; see `gather`.
+
+        Args:
+            dims: One name per axis, in order.
+            coords: Coordinate values, as ``xarray.DataArray`` accepts them
+                (e.g. a dict of dim name to a 1-D array); default: none
+                attached.
+            name: The result's name.
+            attrs: Attributes attached to the result (e.g. ``{"units": "eV"}``).
+            root: The rank that receives the array; default: every rank.
+
+        Returns:
+            The labeled array, or ``None`` on a rank `gather` left out.
+
+        Raises:
+            ValueError: If ``dims`` does not have one name per axis.
+        """
+        from mpiarray.xarray import to_xarray
+
+        return to_xarray(self, dims, coords=coords, name=name, attrs=attrs, root=root)
+
     def to_petsc(self, vec: Any = None) -> Any:
         """Copy this rank's block into a global PETSc vector (needs petsc4py).
 
