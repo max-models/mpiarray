@@ -35,10 +35,36 @@ def test_elementwise_functions() -> None:
     c = mpa.array(data + 2j * data)
     np.testing.assert_array_equal(_g(np.real(c)), data)
     np.testing.assert_array_equal(_g(np.imag(c)), 2 * data)
+    np.testing.assert_allclose(_g(np.angle(c)), np.angle(data + 2j * data))
+    np.testing.assert_allclose(
+        _g(np.angle(c, deg=True)), np.angle(data + 2j * data, deg=True)
+    )
     with pytest.raises(TypeError, match="nonzero"):
         np.where(a > 0)
     with pytest.raises(TypeError, match="does not take"):
         np.clip(a, 0, 1, casting="unsafe")
+
+
+def test_ufunc_aliases() -> None:
+    data = np.linspace(0.1, 2.0, 2 * N).reshape(N, 2)
+    a = mpa.array(data, halo=1)
+    b = mpa.array(data[::-1].copy(), halo=1)
+    np.testing.assert_allclose(_g(mpa.sqrt(a)), np.sqrt(data))
+    np.testing.assert_allclose(_g(mpa.sin(a)), np.sin(data))
+    np.testing.assert_allclose(_g(mpa.log(a)), np.log(data))
+    np.testing.assert_allclose(_g(mpa.maximum(a, b)), np.maximum(data, data[::-1]))
+    np.testing.assert_allclose(_g(mpa.hypot(a, 1.0)), np.hypot(data, 1.0))
+    np.testing.assert_array_equal(_g(mpa.isfinite(a)), np.isfinite(data))
+    np.testing.assert_array_equal(
+        _g(mpa.logical_and(a > 0.5, a < 1.5)),
+        np.logical_and(data > 0.5, data < 1.5),
+    )
+    quotient, remainder = mpa.divmod(a, 0.3)
+    expected_quotient, expected_remainder = np.divmod(data, 0.3)
+    np.testing.assert_allclose(_g(quotient), expected_quotient)
+    np.testing.assert_allclose(_g(remainder), expected_remainder)
+    # aliases are NumPy's own ufuncs: they work the same on plain arrays
+    np.testing.assert_allclose(mpa.sin(data), np.sin(data))
 
 
 def test_comparison_functions() -> None:

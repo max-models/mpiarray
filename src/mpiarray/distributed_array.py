@@ -2016,13 +2016,16 @@ class DistributedArray:
         """Run the distributed version of a NumPy function, if there is one.
 
         Reductions, ``argmin``/``argmax``, ``cumsum``/``cumprod``, ``where``,
-        ``clip``, ``round``, ``real``/``imag``, ``isclose``, ``allclose``,
-        ``array_equal``, ``linalg.norm``, ``vdot``, ``dot``/``matmul`` (two
-        1-D arrays), ``concatenate``/``stack`` (along an axis none of the
-        arrays split), ``copy``, the ``*_like`` functions,
+        ``clip``, ``round``, ``real``/``imag``/``angle``, ``isclose``,
+        ``allclose``, ``array_equal``, ``linalg.norm``, ``vdot``,
+        ``dot``/``matmul`` (two 1-D arrays), ``concatenate``/``stack`` (along
+        an axis none of the arrays split), ``copy``, the ``*_like`` functions,
         ``shape``/``ndim``/``size`` and ``astype`` work like their NumPy
-        versions. Any other NumPy function raises ``TypeError`` instead of
-        quietly gathering the array; call ``gather()`` first for those.
+        versions. NumPy's ufuncs (``sin``, ``maximum``, ``isnan``, ...) work
+        through `__array_ufunc__` instead, and are aliased at module level in
+        `mpiarray.ufuncs`. Any other NumPy function raises ``TypeError``
+        instead of quietly gathering the array; call ``gather()`` first for
+        those.
 
         Args:
             func: The NumPy function.
@@ -2540,6 +2543,7 @@ _ARRAY_FUNCTIONS: dict[Callable, Callable] = {
     np.around: _round,
     np.real: lambda a: a._elementwise(lambda x: x.real, (a,)),
     np.imag: lambda a: a._elementwise(lambda x: x.imag, (a,)),
+    np.angle: lambda a, deg=False: a._elementwise(lambda x: xp.angle(x, deg=deg), (a,)),
     np.isclose: _isclose,
     np.allclose: _allclose,
     np.array_equal: _array_equal,
