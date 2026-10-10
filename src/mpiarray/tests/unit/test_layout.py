@@ -306,3 +306,16 @@ def test_owners_forms_clipping_and_errors() -> None:
         plane.owners(np.array([1, 2, 3]))
     with pytest.raises(ValueError, match="do not end in 2 axes"):
         plane.owners(np.array(1))
+
+
+def test_boundary_values() -> None:
+    layout = Layout(10, comm=fake_comm(3, 0))  # blocks 0:4, 4:7, 7:10
+    coordinate = np.linspace(0.0, 90.0, 10)
+    assert layout.boundary_values(0, coordinate) == [40.0, 70.0]
+    assert layout.boundary_values(-1, coordinate) == [40.0, 70.0]
+    assert Layout(10, comm=fake_comm(1, 0)).boundary_values(0, coordinate) == []
+    plane = Layout((6, 4), comm=fake_comm(6, 0), split=(0, 1))  # grid (2, 3)
+    assert plane.boundary_values(0, np.arange(6.0)) == [3.0]
+    assert plane.boundary_values(1, np.arange(4.0)) == [2.0, 3.0]
+    with pytest.raises(IndexError, match="out of range for 1 dimensions"):
+        layout.boundary_values(1, coordinate)

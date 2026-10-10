@@ -48,9 +48,11 @@ optional-dependencies.docs = [
 # HDF5 files: save_hdf5/load_hdf5 (parallel with an MPI-enabled h5py build)
 optional-dependencies.hdf5 = [ "h5py" ]
 optional-dependencies.mpi = [ "mpi4py" ]
+# xarray interoperability (mpiarray.xarray): a gathered array as a labeled DataArray
+optional-dependencies.xarray = [ "xarray" ]
 # PETSc interoperability (mpiarray.petsc): DMDAs with a layout's decomposition
 # matplotlib and nbformat: the tutorials are also run as tests, under MPI
-optional-dependencies.test = [ "h5py", "matplotlib", "nbformat>=5.10", "pytest", "pytest-cov" ]
+optional-dependencies.test = [ "h5py", "matplotlib", "nbformat>=5.10", "pytest", "pytest-cov", "xarray" ]
 urls."Source" = "https://github.com/max-models/mpiarray"
 
 [tool.setuptools.packages.find]

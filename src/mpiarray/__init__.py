@@ -111,6 +111,9 @@ from mpiarray.ufuncs import (
     trunc,
 )
 
+# xarray is imported only when a function here needs it
+from mpiarray.xarray import to_xarray
+
 __version__ = "0.1.0"
 
 __all__ = [
@@ -209,6 +212,7 @@ __all__ = [
     "square",
     "tan",
     "tanh",
+    "to_xarray",
     "trunc",
     "zeros",
     "zeros_like",
