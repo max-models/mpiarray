@@ -35,10 +35,36 @@ def test_elementwise_functions() -> None:
     c = mpa.array(data + 2j * data)
     np.testing.assert_array_equal(_g(np.real(c)), data)
     np.testing.assert_array_equal(_g(np.imag(c)), 2 * data)
+    np.testing.assert_allclose(_g(np.angle(c)), np.angle(data + 2j * data))
+    np.testing.assert_allclose(
+        _g(np.angle(c, deg=True)), np.angle(data + 2j * data, deg=True)
+    )
     with pytest.raises(TypeError, match="nonzero"):
         np.where(a > 0)
     with pytest.raises(TypeError, match="does not take"):
         np.clip(a, 0, 1, casting="unsafe")
+
+
+def test_ufunc_aliases() -> None:
+    data = np.linspace(0.1, 2.0, 2 * N).reshape(N, 2)
+    a = mpa.array(data, halo=1)
+    b = mpa.array(data[::-1].copy(), halo=1)
+    np.testing.assert_allclose(_g(mpa.sqrt(a)), np.sqrt(data))
+    np.testing.assert_allclose(_g(mpa.sin(a)), np.sin(data))
+    np.testing.assert_allclose(_g(mpa.log(a)), np.log(data))
+    np.testing.assert_allclose(_g(mpa.maximum(a, b)), np.maximum(data, data[::-1]))
+    np.testing.assert_allclose(_g(mpa.hypot(a, 1.0)), np.hypot(data, 1.0))
+    np.testing.assert_array_equal(_g(mpa.isfinite(a)), np.isfinite(data))
+    np.testing.assert_array_equal(
+        _g(mpa.logical_and(a > 0.5, a < 1.5)),
+        np.logical_and(data > 0.5, data < 1.5),
+    )
+    quotient, remainder = mpa.divmod(a, 0.3)
+    expected_quotient, expected_remainder = np.divmod(data, 0.3)
+    np.testing.assert_allclose(_g(quotient), expected_quotient)
+    np.testing.assert_allclose(_g(remainder), expected_remainder)
+    # aliases are NumPy's own ufuncs: they work the same on plain arrays
+    np.testing.assert_allclose(mpa.sin(data), np.sin(data))
 
 
 def test_comparison_functions() -> None:
@@ -71,6 +97,23 @@ def test_reductions_norms_and_shape_functions() -> None:
     with pytest.raises(TypeError, match="axis"):
         np.linalg.norm(a, axis=0)
     assert np.vdot(a, a) == pytest.approx(np.vdot(data, data))
+    vdata = data[:, 0]
+    v, w = mpa.array(vdata), mpa.array(vdata + 1.0)
+    assert v.dot(w) == pytest.approx(np.dot(vdata, vdata + 1.0))
+    assert np.dot(v, w) == pytest.approx(np.dot(vdata, vdata + 1.0))
+    assert np.matmul(v, w) == pytest.approx(np.dot(vdata, vdata + 1.0))
+    with pytest.raises(TypeError, match="1-D"):
+        np.dot(a, a)
+    with pytest.raises(TypeError, match="DistributedArray"):
+        np.dot(v, vdata)
+    with pytest.raises(TypeError, match="DistributedArray"):
+        v.dot(vdata)
+    with pytest.raises(TypeError, match="no out"):
+        np.dot(v, w, np.empty(()))
+    with pytest.raises(TypeError, match="no out"):
+        np.matmul(v, w, out=np.empty(()))
+    with pytest.raises(TypeError, match="NotImplemented"):
+        np.matmul(v, w, casting="unsafe")
     assert np.shape(a) == (N, 2) and np.ndim(a) == 2 and np.size(a) == 2 * N
     assert np.size(a, 1) == 2
     assert isinstance(np.copy(a), DistributedArray)
@@ -89,7 +132,7 @@ def test_like_functions_and_unsupported_functions() -> None:
     with pytest.raises(TypeError, match="no shape or subok"):
         np.zeros_like(a, shape=(3,))
     with pytest.raises(TypeError, match="no implementation found"):
-        np.concatenate([a, a])
+        np.median(a)
 
 
 @pytest.mark.parametrize("split", [0, 1, (0, 1), None])
@@ -108,3 +151,36 @@ def test_cumsum_and_cumprod(split) -> None:
         a.cumsum()
     line = mpa.array(data[:, 0])
     np.testing.assert_allclose(_g(line.cumsum()), np.cumsum(data[:, 0]))
+
+
+@pytest.mark.parametrize("split", [0, 1, None])
+def test_concatenate_and_stack(split) -> None:
+    data = np.arange(2.0 * N * N).reshape(N, N, 2)
+    a = mpa.array(data, split=split, halo=1)
+    b = mpa.array(data + 100.0, split=split, halo=1)
+    for axis in range(3):
+        if size > 1 and split is not None and axis == split:
+            with pytest.raises(TypeError, match="split axes"):
+                np.concatenate([a, b], axis=axis)
+            continue
+        np.testing.assert_array_equal(
+            _g(np.concatenate([a, b], axis=axis)),
+            np.concatenate([data, data + 100.0], axis=axis),
+        )
+    for axis in (0, 1, -1):
+        np.testing.assert_array_equal(
+            _g(np.stack([a, b], axis=axis)), np.stack([data, data + 100.0], axis=axis)
+        )
+    with pytest.raises(TypeError, match="every array to be one"):
+        np.concatenate([a, data])
+    with pytest.raises(TypeError, match="every array to be one"):
+        np.stack([a, data])
+    with pytest.raises(TypeError, match="no further keyword arguments"):
+        np.concatenate([a, b], dtype=np.float32)
+    with pytest.raises(TypeError, match="no further keyword arguments"):
+        np.stack([a, b], dtype=np.float32)
+    mismatched_axis = next(axis for axis in range(3) if split is None or axis != split)
+    with pytest.raises(ValueError, match="same layout"):
+        np.concatenate([a, mpa.array(data, split=split, halo=0)], axis=mismatched_axis)
+    with pytest.raises(ValueError, match="same shape"):
+        np.stack([a, mpa.array(data[:-1])])
