@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 import sys
+from collections.abc import Mapping, Sequence
 from typing import Any
 
 import numpy as np
@@ -11,14 +12,27 @@ import pytest
 
 import mpiarray as mpa
 from mpiarray import DistributedArray, Layout, StencilOperator
+from mpiarray.sparse import Index, Offset
 
 comm = mpa.default_comm()
 size = comm.Get_size()
 
-LAPLACIAN_2D = {
-    "offsets": [(0, 0), (-1, 0), (1, 0), (0, -1), (0, 1)],
-    "coefficients": [4.0, -1.0, -1.0, -1.0, -1.0],
-}
+LAPLACIAN_OFFSETS: tuple[Offset, ...] = ((0, 0), (-1, 0), (1, 0), (0, -1), (0, 1))
+LAPLACIAN_COEFFICIENTS: tuple[float, ...] = (4.0, -1.0, -1.0, -1.0, -1.0)
+
+
+def laplacian_2d(
+    layout: Layout,
+    *,
+    overrides: Mapping[Index, Sequence[tuple[Offset, Any]]] | None = None,
+) -> StencilOperator:
+    """The 5-point 2D Laplacian on ``layout``, with optional `overrides`."""
+    return StencilOperator(
+        layout,
+        offsets=LAPLACIAN_OFFSETS,
+        coefficients=LAPLACIAN_COEFFICIENTS,
+        overrides=overrides,
+    )
 
 
 def dense_laplacian(shape: tuple[int, int]) -> np.ndarray:
@@ -95,7 +109,7 @@ def test_construction_errors() -> None:
 
 
 def test_apply_rejects_mismatched_layout() -> None:
-    a = StencilOperator(Layout((3 * size + 3, 5), comm=comm, halo=1), **LAPLACIAN_2D)
+    a = laplacian_2d(Layout((3 * size + 3, 5), comm=comm, halo=1))
     u = mpa.zeros((3 * size + 3, 6), halo=1)
     with pytest.raises(ValueError, match="does not match the operator's layout"):
         a.apply(u)
@@ -103,14 +117,10 @@ def test_apply_rejects_mismatched_layout() -> None:
 
 def test_properties_and_repr() -> None:
     layout = Layout((3 * size + 3, 5), comm=comm, halo=1)
-    operator = StencilOperator(
-        layout,
-        **LAPLACIAN_2D,
-        overrides={(0, 0): [((0, 0), 1.0)]},
-    )
+    operator = laplacian_2d(layout, overrides={(0, 0): [((0, 0), 1.0)]})
     assert operator.layout == layout
-    assert operator.offsets == tuple(LAPLACIAN_2D["offsets"])
-    assert operator.coefficients == tuple(LAPLACIAN_2D["coefficients"])
+    assert operator.offsets == LAPLACIAN_OFFSETS
+    assert operator.coefficients == LAPLACIAN_COEFFICIENTS
     assert "5 offsets" in repr(operator)
     assert "1 overrides" in repr(operator)
 
@@ -122,7 +132,7 @@ def test_properties_and_repr() -> None:
 def test_apply_periodic(grid: np.ndarray) -> None:
     layout = Layout(grid.shape, comm=comm, halo=1, periodic=True)
     u = filled(layout, grid)
-    operator = StencilOperator(layout, **LAPLACIAN_2D)
+    operator = laplacian_2d(layout)
     result = operator.apply(u).to_numpy()
     nx, ny = grid.shape
     expected = (
@@ -138,7 +148,7 @@ def test_apply_periodic(grid: np.ndarray) -> None:
 def test_apply_dirichlet_wall(grid: np.ndarray) -> None:
     layout = Layout(grid.shape, comm=comm, halo=1)
     u = filled(layout, grid)
-    operator = StencilOperator(layout, **LAPLACIAN_2D)
+    operator = laplacian_2d(layout)
     result = operator.apply(u, boundary=0.0).to_numpy()
     np.testing.assert_allclose(result, dirichlet_apply(grid))
 
@@ -146,7 +156,7 @@ def test_apply_dirichlet_wall(grid: np.ndarray) -> None:
 def test_apply_into_out(grid: np.ndarray) -> None:
     layout = Layout(grid.shape, comm=comm, halo=1)
     u = filled(layout, grid)
-    operator = StencilOperator(layout, **LAPLACIAN_2D)
+    operator = laplacian_2d(layout)
     out = mpa.zeros(layout=layout)
     returned = operator.apply(u, out, boundary=0.0)
     assert returned is out
@@ -171,9 +181,8 @@ def test_apply_with_overrides(grid: np.ndarray) -> None:
     u = filled(layout, grid)
     nx, ny = grid.shape
     corner = (nx - 1, ny - 1)
-    operator = StencilOperator(
+    operator = laplacian_2d(
         layout,
-        **LAPLACIAN_2D,
         overrides={(0, 0): [((0, 0), 1.0)], corner: [((0, 0), -2.0)]},
     )
     result = operator.apply(u, boundary=0.0).to_numpy()
@@ -237,25 +246,25 @@ def test_add_with_varying_coefficient_and_override(grid: np.ndarray) -> None:
 
 
 def test_add_rejects_mismatched_layout() -> None:
-    a = StencilOperator(Layout((3 * size + 3, 5), comm=comm, halo=1), **LAPLACIAN_2D)
-    b = StencilOperator(Layout((3 * size + 3, 6), comm=comm, halo=1), **LAPLACIAN_2D)
+    a = laplacian_2d(Layout((3 * size + 3, 5), comm=comm, halo=1))
+    b = laplacian_2d(Layout((3 * size + 3, 6), comm=comm, halo=1))
     with pytest.raises(ValueError, match="same layout"):
         a + b
 
 
 def test_arithmetic_rejects_other_types() -> None:
-    a = StencilOperator(Layout((3 * size + 3, 5), comm=comm, halo=1), **LAPLACIAN_2D)
+    a = laplacian_2d(Layout((3 * size + 3, 5), comm=comm, halo=1))
     with pytest.raises(TypeError):
-        a + 5
+        a + 5  # ty: ignore[unsupported-operator]
     with pytest.raises(TypeError):
-        a - 5
+        a - 5  # ty: ignore[unsupported-operator]
     assert a.__mul__(np.zeros((3 * size + 3, 5))) is NotImplemented
 
 
 def test_sub_and_neg(grid: np.ndarray) -> None:
     layout = Layout(grid.shape, comm=comm, halo=1, periodic=True)
     u = filled(layout, grid)
-    a = StencilOperator(layout, **LAPLACIAN_2D)
+    a = laplacian_2d(layout)
     b = StencilOperator(layout, offsets=[(0, 0)], coefficients=[1.0])
     expected = a.apply(u).to_numpy() - b.apply(u).to_numpy()
     np.testing.assert_allclose((a - b).apply(u).to_numpy(), expected)
@@ -265,11 +274,7 @@ def test_sub_and_neg(grid: np.ndarray) -> None:
 def test_scalar_mul_and_rmul(grid: np.ndarray) -> None:
     layout = Layout(grid.shape, comm=comm, halo=1, periodic=True)
     u = filled(layout, grid)
-    a = StencilOperator(
-        layout,
-        **LAPLACIAN_2D,
-        overrides={(0, 0): [((0, 0), 1.0)]},
-    )
+    a = laplacian_2d(layout, overrides={(0, 0): [((0, 0), 1.0)]})
     expected = 2.0 * a.apply(u).to_numpy()
     np.testing.assert_allclose((2.0 * a).apply(u).to_numpy(), expected)
     np.testing.assert_allclose((a * 2.0).apply(u).to_numpy(), expected)
@@ -288,14 +293,14 @@ def test_to_petsc_mat_without_petsc4py(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(sys.modules, "petsc4py", None)
     monkeypatch.setitem(sys.modules, "petsc4py.PETSc", None)
     layout = Layout((3 * size + 3, 5), comm=comm, halo=1)
-    operator = StencilOperator(layout, **LAPLACIAN_2D)
+    operator = laplacian_2d(layout)
     with pytest.raises(ImportError, match="pip install petsc4py"):
         operator.to_petsc_mat()
 
 
 def test_to_petsc_mat_matches_dense(PETSc: Any, grid: np.ndarray) -> None:
     layout = Layout(grid.shape, comm=comm, halo=1)
-    operator = StencilOperator(layout, **LAPLACIAN_2D)
+    operator = laplacian_2d(layout)
     matrix = operator.to_petsc_mat()
     u = filled(layout, grid)
     vec = u.to_petsc()
@@ -311,11 +316,7 @@ def test_to_petsc_mat_matches_dense(PETSc: Any, grid: np.ndarray) -> None:
 def test_to_petsc_mat_with_overrides(PETSc: Any, grid: np.ndarray) -> None:
     layout = Layout(grid.shape, comm=comm, halo=1)
     nx, ny = grid.shape
-    operator = StencilOperator(
-        layout,
-        **LAPLACIAN_2D,
-        overrides={(0, 0): [((0, 0), 1.0)]},
-    )
+    operator = laplacian_2d(layout, overrides={(0, 0): [((0, 0), 1.0)]})
     matrix = operator.to_petsc_mat()
     u = filled(layout, grid)
     vec = u.to_petsc()
