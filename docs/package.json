@@ -11,7 +11,7 @@
     "dev": "astro dev",
     "prestart": "node scripts/prepare-notebooks.mjs",
     "start": "astro dev",
-    "prebuild": "node scripts/prepare-notebooks.mjs",
+    "prebuild": "node scripts/prepare-notebooks.mjs --execute",
     "build": "astro build",
     "preview": "astro preview",
     "check:mdx": "node scripts/check-mdx.mjs",

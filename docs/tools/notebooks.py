@@ -1,11 +1,11 @@
-"""Execute the notebooks in ``tutorials/`` and convert them into Starlight MDX pages.
+"""Execute the notebooks in ``guides/`` and convert them into Starlight MDX pages.
 
 ``execute``
     Runs each notebook with nbclient into ``docs/.cache/notebooks/<slug>.ipynb``. A notebook is
     rerun only when the hash of its cells changes (``--force`` reruns all of them).
 ``convert``
-    Writes ``docs/src/content/docs/tutorials/<slug>.mdx`` from the executed copy, the images into
-    ``docs/public/tutorials/<slug>/`` and a downloadable copy of the notebook next to them.
+    Writes ``docs/src/content/docs/guides/<slug>.mdx`` from the executed copy, the images into
+    ``docs/public/guides/<slug>/`` and a downloadable copy of the notebook next to them.
     Notebooks that have not been executed are converted without outputs (``--strict`` fails on
     them, and on notebooks whose run raised).
 ``clean``
@@ -28,10 +28,10 @@ from typing import Any
 
 DOCS = Path(__file__).resolve().parents[1]
 REPO = DOCS.parent
-NOTEBOOKS = REPO / "tutorials"
+NOTEBOOKS = REPO / "guides"
 CACHE = DOCS / ".cache" / "notebooks"
-CONTENT = DOCS / "src" / "content" / "docs" / "tutorials"
-PUBLIC = DOCS / "public" / "tutorials"
+CONTENT = DOCS / "src" / "content" / "docs" / "guides"
+PUBLIC = DOCS / "public" / "guides"
 COMPONENTS = "../../../components"
 
 
@@ -96,6 +96,7 @@ def cmd_execute(args: argparse.Namespace) -> None:
             and target.exists()
             and key_file.exists()
             and key_file.read_text() == key
+            and not target.with_suffix(".error").exists()
         ):
             print(f"[notebooks] {slug}: up to date")
             continue
@@ -224,7 +225,7 @@ class Page:
         self.assets += 1
         self.public.mkdir(parents=True, exist_ok=True)
         name = f"{self.assets}{suffix}"
-        return self.public / name, f"/tutorials/{self.slug}/{name}"
+        return self.public / name, f"/guides/{self.slug}/{name}"
 
 
 def _fence(text: str, language: str = "text") -> str:
@@ -330,7 +331,14 @@ def convert_notebook(source: Path, executed: Path | None, order: int) -> Page:
             body.append(sanitize_markdown(text).strip())
         elif cell.cell_type == "code":
             if cell.source.strip() and "hide-input" not in tags:
-                body.append(_fence(cell.source, "python"))
+                code = _fence(cell.source, "python")
+                if "fold-input" in tags:
+                    code = (
+                        "<details>\n<summary>Show code</summary>\n\n"
+                        + code
+                        + "\n\n</details>"
+                    )
+                body.append(code)
             if "remove-output" in tags:
                 continue
             for output in merge_streams(cell.get("outputs", [])):
@@ -351,12 +359,12 @@ def convert_notebook(source: Path, executed: Path | None, order: int) -> Page:
         f"title: {_yaml_string(title)}",
         f"description: {_yaml_string(description or title)}",
         "sidebar:",
-        f"  order: {order}",
+        f"  order: {nb.metadata.get('guide', {}).get('order', order)}",
         "---",
     ]
     header = (
-        f'<NotebookHeader download="/tutorials/{slug}/{source.name}" '
-        f'source="tutorials/{source.name}" status="{status}" />'
+        f'<NotebookHeader download="/guides/{slug}/{source.name}" '
+        f'source="guides/{source.name}" status="{status}" />'
     )
     text = (
         "\n".join(frontmatter) + "\n\n" + "\n".join(imports) + "\n\n" + header + "\n\n"
@@ -368,19 +376,22 @@ def convert_notebook(source: Path, executed: Path | None, order: int) -> Page:
 
 
 def cmd_convert(args: argparse.Namespace) -> None:
+    expected = {f"{slug_of(path)}.mdx" for path in notebooks()}
     for stale in CONTENT.glob("*.mdx"):
-        stale.unlink()
+        if stale.name not in expected:
+            stale.unlink()
     problems = []
     for order, source in enumerate(notebooks(), start=1):
         slug = slug_of(source)
         executed = CACHE / f"{slug}.ipynb"
         error_file = executed.with_suffix(".error")
-        page = convert_notebook(source, executed if executed.exists() else None, order)
-        state = "executed" if executed.exists() else "not run"
+        fresh = executed.exists() and cell_hash(executed) == cell_hash(source)
+        page = convert_notebook(source, executed if fresh else None, order)
+        state = "executed" if fresh else "not run"
         if error_file.exists():
             problems.append(f"{slug}: run failed: {error_file.read_text().strip()}")
-        elif not executed.exists():
-            problems.append(f"{slug}: not executed")
+        elif not fresh:
+            problems.append(f"{slug}: not executed or source changed")
         problems += [f"{slug}: {error}" for error in page.errors]
         print(
             f"[notebooks] {slug}: {state}, {page.assets} assets -> {CONTENT / slug}.mdx"

@@ -39,6 +39,7 @@ optional-dependencies.dev = [
 ]
 optional-dependencies.docs = [
   "astropy",
+  "h5py",
   "griffe",
   "ipykernel",
   "matplotlib",
@@ -54,7 +55,7 @@ optional-dependencies.mpi = [ "mpi4py" ]
 optional-dependencies.units = [ "astropy" ]
 optional-dependencies.xarray = [ "xarray" ]
 # PETSc interoperability (mpiarray.petsc): DMDAs with a layout's decomposition
-# matplotlib and nbformat: the tutorials are also run as tests, under MPI
+# matplotlib and nbformat: the guides are also run as tests, under MPI
 optional-dependencies.test = [ "astropy", "h5py", "matplotlib", "nbformat>=5.10", "pytest", "pytest-cov", "xarray" ]
 urls."Source" = "https://github.com/max-models/mpiarray"
 
