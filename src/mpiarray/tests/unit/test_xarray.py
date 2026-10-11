@@ -78,23 +78,6 @@ def test_labeled_sets_dims_and_returns_self() -> None:
     assert a.dims == ("x", "y")
 
 
-def test_labeled_sets_name_independently_of_dims() -> None:
-    a = mpa.array(np.arange(2.0 * N).reshape(N, 2))
-    assert a.name is None
-    a.labeled(name="rho")
-    assert a.name == "rho" and a.dims is None
-    a.labeled("x", "y")
-    assert a.dims == ("x", "y") and a.name == "rho"  # name untouched
-    a.labeled("a", "b", name="phi")
-    assert a.dims == ("a", "b") and a.name == "phi"
-
-
-def test_to_xarray_uses_labeled_name_by_default() -> None:
-    a = mpa.array(np.arange(2.0 * N).reshape(N, 2)).labeled("x", "y", name="rho")
-    assert a.to_xarray().name == "rho"
-    assert a.to_xarray(name="other").name == "other"
-
-
 def test_labeled_rejects_the_wrong_number_of_names() -> None:
     a = mpa.array(np.arange(2.0 * N).reshape(N, 2))
     with pytest.raises(ValueError, match="one name per axis; got 1 for a 2-D array"):
@@ -122,11 +105,9 @@ def test_to_xarray_without_dims_or_labeled_raises() -> None:
 
 
 @pytest.mark.parametrize("split", [0, 1, None])
-def test_labeled_dims_and_name_propagate_through_shape_preserving_operations(
-    split,
-) -> None:
+def test_labeled_dims_propagate_through_shape_preserving_operations(split) -> None:
     data = np.arange(float(N * N)).reshape(N, N)
-    a = mpa.array(data, split=split, halo=1).labeled("x", "y", name="rho")
+    a = mpa.array(data, split=split, halo=1).labeled("x", "y")
     for result in (
         a.copy(),
         a.astype(np.float32),
@@ -134,20 +115,19 @@ def test_labeled_dims_and_name_propagate_through_shape_preserving_operations(
         -a,
     ):
         assert result.dims == ("x", "y")
-        assert result.name == "rho"
     import mpiarray.layout as layout_mod
 
     other_split = 1 if split != 1 else 0
     redistributed = a.redistribute(
         layout_mod.Layout(data.shape, comm=comm, split=other_split, halo=1)
     )
-    assert redistributed.dims == ("x", "y") and redistributed.name == "rho"
+    assert redistributed.dims == ("x", "y")
     rebalanced = a.rebalance(np.ones(data.shape))
-    assert rebalanced.dims == ("x", "y") and rebalanced.name == "rho"
+    assert rebalanced.dims == ("x", "y")
 
 
-def test_dims_and_name_do_not_propagate_through_shape_changing_operations() -> None:
+def test_dims_do_not_propagate_through_shape_changing_operations() -> None:
     data = np.arange(2.0 * N).reshape(N, 2)
-    a = mpa.array(data).labeled("x", "y", name="rho")
-    assert a.sum(axis=0).dims is None and a.sum(axis=0).name is None
-    assert a[1:].dims is None and a[1:].name is None
+    a = mpa.array(data).labeled("x", "y")
+    assert a.sum(axis=0).dims is None
+    assert a[1:].dims is None

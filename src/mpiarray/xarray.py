@@ -1,14 +1,18 @@
 """xarray interoperability: a gathered array as a labeled ``xarray.DataArray``.
 
-mpiarray has no notion of what an axis means, so the names (and a name for the
-array) default to none unless set with `DistributedArray.labeled`::
+mpiarray has no notion of what an axis means, so the names default to none
+unless set with `DistributedArray.labeled`::
 
     import mpiarray as mpa
 
-    rho = mpa.zeros((64, 48)).labeled("x", "y", name="rho")
-    data = rho.to_xarray(x=x_values, y=y_values)
+    rho = mpa.zeros((64, 48)).labeled("x", "y")
+    data = rho.to_xarray(x=x_values, y=y_values, name="rho")
     # or give the names at the call site instead:
     data = mpa.zeros((64, 48)).to_xarray(("x", "y"), x=x_values, y=y_values)
+
+``name`` and ``attrs`` (e.g. ``{"units": "eV"}``) are given at each call, not stored on
+the array: unlike axis names, they describe what the *values* are, which arithmetic can
+silently invalidate with no way for mpiarray to tell.
 
 Each coordinate's values are passed as a keyword argument named after its axis
 (``x=``, ``y=``, ...; also any auxiliary coordinate over the named axes, e.g.
@@ -75,7 +79,7 @@ def to_xarray(
         array: The distributed array to gather.
         dims: One name per axis, in order; default: ``array.dims``, set by
             `DistributedArray.labeled`.
-        name: The result's name; default: ``array.name``, set by `labeled`.
+        name: The result's name.
         attrs: Attributes attached to the result (e.g. ``{"units": "eV"}``).
         root: The rank that receives the array; default: every rank (see
             `DistributedArray.gather`).
@@ -103,8 +107,6 @@ def to_xarray(
             )
     if len(dims) != array.ndim:
         raise ValueError(f"dims has {len(dims)} names for a {array.ndim}-D array")
-    if name is None:
-        name = array.name
     data = array.to_numpy(root=root)
     if data is None:
         return None

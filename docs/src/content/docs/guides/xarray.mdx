@@ -19,8 +19,8 @@ xarray is imported on first use only; `import mpiarray` works without it.
 
 ## A gathered, labeled array
 
-mpiarray has no notion of what an axis means, so `labeled` attaches the axis names and a
-name once, on the array itself:
+mpiarray has no notion of what an axis means, so `labeled` attaches the axis names once,
+on the array itself:
 
 ```python
 import numpy as np
@@ -28,10 +28,23 @@ import mpiarray as mpa
 
 x = np.linspace(0.0, 1.0, 64)
 y = np.linspace(0.0, 1.0, 48)
-rho = mpa.zeros((64, 48), split=0).labeled("x", "y", name="rho")
-data = rho.to_xarray(x=x, y=y)
-# also: mpa.to_xarray(rho, x=x, y=y)
+rho = mpa.zeros((64, 48), split=0).labeled("x", "y")
+i0, i1 = rho.layout.index_bounds[0]  # this rank's slab of x
+xi = np.arange(i0, i1)[:, None] / 64.0 - 0.5
+yi = np.arange(48)[None, :] / 48.0 - 0.5
+rho.local[...] = np.exp(-(xi**2 + yi**2) * 20)  # a Gaussian bump
+
+data = rho.to_xarray(x=x, y=y, name="rho")
+# also: mpa.to_xarray(rho, x=x, y=y, name="rho")
 ```
+
+`name="rho"` above is just a string passed to `to_xarray`, unrelated to the Python variable
+being called `rho` — naming the variable something else would not change it.
+
+`name` and `attrs` (e.g. `{"units": "eV"}`) are given at each `to_xarray` call, not stored
+on the array: unlike axis names, they describe what the *values* are, which arithmetic can
+silently invalidate (`a * a` is not in the same units as `a`) with no way for mpiarray to
+tell.
 
 The coordinate values are optional: `rho.to_xarray()` alone still gives a `DataArray` with
 `dims == ("x", "y")` (from `labeled`), just with no coordinate attached —
@@ -41,19 +54,17 @@ The coordinate values are optional: `rho.to_xarray()` alone still gives a `DataA
 coordinate to compare against, and raises without it.
 
 `labeled` returns the array itself (not a copy), so it chains onto any creation call.
-`a.dims`/`a.name` read back what was set, `None` if `labeled` was never called; passing
-`dims=`/`name=` explicitly to `to_xarray` still works and overrides them for that call.
-Each coordinate's values are a keyword argument named after its axis (`x=`, `y=`, ...;
-also any auxiliary coordinate over the named axes, such as physical `X=`/`Y=`/`Z=` grids
-over logical `eta1`/`eta2`); an axis named like one of `to_xarray`'s own parameters
-(`dims`, `name`, `attrs`, `root`, `coords`) goes through `coords=` instead, a dict merged
-with the keyword coordinates.
+`a.dims` reads back what was set, `None` if never called; passing `dims=` explicitly to
+`to_xarray` still works and overrides it for that call. Each coordinate's values are a
+keyword argument named after its axis (`x=`, `y=`, ...; also any auxiliary coordinate over
+the named axes, such as physical `X=`/`Y=`/`Z=` grids over logical `eta1`/`eta2`); an axis
+named like one of `to_xarray`'s own parameters (`dims`, `name`, `attrs`, `root`, `coords`)
+goes through `coords=` instead, a dict merged with the keyword coordinates.
 
-Elementwise arithmetic, halo updates, `copy`, `astype`, `redistribute` and `rebalance`
-keep the labels, since every axis still means the same thing afterwards; a reshape,
-reduction, selection, `concatenate` or `stack` does not, since what the result's axes
-mean is not always obvious — call `labeled` again on the result if you still want them
-labeled.
+Elementwise arithmetic, halo updates, `copy`, `astype`, `redistribute` and `rebalance` keep
+the axis names, since which axis is which does not change when the values do; a reshape,
+reduction, selection, `concatenate` or `stack` drops them, since what the result's axes mean
+is not always obvious — call `labeled` again on the result if you still want them labeled.
 
 This is collective, like `gather`: call it on every rank. `root=` gathers to one rank only
 (`None`, the default: every rank), which matters when handing the result to a plotting
@@ -123,7 +134,7 @@ x = np.linspace(-1.0, 1.0, nx)
 y = np.linspace(-1.0, 1.0, ny)
 z = np.linspace(-1.0, 1.0, nz)
 
-E = mpa.zeros((3, nx, ny, nz), split=1).labeled("component", "x", "y", "z", name="E")
+E = mpa.zeros((3, nx, ny, nz), split=1).labeled("component", "x", "y", "z")
 i0, i1 = E.layout.index_bounds[1]  # this rank's slab of x (axis 1: split=1)
 X, Y, Z = np.meshgrid(x[i0:i1], y, z, indexing="ij")
 envelope = np.exp(-2.0 * (X**2 + Y**2)) * np.exp(-(Z**2))
@@ -131,7 +142,7 @@ E.local[0] = -Y * envelope  # Ex
 E.local[1] = X * envelope  # Ey
 E.local[2] = 0.3 * np.sin(np.pi * Z) * envelope  # Ez
 
-data = E.to_xarray(x=x, y=y, z=z)
+data = E.to_xarray(x=x, y=y, z=z, name="E")
 ```
 
 `data.plasma.plot` (registered on every xarray object once plasma-plots is imported) selects

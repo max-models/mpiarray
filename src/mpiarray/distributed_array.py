@@ -205,61 +205,55 @@ class DistributedArray:
         self._data = storage
         # receive buffers and host staging, reused by every halo exchange
         self._halo_buffers: dict[tuple, Any] = {}
-        # set by `labeled`, for `to_xarray`'s defaults
+        # set by `labeled`, for `to_xarray`'s default `dims`
         self._dims: tuple[str, ...] | None = None
-        self._name: str | None = None
 
     def _labeled_like(self, result: Self) -> Self:
-        """Copy this array's `labeled` ``dims``/``name`` onto ``result``; returns it."""
+        """Copy this array's `labeled` ``dims`` onto ``result``; returns it."""
         result._dims = self._dims
-        result._name = self._name
         return result
 
     def _with_storage(self, storage: Array) -> Self:
         """Return an array with this layout and type that owns ``storage``."""
         return self._labeled_like(type(self)(self._layout, storage))
 
-    def labeled(self, *dims: str, name: str | None = None) -> Self:
-        """Attach axis names and a name, for `to_xarray` to use as its defaults.
+    def labeled(self, *dims: str) -> Self:
+        """Attach axis names, for `to_xarray` to use as its default ``dims``.
 
         Not part of the layout: a reshape, reduction, selection, `concatenate`
         or `stack` does not carry them over, since what the result's axes mean
         is not always obvious; call `labeled` again on the result if needed.
         Operations that keep every axis as it was (elementwise arithmetic,
-        halo updates, `copy`, `astype`, `redistribute`, `rebalance`) do.
+        halo updates, `copy`, `astype`, `redistribute`, `rebalance`) do, since
+        which axis is which does not change when the values do.
+
+        A name or units for the array itself are deliberately not part of
+        this: unlike axis names, they describe what the *values* are, which
+        arithmetic can silently invalidate with no way for mpiarray to tell
+        (e.g. a result of ``a * a`` is not in ``a``'s units).
 
         Args:
-            dims: One name per axis, in order; omit to leave `dims` as it is
-                (e.g. to set only ``name``).
-            name: The array's name; omit to leave it as it is.
+            dims: One name per axis, in order.
 
         Returns:
             This array (not a copy), for chaining, e.g.
-            ``mpa.zeros((64, 48)).labeled("x", "y", name="rho")``.
+            ``mpa.zeros((64, 48)).labeled("x", "y")``.
 
         Raises:
-            ValueError: If ``dims`` is given without one name per axis.
+            ValueError: If ``dims`` does not have one name per axis.
         """
-        if dims:
-            if len(dims) != self.ndim:
-                raise ValueError(
-                    f"labeled() needs one name per axis; got {len(dims)} for a "
-                    f"{self.ndim}-D array",
-                )
-            self._dims = dims
-        if name is not None:
-            self._name = name
+        if len(dims) != self.ndim:
+            raise ValueError(
+                f"labeled() needs one name per axis; got {len(dims)} for a "
+                f"{self.ndim}-D array",
+            )
+        self._dims = dims
         return self
 
     @property
     def dims(self) -> tuple[str, ...] | None:
         """The axis names set by `labeled`, or ``None``."""
         return self._dims
-
-    @property
-    def name(self) -> str | None:
-        """The name set by `labeled`, or ``None``."""
-        return self._name
 
     # ------------------------------------------------------------------ #
     # Properties
@@ -413,7 +407,7 @@ class DistributedArray:
         Args:
             dims: One name per axis, in order; default: `dims`, set by
                 `labeled`.
-            name: The result's name; default: `name`, set by `labeled`.
+            name: The result's name.
             attrs: Attributes attached to the result (e.g. ``{"units": "eV"}``).
             root: The rank that receives the array; default: every rank.
             coords: Coordinate values, as ``xarray.DataArray`` accepts them
