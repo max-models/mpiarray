@@ -41,6 +41,7 @@ from mpiarray.layout import Layout, block_numbering, chunk_bounds, process_grid
 # petsc4py is imported only when a PETSc function is called
 from mpiarray.petsc import copy_from_petsc, copy_to_petsc, from_petsc, petsc_numbering
 from mpiarray.points import migrate
+from mpiarray.sparse import StencilOperator
 from mpiarray.ufuncs import (
     arccos,
     arccosh,
@@ -120,6 +121,7 @@ __all__ = [
     "DistributedArray",
     "HaloUpdate",
     "Layout",
+    "StencilOperator",
     "__version__",
     "arange",
     "arccos",
