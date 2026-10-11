@@ -169,12 +169,14 @@ currently drop units; reattach them explicitly when their physical meaning is kn
 
 ## Marking rank boundaries on a plot
 
-[plasma-plots](https://github.com/max-models/plasma-plots)'s `plot_slice` (plasma-plots 0.2.0
-and later) has an `overlays={"rank_boundaries": ...}` option that draws dashed lines where one
-rank's block ends and the next begins, styled apart from ordinary `"coordinate_lines"` so both
-can share an axis. Pass the `Layout` itself, no manual bookkeeping needed: plasma-plots finds
-each drawn dimension's axis by name among the data's own dimensions (the sweep dimension, `t`
-by default, is skipped) and calls `Layout.boundary_values` for it:
+[plasma-plots](https://github.com/max-models/plasma-plots)'s `plot_slice` has an
+`overlays={"rank_boundaries": ...}` option (plasma-plots 0.2.1 and later for passing a
+`Layout` directly, as below; 0.2.0 already took a plain `{name: values}` dict) that draws
+dashed lines where one rank's block ends and the next begins, styled apart from ordinary
+`"coordinate_lines"` so both can share an axis. Pass the `Layout` itself, no manual
+bookkeeping needed: plasma-plots finds each drawn dimension's axis by name among the
+data's own dimensions (the sweep dimension, `t` by default, is skipped) and calls
+`Layout.boundary_values` for it:
 
 ```python
 import matplotlib.pyplot as plt

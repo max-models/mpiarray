@@ -45,9 +45,7 @@ optional-dependencies.docs = [
   "matplotlib",
   "nbclient>=0.10",
   "nbformat>=5.10",
-  # from its devel branch for now, like cunumpy above; switch to a version
-  # range once it has a PyPI release
-  "plasma-plots @ git+https://github.com/max-models/plasma-plots.git@devel",
+  "plasma-plots>=0.2.1",
   "xarray",
 ]
 # without mpi4py, mpiarray runs serially on maybempi's stand-in for mpi4py.MPI

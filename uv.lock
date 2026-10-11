@@ -2472,7 +2472,7 @@ requires-dist = [
     { name = "nbformat", marker = "extra == 'docs'", specifier = ">=5.10" },
     { name = "nbformat", marker = "extra == 'test'", specifier = ">=5.10" },
     { name = "numpy" },
-    { name = "plasma-plots", marker = "extra == 'docs'", git = "https://github.com/max-models/plasma-plots.git?rev=devel" },
+    { name = "plasma-plots", marker = "extra == 'docs'", specifier = ">=0.2.1" },
     { name = "pre-commit", marker = "extra == 'dev'" },
     { name = "pyproject-fmt", marker = "extra == 'dev'" },
     { name = "pyright", marker = "extra == 'dev'" },
@@ -3092,7 +3092,7 @@ wheels = [
 [[package]]
 name = "plasma-plots"
 version = "0.2.1"
-source = { git = "https://github.com/max-models/plasma-plots.git?rev=devel#5051d8c2ec4aa8669d908a2c8fecf81a723ddbc9" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "ipywidgets" },
     { name = "matplotlib", version = "3.10.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -3102,6 +3102,10 @@ dependencies = [
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "xarray", version = "2025.6.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "xarray", version = "2026.9.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/26/c3/376b3ce0c9850f030ec3451ad004d8fe9aeca6c3e13742ab787c440f2aad/plasma_plots-0.2.1.tar.gz", hash = "sha256:d4b90a9abb799db458ed38e851e08bb2b14ef17886d342bfb4d586f8ed4854ec", size = 417240, upload-time = "2026-10-11T15:26:51.456Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4e/29/30c50e334875b4c5cc5d12f1467e3310e840a454683639fceec2293e4723/plasma_plots-0.2.1-py3-none-any.whl", hash = "sha256:fa27166a8f2d1ccca6ba7ec1856cadf16294b48014a197b7301407c2504ef088", size = 326945, upload-time = "2026-10-11T15:26:50.065Z" },
 ]
 
 [[package]]
