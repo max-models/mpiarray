@@ -205,10 +205,55 @@ class DistributedArray:
         self._data = storage
         # receive buffers and host staging, reused by every halo exchange
         self._halo_buffers: dict[tuple, Any] = {}
+        # set by `labeled`, for `to_xarray`'s default `dims`
+        self._dims: tuple[str, ...] | None = None
+
+    def _labeled_like(self, result: Self) -> Self:
+        """Copy this array's `labeled` ``dims`` onto ``result``; returns it."""
+        result._dims = self._dims
+        return result
 
     def _with_storage(self, storage: Array) -> Self:
         """Return an array with this layout and type that owns ``storage``."""
-        return type(self)(self._layout, storage)
+        return self._labeled_like(type(self)(self._layout, storage))
+
+    def labeled(self, *dims: str) -> Self:
+        """Attach axis names, for `to_xarray` to use as its default ``dims``.
+
+        Not part of the layout: a reshape, reduction, selection, `concatenate`
+        or `stack` does not carry them over, since what the result's axes mean
+        is not always obvious; call `labeled` again on the result if needed.
+        Operations that keep every axis as it was (elementwise arithmetic,
+        halo updates, `copy`, `astype`, `redistribute`, `rebalance`) do, since
+        which axis is which does not change when the values do.
+
+        A name or units for the array itself are deliberately not part of
+        this: unlike axis names, they describe what the *values* are, which
+        arithmetic can silently invalidate with no way for mpiarray to tell
+        (e.g. a result of ``a * a`` is not in ``a``'s units).
+
+        Args:
+            dims: One name per axis, in order.
+
+        Returns:
+            This array (not a copy), for chaining, e.g.
+            ``mpa.zeros((64, 48)).labeled("x", "y")``.
+
+        Raises:
+            ValueError: If ``dims`` does not have one name per axis.
+        """
+        if len(dims) != self.ndim:
+            raise ValueError(
+                f"labeled() needs one name per axis; got {len(dims)} for a "
+                f"{self.ndim}-D array",
+            )
+        self._dims = dims
+        return self
+
+    @property
+    def dims(self) -> tuple[str, ...] | None:
+        """The axis names set by `labeled`, or ``None``."""
+        return self._dims
 
     # ------------------------------------------------------------------ #
     # Properties
@@ -347,37 +392,43 @@ class DistributedArray:
 
     def to_xarray(
         self,
-        dims: Sequence[str],
+        dims: Sequence[str] | None = None,
         *,
-        coords: Any = None,
         name: str | None = None,
         attrs: dict[str, Any] | None = None,
         root: int | None = None,
+        coords: dict[str, Any] | None = None,
+        **axis_coords: Any,
     ) -> Any:
         """Return this array gathered and labeled as an ``xarray.DataArray`` (needs xarray).
 
-        mpiarray has no notion of what an axis means, so ``dims`` (and
-        ``coords``) are given here, not stored on the array. See
-        `mpiarray.xarray.to_xarray`. Collective; see `gather`.
+        See `mpiarray.xarray.to_xarray`. Collective; see `gather`.
 
         Args:
-            dims: One name per axis, in order.
-            coords: Coordinate values, as ``xarray.DataArray`` accepts them
-                (e.g. a dict of dim name to a 1-D array); default: none
-                attached.
+            dims: One name per axis, in order; default: `dims`, set by
+                `labeled`.
             name: The result's name.
             attrs: Attributes attached to the result (e.g. ``{"units": "eV"}``).
             root: The rank that receives the array; default: every rank.
+            coords: Coordinate values, as ``xarray.DataArray`` accepts them
+                (e.g. a dict of dim name to a 1-D array); merged with
+                ``**axis_coords``, for an axis named like one of this
+                method's own parameters.
+            **axis_coords: Coordinate values keyed by axis name, e.g.
+                ``x=x_values`` for a `labeled` ``"x"`` axis.
 
         Returns:
             The labeled array, or ``None`` on a rank `gather` left out.
 
         Raises:
-            ValueError: If ``dims`` does not have one name per axis.
+            ValueError: If ``dims`` is not given and the array was not
+                labeled, or it does not have one name per axis.
         """
         from mpiarray.xarray import to_xarray
 
-        return to_xarray(self, dims, coords=coords, name=name, attrs=attrs, root=root)
+        return to_xarray(
+            self, dims, name=name, attrs=attrs, root=root, coords=coords, **axis_coords
+        )
 
     def to_petsc(self, vec: Any = None) -> Any:
         """Copy this rank's block into a global PETSc vector (needs petsc4py).
@@ -679,7 +730,7 @@ class DistributedArray:
         storage = xp.zeros(layout.storage_shape, dtype=self.dtype)
         if not source.distributed:  # every rank holds the whole array
             storage[layout.interior] = self.local[layout.global_slices()]
-            return type(self)(layout, storage)
+            return self._labeled_like(type(self)(layout, storage))
         boxes: list[Box | None] = [
             source.index_bounds_of(r) for r in range(source.size)
         ]
@@ -693,7 +744,7 @@ class DistributedArray:
         )
         for _, box, piece in pieces:
             storage[local_index(box, layout.index_bounds, layout.halo)] = piece
-        return type(self)(layout, storage)
+        return self._labeled_like(type(self)(layout, storage))
 
     def rebalance(self, weights: Any) -> Self:
         """Return the array moved to blocks of about equal weight; see `Layout.weighted`.
