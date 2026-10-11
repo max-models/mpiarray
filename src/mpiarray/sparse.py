@@ -69,6 +69,10 @@ class StencilOperator:
     coefficient)`` pairs, replacing the regular stencil at that row only, on
     whichever rank owns it.
 
+    Operators of the same `layout` combine with ``+``, ``-``, unary ``-`` and
+    multiplication by a number, merging offsets (and overridden rows) term by
+    term, e.g. ``laplacian + mass_matrix`` or ``-0.5 * laplacian``.
+
     Args:
         layout: The decomposition the operator applies to; also fixes how
             many axes an offset has.
@@ -205,13 +209,106 @@ class StencilOperator:
         out.local[...] = result
         return out
 
-    def _row(  # pragma: no cover - only used by to_petsc_mat, needs petsc4py
-        self, index: Index, bounds: tuple[tuple[int, int], ...]
-    ) -> list[tuple[Offset, Any]]:
-        """The ``(offset, coefficient)`` terms for the row at global ``index``."""
-        return self._overrides.get(index) or list(
-            zip(self._offsets, self._coefficients, strict=True),
+    def _local_position(self, index: Index) -> tuple[int, ...] | None:
+        """``index`` relative to this rank's block, or ``None`` if not owned."""
+        position = tuple(
+            i - start
+            for i, (start, _) in zip(index, self._layout.index_bounds, strict=True)
         )
+        if any(
+            p < 0 or p >= n
+            for p, n in zip(position, self._layout.local_shape, strict=True)
+        ):
+            return None
+        return position
+
+    def _terms_at(self, index: Index) -> list[tuple[Offset, Any]] | None:
+        """The row at global ``index``, with any per-cell coefficient resolved to a number.
+
+        Returns ``None`` if this rank does not own ``index`` (its per-cell
+        coefficients, if any, are not available locally).
+        """
+        position = self._local_position(index)
+        if position is None:
+            return None
+        terms = self._overrides.get(index)
+        if terms is not None:
+            return list(terms)
+        return [
+            (offset, coefficient if _is_scalar(coefficient) else coefficient[position])
+            for offset, coefficient in zip(
+                self._offsets, self._coefficients, strict=True
+            )
+        ]
+
+    def __add__(self, other: StencilOperator) -> StencilOperator:
+        """Return the operator ``self + other``, on their shared layout.
+
+        Regular offsets are merged, adding coefficients where both operators
+        use the same offset. Overridden rows are merged the same way, row by
+        row; a row overridden in only one operand is combined with the
+        other's regular stencil at that row.
+
+        Args:
+            other: An operator of the same `layout`.
+
+        Returns:
+            The combined `StencilOperator`.
+
+        Raises:
+            ValueError: If ``other``'s layout differs from this operator's.
+        """
+        if not isinstance(other, StencilOperator):
+            return NotImplemented
+        if self._layout != other._layout:
+            raise ValueError("can only add StencilOperators of the same layout")
+        coefficients = dict(zip(self._offsets, self._coefficients, strict=True))
+        for offset, coefficient in zip(
+            other._offsets, other._coefficients, strict=True
+        ):
+            coefficients[offset] = coefficients.get(offset, 0.0) + coefficient
+        offsets = tuple(coefficients)
+        overrides = {}
+        for index in self._overrides.keys() | other._overrides.keys():
+            a, b = self._terms_at(index), other._terms_at(index)
+            if a is None or b is None:  # not owned by this rank
+                continue
+            merged: dict[Offset, Any] = {}
+            for offset, coefficient in itertools.chain(a, b):
+                merged[offset] = merged.get(offset, 0.0) + coefficient
+            overrides[index] = list(merged.items())
+        return StencilOperator(
+            self._layout,
+            offsets,
+            [coefficients[offset] for offset in offsets],
+            overrides=overrides,
+        )
+
+    def __sub__(self, other: StencilOperator) -> StencilOperator:
+        """Return ``self - other``; see `__add__`."""
+        if not isinstance(other, StencilOperator):
+            return NotImplemented
+        return self + (-1.0) * other
+
+    def __neg__(self) -> StencilOperator:
+        """Return ``-self``."""
+        return -1.0 * self
+
+    def __mul__(self, scalar: Any) -> StencilOperator:
+        """Return this operator scaled by ``scalar`` (a number)."""
+        if not _is_scalar(scalar):
+            return NotImplemented
+        return StencilOperator(
+            self._layout,
+            self._offsets,
+            [scalar * coefficient for coefficient in self._coefficients],
+            overrides={
+                index: [(offset, scalar * coefficient) for offset, coefficient in terms]
+                for index, terms in self._overrides.items()
+            },
+        )
+
+    __rmul__ = __mul__
 
     def to_petsc_mat(self) -> Any:  # pragma: no cover - needs petsc4py, see petsc.py
         """Assemble this operator's pattern as a ``PETSc.Mat``.
@@ -241,15 +338,13 @@ class StencilOperator:
         shape = layout.shape
         periodic = layout.periodic
         bounds = layout.index_bounds
-        starts = tuple(start for start, _ in bounds)
 
         for index in itertools.product(*(range(start, end) for start, end in bounds)):
-            local_position = tuple(
-                i - start for i, start in zip(index, starts, strict=True)
-            )
+            terms = self._terms_at(index)
+            assert terms is not None  # index is within this rank's own bounds
             columns = []
             values = []
-            for offset, coefficient in self._row(index, bounds):
+            for offset, coefficient in terms:
                 neighbour = []
                 for i, o, n, p in zip(index, offset, shape, periodic, strict=True):
                     j = i + o
@@ -261,13 +356,8 @@ class StencilOperator:
                     neighbour.append(j)
                 if neighbour is None:
                     continue
-                value = (
-                    coefficient
-                    if _is_scalar(coefficient)
-                    else coefficient[local_position]
-                )
                 columns.append(int(numbering[tuple(neighbour)]))
-                values.append(float(value))
+                values.append(float(coefficient))
             matrix.setValues([int(numbering[index])], columns, values)
         matrix.assemble()
         return matrix

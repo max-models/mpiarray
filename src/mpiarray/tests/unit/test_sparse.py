@@ -199,6 +199,83 @@ def test_apply_1d() -> None:
 
 
 # ---------------------------------------------------------------------- #
+# Arithmetic: +, -, unary -, scalar *
+
+
+def test_add_merges_offsets_and_overrides(grid: np.ndarray) -> None:
+    layout = Layout(grid.shape, comm=comm, halo=1, periodic=True)
+    u = filled(layout, grid)
+    corner = tuple(n - 1 for n in grid.shape)
+    a = StencilOperator(layout, offsets=[(0, 0), (-1, 0)], coefficients=[2.0, -1.0])
+    b = StencilOperator(
+        layout,
+        offsets=[(0, 0), (1, 0)],
+        coefficients=[3.0, -1.0],
+        overrides={corner: [((0, 0), 5.0)]},
+    )
+    combined = a + b
+    assert set(combined.offsets) == {(0, 0), (-1, 0), (1, 0)}
+    expected = a.apply(u).to_numpy() + b.apply(u).to_numpy()
+    np.testing.assert_allclose(combined.apply(u).to_numpy(), expected)
+
+
+def test_add_with_varying_coefficient_and_override(grid: np.ndarray) -> None:
+    layout = Layout(grid.shape, comm=comm, halo=1, periodic=True)
+    u = filled(layout, grid)
+    corner = tuple(n - 1 for n in grid.shape)
+    weight = np.full(layout.local_shape, 3.0)
+    a = StencilOperator(layout, offsets=[(0, 0)], coefficients=[weight])
+    b = StencilOperator(
+        layout,
+        offsets=[(0, 0)],
+        coefficients=[1.0],
+        overrides={corner: [((0, 0), 10.0)]},
+    )
+    combined = a + b
+    expected = a.apply(u).to_numpy() + b.apply(u).to_numpy()
+    np.testing.assert_allclose(combined.apply(u).to_numpy(), expected)
+
+
+def test_add_rejects_mismatched_layout() -> None:
+    a = StencilOperator(Layout((4, 4), comm=comm, halo=1), **LAPLACIAN_2D)
+    b = StencilOperator(Layout((4, 5), comm=comm, halo=1), **LAPLACIAN_2D)
+    with pytest.raises(ValueError, match="same layout"):
+        a + b
+
+
+def test_arithmetic_rejects_other_types() -> None:
+    a = StencilOperator(Layout((4, 4), comm=comm, halo=1), **LAPLACIAN_2D)
+    with pytest.raises(TypeError):
+        a + 5
+    with pytest.raises(TypeError):
+        a - 5
+    assert a.__mul__(np.zeros((4, 4))) is NotImplemented
+
+
+def test_sub_and_neg(grid: np.ndarray) -> None:
+    layout = Layout(grid.shape, comm=comm, halo=1, periodic=True)
+    u = filled(layout, grid)
+    a = StencilOperator(layout, **LAPLACIAN_2D)
+    b = StencilOperator(layout, offsets=[(0, 0)], coefficients=[1.0])
+    expected = a.apply(u).to_numpy() - b.apply(u).to_numpy()
+    np.testing.assert_allclose((a - b).apply(u).to_numpy(), expected)
+    np.testing.assert_allclose((-a).apply(u).to_numpy(), -a.apply(u).to_numpy())
+
+
+def test_scalar_mul_and_rmul(grid: np.ndarray) -> None:
+    layout = Layout(grid.shape, comm=comm, halo=1, periodic=True)
+    u = filled(layout, grid)
+    a = StencilOperator(
+        layout,
+        **LAPLACIAN_2D,
+        overrides={(0, 0): [((0, 0), 1.0)]},
+    )
+    expected = 2.0 * a.apply(u).to_numpy()
+    np.testing.assert_allclose((2.0 * a).apply(u).to_numpy(), expected)
+    np.testing.assert_allclose((a * 2.0).apply(u).to_numpy(), expected)
+
+
+# ---------------------------------------------------------------------- #
 # to_petsc_mat: skips without petsc4py
 
 
