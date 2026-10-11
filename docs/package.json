@@ -7,8 +7,11 @@
     "node": ">=22.12.0"
   },
   "scripts": {
+    "predev": "node scripts/prepare-notebooks.mjs",
     "dev": "astro dev",
+    "prestart": "node scripts/prepare-notebooks.mjs",
     "start": "astro dev",
+    "prebuild": "node scripts/prepare-notebooks.mjs",
     "build": "astro build",
     "preview": "astro preview",
     "check:mdx": "node scripts/check-mdx.mjs",

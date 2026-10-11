@@ -38,4 +38,5 @@ def test_every_tutorial_is_tested() -> None:
         "heat_equation",
         "particles",
         "working_with_data",
+        "units",
     }

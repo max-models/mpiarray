@@ -31,6 +31,12 @@ make docs-clean       # remove generated pages and build output
 `make docs-notebooks` only reruns a notebook whose cells changed since the last run; pass
 `FORCE=1` to rerun all of them.
 
+Running `npm run dev`, `npm start` or `npm run build` from `docs/` also converts the
+notebooks automatically, so the tutorial pages are available after a clean checkout or
+`make docs-clean`. Conversion uses cached outputs when available; run `make docs-notebooks`
+to execute the examples and populate those outputs. The npm commands use `DOCS_PYTHON`
+when set, otherwise the repository's `.venv` Python or the system Python.
+
 ## Writing tutorials
 
 Put a notebook in `tutorials/`. Its first `# Heading` becomes the page title and the first
