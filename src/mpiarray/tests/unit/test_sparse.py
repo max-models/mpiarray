@@ -95,14 +95,14 @@ def test_construction_errors() -> None:
 
 
 def test_apply_rejects_mismatched_layout() -> None:
-    a = StencilOperator(Layout((4, 4), comm=comm, halo=1), **LAPLACIAN_2D)
-    u = mpa.zeros((4, 5), halo=1)
+    a = StencilOperator(Layout((3 * size + 3, 5), comm=comm, halo=1), **LAPLACIAN_2D)
+    u = mpa.zeros((3 * size + 3, 6), halo=1)
     with pytest.raises(ValueError, match="does not match the operator's layout"):
         a.apply(u)
 
 
 def test_properties_and_repr() -> None:
-    layout = Layout((4, 4), comm=comm, halo=1)
+    layout = Layout((3 * size + 3, 5), comm=comm, halo=1)
     operator = StencilOperator(
         layout,
         **LAPLACIAN_2D,
@@ -237,19 +237,19 @@ def test_add_with_varying_coefficient_and_override(grid: np.ndarray) -> None:
 
 
 def test_add_rejects_mismatched_layout() -> None:
-    a = StencilOperator(Layout((4, 4), comm=comm, halo=1), **LAPLACIAN_2D)
-    b = StencilOperator(Layout((4, 5), comm=comm, halo=1), **LAPLACIAN_2D)
+    a = StencilOperator(Layout((3 * size + 3, 5), comm=comm, halo=1), **LAPLACIAN_2D)
+    b = StencilOperator(Layout((3 * size + 3, 6), comm=comm, halo=1), **LAPLACIAN_2D)
     with pytest.raises(ValueError, match="same layout"):
         a + b
 
 
 def test_arithmetic_rejects_other_types() -> None:
-    a = StencilOperator(Layout((4, 4), comm=comm, halo=1), **LAPLACIAN_2D)
+    a = StencilOperator(Layout((3 * size + 3, 5), comm=comm, halo=1), **LAPLACIAN_2D)
     with pytest.raises(TypeError):
         a + 5
     with pytest.raises(TypeError):
         a - 5
-    assert a.__mul__(np.zeros((4, 4))) is NotImplemented
+    assert a.__mul__(np.zeros((3 * size + 3, 5))) is NotImplemented
 
 
 def test_sub_and_neg(grid: np.ndarray) -> None:
