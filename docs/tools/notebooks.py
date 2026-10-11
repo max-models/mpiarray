@@ -18,10 +18,13 @@ from __future__ import annotations
 
 import argparse
 import base64
+import functools
 import hashlib
 import json
+import os
 import re
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -33,6 +36,10 @@ CACHE = DOCS / ".cache" / "notebooks"
 CONTENT = DOCS / "src" / "content" / "docs" / "guides"
 PUBLIC = DOCS / "public" / "guides"
 COMPONENTS = "../../../components"
+# Guides run under real MPI (mpiarray.tests.unit.test_guides already runs their code on 1,
+# 2 and 4 ranks), so `if rank == 0:` plots show actual rank boundaries, not maybempi's
+# single-rank stand-in. DOCS_MPI_RANKS=1 (or no mpi4py/mpiexec) falls back to one rank.
+MPI_RANKS = int(os.environ.get("DOCS_MPI_RANKS", "4"))
 
 
 def slug_of(path: Path) -> str:
@@ -59,6 +66,51 @@ def cell_hash(path: Path) -> str:
     return hashlib.sha256(json.dumps(cells, sort_keys=True).encode()).hexdigest()[:16]
 
 
+@functools.cache
+def _mpi_launcher() -> list[str] | None:
+    """The MPI launcher command, with Open MPI's oversubscribe flag."""
+    launcher = shutil.which("mpiexec") or shutil.which("mpirun")
+    if launcher is None:
+        return None
+    version = subprocess.run(
+        [launcher, "--version"], capture_output=True, text=True, check=False
+    ).stdout
+    # Open MPI refuses more ranks than cores without it; MPICH has no such flag.
+    # Open MPI 5 calls itself "Open MPI", Open MPI 4 (Ubuntu's) "OpenRTE".
+    is_open_mpi = any(
+        name in version.lower() for name in ("open mpi", "openrte", "open-mpi")
+    )
+    return [launcher, "--oversubscribe"] if is_open_mpi else [launcher]
+
+
+def _kernel_manager(nranks: int):
+    from jupyter_client.kernelspec import KernelSpec
+    from jupyter_client.manager import KernelManager
+
+    km = KernelManager(kernel_name="python3")
+    if nranks > 1:
+        launcher = _mpi_launcher()
+        try:
+            import mpi4py  # noqa: F401
+        except ImportError:
+            launcher = None
+        if launcher is not None:
+            argv = [
+                *launcher,
+                "-n",
+                str(nranks),
+                sys.executable,
+                str(DOCS / "tools" / "mpi_kernel.py"),
+                "-f",
+                "{connection_file}",
+            ]
+            # KernelManager.kernel_spec has no setter; this is the attribute it caches into.
+            km._kernel_spec = KernelSpec(
+                argv=argv, language="python", display_name="Python 3 (MPI)"
+            )
+    return km
+
+
 def execute_notebook(path: Path, target: Path, timeout: int) -> None:
     import nbformat
     from nbclient import NotebookClient
@@ -67,7 +119,7 @@ def execute_notebook(path: Path, target: Path, timeout: int) -> None:
     client = NotebookClient(
         nb,
         timeout=timeout,
-        kernel_name="python3",
+        km=_kernel_manager(MPI_RANKS),
         resources={"metadata": {"path": str(path.parent)}},
     )
     error = None
@@ -85,6 +137,21 @@ def execute_notebook(path: Path, target: Path, timeout: int) -> None:
 
 
 def cmd_execute(args: argparse.Namespace) -> None:
+    if MPI_RANKS > 1 and _mpi_launcher() is not None:
+        try:
+            import mpi4py  # noqa: F401
+
+            print(f"[notebooks] running guides under mpiexec -n {MPI_RANKS}")
+        except ImportError:
+            print(
+                "[notebooks] mpi4py not installed; running guides on 1 rank "
+                "(install the 'mpi' extra for real rank boundaries)"
+            )
+    elif MPI_RANKS > 1:
+        print(
+            "[notebooks] mpiexec/mpirun not found; running guides on 1 rank "
+            "(install an MPI implementation for real rank boundaries)"
+        )
     failed = []
     for path in notebooks():
         slug = slug_of(path)
