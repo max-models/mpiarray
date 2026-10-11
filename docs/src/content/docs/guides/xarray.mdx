@@ -1,0 +1,184 @@
+---
+title: xarray
+description: Gathering a distributed array as a labeled xarray.DataArray, and marking rank boundaries on a plot.
+sidebar:
+  order: 7
+---
+
+import NotebookImage from '../../../components/NotebookImage.astro';
+
+`a.to_xarray(dims, ...)` gathers an array (like `gather`/`to_numpy`) and labels the result as
+an `xarray.DataArray`, for plotting or further analysis with xarray-based tools. It needs
+xarray, which is not a dependency of mpiarray; install it separately:
+
+```bash
+pip install xarray  # or: pip install mpiarray[xarray]
+```
+
+xarray is imported on first use only; `import mpiarray` works without it.
+
+## A gathered, labeled array
+
+mpiarray has no notion of what an axis means, so `labeled` attaches the axis names and a
+name once, on the array itself:
+
+```python
+import numpy as np
+import mpiarray as mpa
+
+x = np.linspace(0.0, 1.0, 64)
+y = np.linspace(0.0, 1.0, 48)
+rho = mpa.zeros((64, 48), split=0).labeled("x", "y", name="rho")
+data = rho.to_xarray(x=x, y=y)
+# also: mpa.to_xarray(rho, x=x, y=y)
+```
+
+The coordinate values are optional: `rho.to_xarray()` alone still gives a `DataArray` with
+`dims == ("x", "y")` (from `labeled`), just with no coordinate attached —
+`Dimensions without coordinates: x, y`. Positional selection (`isel`, or an integer like
+`component=0` on the `.plasma.plot` accessor) still works without them; selecting by value
+(`.sel()`, a float like `z=0.0` on the accessor, or `rank_boundaries`, below) needs the real
+coordinate to compare against, and raises without it.
+
+`labeled` returns the array itself (not a copy), so it chains onto any creation call.
+`a.dims`/`a.name` read back what was set, `None` if `labeled` was never called; passing
+`dims=`/`name=` explicitly to `to_xarray` still works and overrides them for that call.
+Each coordinate's values are a keyword argument named after its axis (`x=`, `y=`, ...;
+also any auxiliary coordinate over the named axes, such as physical `X=`/`Y=`/`Z=` grids
+over logical `eta1`/`eta2`); an axis named like one of `to_xarray`'s own parameters
+(`dims`, `name`, `attrs`, `root`, `coords`) goes through `coords=` instead, a dict merged
+with the keyword coordinates.
+
+Elementwise arithmetic, halo updates, `copy`, `astype`, `redistribute` and `rebalance`
+keep the labels, since every axis still means the same thing afterwards; a reshape,
+reduction, selection, `concatenate` or `stack` does not, since what the result's axes
+mean is not always obvious — call `labeled` again on the result if you still want them
+labeled.
+
+This is collective, like `gather`: call it on every rank. `root=` gathers to one rank only
+(`None`, the default: every rank), which matters when handing the result to a plotting
+library whose functions only draw on rank 0, such as plasma-plots:
+
+```python
+data = rho.to_xarray(x=x, y=y, root=0)  # every rank calls this
+# ... then, only on rank 0 (plasma-plots does this for you):
+# plot_slice(data)
+```
+
+Gather *before* calling into a rank-0-only plotting function, not inside it: those functions
+skip their body entirely on the other ranks, so a `gather`/`to_xarray` call made only inside
+one would hang, waiting for ranks that never call it.
+
+## Marking rank boundaries on a plot
+
+[plasma-plots](https://github.com/max-models/plasma-plots)'s `plot_slice` (plasma-plots 0.2.0
+and later) has an `overlays={"rank_boundaries": ...}` option that draws dashed lines where one
+rank's block ends and the next begins, styled apart from ordinary `"coordinate_lines"` so both
+can share an axis. Pass the `Layout` itself, no manual bookkeeping needed: plasma-plots finds
+each drawn dimension's axis by name among the data's own dimensions (the sweep dimension, `t`
+by default, is skipped) and calls `Layout.boundary_values` for it:
+
+```python
+data.plasma.plot.slice(overlays={"rank_boundaries": rho.layout})
+```
+
+Or with the function form:
+
+```python
+from plasma_plots.plotting import plot_slice
+
+plot_slice(data, overlays={"rank_boundaries": rho.layout}).show()
+# or .save("rho.png"); in a notebook the cell's result displays it already
+```
+
+`rho` split over 4 ranks along `x`, filled with a Gaussian bump, drawn this way:
+
+<NotebookImage
+  src="/guides/xarray/rank-boundaries.png"
+  alt="A 2D Gaussian field split over 4 MPI ranks along x, with the 3 rank boundaries marked as dashed red lines"
+/>
+
+For an explicit list of values instead (e.g. lines not tied to any `Layout`),
+`Layout.boundary_values(axis, coordinate)` turns a layout's block cuts (`Layout.bounds`, index
+positions) into the coordinate values directly, and `overlays` takes a plain
+`{name: values}` dict the same way `"coordinate_lines"` does:
+
+```python
+>>> rho.layout.bounds[0]  # index cuts, under mpiexec -n 4
+(0, 16, 32, 48, 64)
+>>> rho.layout.boundary_values(0, x)  # the same cuts, in x's own values
+[0.25396825396825395, 0.5079365079365079, 0.7619047619047619]
+```
+
+## A 3D vector field, sliced and lined out
+
+A "component" axis is labeled like any other:
+
+```python
+import numpy as np
+import mpiarray as mpa
+
+nx, ny, nz = 32, 24, 16
+x = np.linspace(-1.0, 1.0, nx)
+y = np.linspace(-1.0, 1.0, ny)
+z = np.linspace(-1.0, 1.0, nz)
+
+E = mpa.zeros((3, nx, ny, nz), split=1).labeled("component", "x", "y", "z", name="E")
+i0, i1 = E.layout.index_bounds[1]  # this rank's slab of x (axis 1: split=1)
+X, Y, Z = np.meshgrid(x[i0:i1], y, z, indexing="ij")
+envelope = np.exp(-2.0 * (X**2 + Y**2)) * np.exp(-(Z**2))
+E.local[0] = -Y * envelope  # Ex
+E.local[1] = X * envelope  # Ey
+E.local[2] = 0.3 * np.sin(np.pi * Z) * envelope  # Ez
+
+data = E.to_xarray(x=x, y=y, z=z)
+```
+
+`data.plasma.plot` (registered on every xarray object once plasma-plots is imported) selects
+the other axes by naming them: an integer is a position, a float the nearest coordinate
+value — `component=0` picks `Ex`, the first of the 3 entries along the `"component"` axis,
+the same way `z=0.0` picks the nearest `z` to `0`. A 2-D slice of `Ex` at `z = 0`, with the
+rank boundaries along `x` marked:
+
+```python
+import plasma_plots  # registers the .plasma accessor
+
+data.plasma.plot.slice(
+    component=0, z=0.0, title="Ex", overlays={"rank_boundaries": E.layout}
+).show()
+```
+
+Selecting `component=0` does not rename the array, so without `title=` the plot would just
+say `"E"`; pass it explicitly (here and below) to say which component is shown.
+
+<NotebookImage
+  src="/guides/xarray/E-slice.png"
+  alt="A 2D slice of the x-component of a vortex-like vector field at z=0, with 3 dashed red lines marking the boundaries between 4 MPI ranks split along x"
+/>
+
+And a 1-D lineout of `Ey` along `x`, at `y = z = 0`, with the same rank boundaries marked
+(`plot_lineout`'s own `rank_boundaries=` takes a plain list of values; the accessor also
+takes a `Layout` directly here, the same way `plot_slice`'s does):
+
+```python
+data.plasma.plot.lineout(
+    component=1,
+    y=0.0,
+    z=0.0,
+    title="Ey",
+    rank_boundaries=E.layout
+).show()
+```
+
+<NotebookImage
+  src="/guides/xarray/E-lineout.png"
+  alt="A 1D lineout of the y-component of the vector field along x, at y=0 and z=0, with 3 dashed red lines marking the boundaries between 4 MPI ranks split along x"
+/>
+
+Both need every one of `E`'s own axes to still be there when plasma-plots sees the data
+(`Layout.boundary_values` is always called with the *original* array's axis indices), which
+naming axes on the accessor (`component=0`, `z=0.0`, ...) guarantees: it selects internally,
+handing the whole array to `plot_slice`/`plot_lineout`. Selecting an axis away yourself
+first, e.g. `data.isel(component=0)`, loses that — use `plasma_plots.plotting.plot_slice`
+directly with `view=View(isel={"component": 0, ...})` instead in that case, or drop
+`rank_boundaries`.
