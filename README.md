@@ -136,14 +136,14 @@ Commits](https://www.conventionalcommits.org/); see
 ## Build docs
 
 The documentation in `docs/` is an Astro + Starlight site: hand-written
-pages, the notebooks in `tutorials/` executed and published as pages,
-and the API reference generated from the docstrings with
+pages, the notebooks in `guides/` executed and published as pages, and
+the API reference generated from the docstrings with
 [starlight-pydocs](https://ewels.github.io/starlight-pydocs/). It needs
 Node 22 or newer.
 
 ``` bash
 make docs-install     # npm packages and the Python docs extra
-make docs-notebooks   # execute tutorials/*.ipynb and convert them to pages
+make docs-notebooks   # execute guides/*.ipynb and convert them to pages
 make docs-dev         # live preview at http://localhost:4321/mpiarray/
 make docs-build       # the static site in docs/dist
 ```

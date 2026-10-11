@@ -10,9 +10,9 @@ unless set with `DistributedArray.labeled`::
     # or give the names at the call site instead:
     data = mpa.zeros((64, 48)).to_xarray(("x", "y"), x=x_values, y=y_values)
 
-``name`` and ``attrs`` (e.g. ``{"units": "eV"}``) are given at each call, not stored on
-the array: unlike axis names, they describe what the *values* are, which arithmetic can
-silently invalidate with no way for mpiarray to tell.
+``name`` and general ``attrs`` are given at each call. ``attrs["units"]`` defaults
+to the array's physical unit, if one was attached with ``set_units``; an explicit
+attribute overrides this default.
 
 Each coordinate's values are passed as a keyword argument named after its axis
 (``x=``, ``y=``, ...; also any auxiliary coordinate over the named axes, e.g.
@@ -110,6 +110,9 @@ def to_xarray(
     data = array.to_numpy(root=root)
     if data is None:
         return None
+    attrs = dict(attrs or {})
+    if array.units is not None:
+        attrs.setdefault("units", str(array.units))
     return xr.DataArray(
         data,
         dims=tuple(dims),

@@ -1,4 +1,4 @@
-name: Test Tutorials
+name: Test Guides
 
 on:
   push:
@@ -11,7 +11,7 @@ on:
       - devel
 
 jobs:
-  tutorials:
+  guides:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -33,5 +33,5 @@ jobs:
           uv sync --extra docs
           uv run python -m ipykernel install --user --name python3
 
-      - name: Execute tutorials
+      - name: Execute guides
         run: uv run python docs/tools/notebooks.py execute --force

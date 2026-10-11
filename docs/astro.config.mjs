@@ -16,6 +16,14 @@ const pythonPackage = 'mpiarray';
 export default defineConfig({
 	site: 'https://max-models.github.io',
 	base,
+	redirects: {
+		'/tutorials/': '/guides/',
+		'/tutorials/distributed-arrays/': '/guides/distributed-arrays/',
+		'/tutorials/heat-equation/': '/guides/heat-equation/',
+		'/tutorials/particles/': '/guides/particles/',
+		'/tutorials/working-with-data/': '/guides/working-with-data/',
+		'/tutorials/units/': '/guides/units/',
+	},
 	markdown: {
 		// $...$ and $$...$$ math in Markdown and MDX pages, rendered with KaTeX at build time
 		processor: unified({ remarkPlugins: [remarkMath], rehypePlugins: [rehypeKatex] }),
@@ -72,10 +80,6 @@ export default defineConfig({
 				{
 					label: 'Guides',
 					items: [{ autogenerate: { directory: 'guides' } }],
-				},
-				{
-					label: 'Tutorials',
-					items: [{ autogenerate: { directory: 'tutorials' } }],
 				},
 				{
 					label: 'Development',
