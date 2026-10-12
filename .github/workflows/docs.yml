@@ -39,10 +39,17 @@ jobs:
           cache: npm
           cache-dependency-path: docs/package-lock.json
 
-      - name: Install the package with the docs extra
+      # the guides run on 4 ranks, so their plots show the rank boundaries; without mpiexec
+      # and mpi4py, docs/tools/notebooks.py falls back to one rank and draws none
+      - name: Install MPI
+        run: sudo apt-get update && sudo apt-get install -y libopenmpi-dev openmpi-bin
+
+      - name: Install the package with the docs and mpi extras
         run: |
-          uv sync --extra docs
+          uv sync --extra docs --extra mpi
           uv run python -m ipykernel install --user --name python3
+          mpiexec --version
+          uv run python -c "from mpi4py import MPI; print(MPI.Get_library_version())"
 
       - name: Execute and convert the guides
         run: |

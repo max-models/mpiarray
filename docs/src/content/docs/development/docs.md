@@ -16,6 +16,9 @@ The site in `docs/` is built with [Astro](https://astro.build/) and
 
 - Node 22 or newer.
 - The package installed with the `docs` extra: `pip install -e ".[docs]"`.
+- An MPI implementation (`mpiexec`) and the `mpi` extra, for the rank boundaries in the
+  guides' plots: the notebooks run on 4 ranks (`DOCS_MPI_RANKS`). Without them they run on
+  one rank and the plots show a single block.
 
 ## Commands
 
