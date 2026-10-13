@@ -18,6 +18,7 @@ backend call ``xp.mpi.mpi_is_cuda_aware(comm)`` or
 """
 
 from mpiarray._mpi import default_comm
+from mpiarray.copy import CopyPlan, copy_boxes
 from mpiarray.creation import (
     arange,
     array,
@@ -118,6 +119,7 @@ from mpiarray.xarray import to_xarray
 __version__ = "0.1.0"
 
 __all__ = [
+    "CopyPlan",
     "DistributedArray",
     "HaloUpdate",
     "Layout",
@@ -142,6 +144,7 @@ __all__ = [
     "chunk_bounds",
     "conj",
     "conjugate",
+    "copy_boxes",
     "copy_from_petsc",
     "copy_to_petsc",
     "copysign",
