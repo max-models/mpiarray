@@ -7,10 +7,16 @@ The site in `docs/` is built with [Astro](https://astro.build/) and
 [Starlight](https://starlight.astro.build/). It has three kinds of pages:
 
 - **Hand-written pages** in `docs/src/content/docs/`, as Markdown or MDX.
-- **Guides**, converted from the Jupyter notebooks in `guides/` by `docs/tools/notebooks.py`.
+- **Guides**, converted from the Jupyter notebooks in `guides/` by `starlight-notebooks`.
   All guide content lives in notebooks. Each notebook is executed and its outputs (text, images, tables) are written into an MDX page.
 - **API reference**, generated from the docstrings by
   [starlight-pydocs](https://ewels.github.io/starlight-pydocs/), one page per module.
+
+The configuration (`defineDocs` in `docs/astro.config.mjs`), the look, the header, the notebook
+tool and the build workflow come from the shared
+[starlight-theme](https://github.com/max-models/starlight-theme) of the max-models projects;
+change them there, and update the version in `docs/package.json` and
+`.github/workflows/docs.yml` to pick up a new release.
 
 ## Requirements
 
