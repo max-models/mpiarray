@@ -177,10 +177,10 @@ class CopyPlan:
     def _plan(self, everyone: list) -> None:
         """What this rank sends to and receives from every rank, in order."""
         rank = self._comm.Get_rank()
-        sends: list[list[tuple[int, tuple[slice, ...]]]] = [
+        sends: list[list[tuple[DistributedArray, tuple[slice, ...]]]] = [
             [] for _ in range(self._size)
         ]
-        receives: list[list[tuple[int, tuple[slice, ...]]]] = [
+        receives: list[list[tuple[DistributedArray, tuple[slice, ...], int]]] = [
             [] for _ in range(self._size)
         ]
         for number, (source, source_box, target, target_box) in enumerate(self._copies):
@@ -201,7 +201,8 @@ class CopyPlan:
 
             my_send, my_receive = everyone[rank][0][number]
             outgoing = moved(my_send)
-            if outgoing is not None:
+            # a rank sends from and receives into the arrays it holds
+            if outgoing is not None and source is not None:
                 for other in range(self._size):
                     region = everyone[other][0][number][1]
                     part = None if region is None else overlap(outgoing, region)
@@ -212,9 +213,9 @@ class CopyPlan:
                     )
                     layout = source.layout
                     sends[other].append(
-                        (number, local_index(back, layout.index_bounds, layout.halo))
+                        (source, local_index(back, layout.index_bounds, layout.halo))
                     )
-            if my_receive is not None:
+            if my_receive is not None and target is not None:
                 layout = target.layout
                 for other in range(self._size):
                     incoming = moved(everyone[other][0][number][0])
@@ -222,14 +223,18 @@ class CopyPlan:
                     if part is None:
                         continue
                     receives[other].append(
-                        (number, local_index(part, layout.index_bounds, layout.halo))
+                        (
+                            target,
+                            local_index(part, layout.index_bounds, layout.halo),
+                            number,
+                        )
                     )
         self._sends = sends
         self._receives = receives
 
         def counts(pieces: list) -> list[int]:
             return [
-                sum(math.prod(s.stop - s.start for s in index) for _, index in parts)
+                sum(math.prod(s.stop - s.start for s in piece[1]) for piece in parts)
                 for parts in pieces
             ]
 
@@ -243,9 +248,9 @@ class CopyPlan:
         order = []
         for other, parts in enumerate(receives):
             offset = self._receive_offsets[other]
-            for number, index in parts:
+            for target, index, number in parts:
                 count = math.prod(s.stop - s.start for s in index)
-                order.append((number, other, offset, index))
+                order.append((number, other, offset, target, index))
                 offset += count
         order.sort(key=lambda piece: (piece[0], piece[1]))
         self._unpack = order
@@ -263,9 +268,9 @@ class CopyPlan:
     def execute(self) -> None:
         """Copy the boxes. Collective over the plan's communicator."""
         parts = [
-            xp.ravel(self._copies[number][0].local_with_halos[index])
+            xp.ravel(source.local_with_halos[index])
             for to_rank in self._sends
-            for number, index in to_rank
+            for source, index in to_rank
         ]
         dtype = self._dtype
         send = (
@@ -285,10 +290,11 @@ class CopyPlan:
                     [sendbuf, (self._send_counts, self._send_offsets)],
                     [recvbuf, (self._receive_counts, self._receive_offsets)],
                 )
-        for number, _, offset, index in self._unpack:
-            target = self._copies[number][2].local_with_halos
+        for _, _, offset, target, index in self._unpack:
             shape = tuple(s.stop - s.start for s in index)
-            target[index] = receive[offset : offset + math.prod(shape)].reshape(shape)
+            target.local_with_halos[index] = receive[
+                offset : offset + math.prod(shape)
+            ].reshape(shape)
 
 
 def copy_boxes(copies: Sequence[Copy], comm: Any = None) -> None:

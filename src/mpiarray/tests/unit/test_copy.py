@@ -51,6 +51,13 @@ def make(comm, data: np.ndarray, **layout) -> mpa.DistributedArray | None:
     return mpa.array(data, layout=Layout(data.shape, comm=comm, **layout))
 
 
+def make_here(comm, data: np.ndarray, **layout) -> mpa.DistributedArray:
+    """``data`` as an array on a communicator this rank belongs to."""
+    array = make(comm, data, **layout)
+    assert array is not None
+    return array
+
+
 def fill_storage(array: mpa.DistributedArray, value) -> np.ndarray:
     """Fill the whole storage, halos included, by global index; return the indices."""
     layout = array.layout
@@ -116,13 +123,13 @@ def test_boxes_go_from_one_group_of_ranks_to_another(
         (((0, 1), (0, m)), ((-1, 0), (0, m))),  # a row into the lower x wall's halo
         (((3, 5), (0, 1)), ((3, 5), (m, m + 1))),  # a column into the upper y wall's
     ]
-    index = fill_storage(target, target_value) if target is not None else None
+    index = None if target is None else fill_storage(target, target_value)
 
     plan = CopyPlan([(source, s, target, t) for s, t in copies], comm=WORLD)
     plan.execute()
 
     assert plan.num_copies == 3
-    if target is None:
+    if target is None or index is None:
         return
     expected = target_value(index)
     mine = owned(target, index)
@@ -144,7 +151,7 @@ def test_a_wall_halo_filled_by_the_plan_reaches_every_rank_with_update_halos() -
     comm = group("all")
     data = pattern(0.0, SHAPE)
     n, m = SHAPE
-    target = make(comm, np.zeros(SHAPE), split=(0, 1), halo=1)
+    target = make_here(comm, np.zeros(SHAPE), split=(0, 1), halo=1)
     copy_boxes(
         [(make(comm, data, split=0), ((0, n), (0, 1)), target, ((0, n), (-1, 0)))],
         comm=WORLD,
@@ -165,7 +172,7 @@ def test_a_wall_halo_filled_by_the_plan_reaches_every_rank_with_update_halos() -
 def test_an_array_copies_into_its_own_halo_as_a_periodic_axis_would() -> None:
     comm = group("all")
     n, m = SHAPE
-    array = make(comm, pattern(0.0, SHAPE), split=0, halo=1)
+    array = make_here(comm, pattern(0.0, SHAPE), split=0, halo=1)
     data = pattern(0.0, SHAPE)
     copy_boxes(
         [
