@@ -11,6 +11,8 @@ Every function takes the same keyword arguments for the layout:
 - ``comm``: the communicator (default: ``MPI.COMM_WORLD``, or maybempi's serial
   stand-in when not started by an MPI launcher).
 - ``process_grid``: explicit process counts per axis, instead of ``split``.
+- ``bounds``: explicit cut points per axis, instead of the near-even split;
+  see `Layout`.
 - ``layout``: an existing `Layout`, instead of all of the above.
 
 All of them are collective in the sense that every rank must call them with
@@ -54,6 +56,7 @@ def _make_layout(
     periodic: PeriodicLike,
     comm: Comm | None,
     process_grid: Sequence[int] | None,
+    bounds: Sequence[Sequence[int] | None] | None = None,
 ) -> Layout:
     """Return ``layout``, checked against ``shape``, or a new one."""
     if layout is not None:
@@ -71,6 +74,7 @@ def _make_layout(
         halo=halo,
         periodic=periodic,
         process_grid=process_grid,
+        bounds=bounds,
     )
 
 
@@ -83,6 +87,7 @@ def empty(
     periodic: PeriodicLike = False,
     comm: Comm | None = None,
     process_grid: Sequence[int] | None = None,
+    bounds: Sequence[Sequence[int] | None] | None = None,
     layout: Layout | None = None,
 ) -> DistributedArray:
     """Return a new array without initializing its values.
@@ -95,12 +100,15 @@ def empty(
         periodic: Whether each axis wraps around.
         comm: The communicator.
         process_grid: Explicit process counts per axis.
+        bounds: Explicit cut points per axis, instead of the near-even split.
         layout: An existing layout, instead of the arguments above.
 
     Returns:
         The array; its values, halo cells included, are undefined.
     """
-    layout = _make_layout(shape, layout, split, halo, periodic, comm, process_grid)
+    layout = _make_layout(
+        shape, layout, split, halo, periodic, comm, process_grid, bounds
+    )
     return DistributedArray(layout, xp.empty(layout.storage_shape, dtype=dtype))
 
 
@@ -113,6 +121,7 @@ def zeros(
     periodic: PeriodicLike = False,
     comm: Comm | None = None,
     process_grid: Sequence[int] | None = None,
+    bounds: Sequence[Sequence[int] | None] | None = None,
     layout: Layout | None = None,
 ) -> DistributedArray:
     """Return a new array of zeros.
@@ -125,12 +134,15 @@ def zeros(
         periodic: Whether each axis wraps around.
         comm: The communicator.
         process_grid: Explicit process counts per axis.
+        bounds: Explicit cut points per axis, instead of the near-even split.
         layout: An existing layout, instead of the arguments above.
 
     Returns:
         The array, halo cells included.
     """
-    layout = _make_layout(shape, layout, split, halo, periodic, comm, process_grid)
+    layout = _make_layout(
+        shape, layout, split, halo, periodic, comm, process_grid, bounds
+    )
     return DistributedArray(layout, xp.zeros(layout.storage_shape, dtype=dtype))
 
 
@@ -143,6 +155,7 @@ def ones(
     periodic: PeriodicLike = False,
     comm: Comm | None = None,
     process_grid: Sequence[int] | None = None,
+    bounds: Sequence[Sequence[int] | None] | None = None,
     layout: Layout | None = None,
 ) -> DistributedArray:
     """Return a new array of ones.
@@ -155,12 +168,15 @@ def ones(
         periodic: Whether each axis wraps around.
         comm: The communicator.
         process_grid: Explicit process counts per axis.
+        bounds: Explicit cut points per axis, instead of the near-even split.
         layout: An existing layout, instead of the arguments above.
 
     Returns:
         The array, halo cells included.
     """
-    layout = _make_layout(shape, layout, split, halo, periodic, comm, process_grid)
+    layout = _make_layout(
+        shape, layout, split, halo, periodic, comm, process_grid, bounds
+    )
     return DistributedArray(layout, xp.ones(layout.storage_shape, dtype=dtype))
 
 
@@ -174,6 +190,7 @@ def full(
     periodic: PeriodicLike = False,
     comm: Comm | None = None,
     process_grid: Sequence[int] | None = None,
+    bounds: Sequence[Sequence[int] | None] | None = None,
     layout: Layout | None = None,
 ) -> DistributedArray:
     """Return a new array filled with ``fill_value``.
@@ -187,12 +204,15 @@ def full(
         periodic: Whether each axis wraps around.
         comm: The communicator.
         process_grid: Explicit process counts per axis.
+        bounds: Explicit cut points per axis, instead of the near-even split.
         layout: An existing layout, instead of the arguments above.
 
     Returns:
         The array.
     """
-    layout = _make_layout(shape, layout, split, halo, periodic, comm, process_grid)
+    layout = _make_layout(
+        shape, layout, split, halo, periodic, comm, process_grid, bounds
+    )
     storage = xp.full(layout.storage_shape, fill_value, dtype=dtype)
     return DistributedArray(layout, storage)
 
@@ -262,6 +282,7 @@ def _layout_for(
     periodic: _PeriodicArg,
     comm: Comm | None,
     process_grid: Sequence[int] | None,
+    bounds: Sequence[Sequence[int] | None] | None = None,
 ) -> Layout | None:
     """Return ``source``'s layout with the given options changed, or None if none is."""
     if (
@@ -270,10 +291,11 @@ def _layout_for(
         and periodic is DEFAULT
         and comm is None
         and process_grid is None
+        and bounds is None
     ):
         return None
     old = source.layout
-    if split is DEFAULT and process_grid is None:
+    if split is DEFAULT and process_grid is None and bounds is None:
         split = old.split if old.split else None
     return Layout(
         old.shape,
@@ -282,6 +304,7 @@ def _layout_for(
         halo=old.halo if halo is DEFAULT else halo,
         periodic=old.periodic if periodic is DEFAULT else periodic,
         process_grid=process_grid,
+        bounds=bounds,
     )
 
 
@@ -294,6 +317,7 @@ def array(
     periodic: _PeriodicArg = DEFAULT,
     comm: Comm | None = None,
     process_grid: Sequence[int] | None = None,
+    bounds: Sequence[Sequence[int] | None] | None = None,
     layout: Layout | None = None,
 ) -> DistributedArray:
     """Return a distributed array with the values of a global array.
@@ -317,6 +341,7 @@ def array(
         periodic: Whether each axis wraps around (default ``False``).
         comm: The communicator.
         process_grid: Explicit process counts per axis.
+        bounds: Explicit cut points per axis, instead of the near-even split.
         layout: An existing layout, instead of the arguments above.
 
     Returns:
@@ -328,7 +353,7 @@ def array(
     """
     if isinstance(obj, DistributedArray):
         if layout is None:
-            layout = _layout_for(obj, split, halo, periodic, comm, process_grid)
+            layout = _layout_for(obj, split, halo, periodic, comm, process_grid, bounds)
         if layout is None or layout == obj.layout:
             return obj.astype(obj.dtype if dtype is None else dtype)
         obj = obj.gather()
@@ -341,6 +366,7 @@ def array(
         False if periodic is DEFAULT else periodic,
         comm,
         process_grid,
+        bounds,
     )
     if debug_checks():
         _check_identical(data, layout.comm)
@@ -358,6 +384,7 @@ def asarray(
     periodic: _PeriodicArg = DEFAULT,
     comm: Comm | None = None,
     process_grid: Sequence[int] | None = None,
+    bounds: Sequence[Sequence[int] | None] | None = None,
     layout: Layout | None = None,
 ) -> DistributedArray:
     """Return ``obj`` as a distributed array, without a copy if it already is one.
@@ -373,12 +400,15 @@ def asarray(
         periodic: Whether each axis wraps around.
         comm: The communicator.
         process_grid: Explicit process counts per axis.
+        bounds: Explicit cut points per axis, instead of the near-even split.
         layout: An existing layout, instead of the arguments above.
     """
     if isinstance(obj, DistributedArray) and (
         dtype is None or xp.dtype(dtype) == obj.dtype
     ):
-        wanted = layout or _layout_for(obj, split, halo, periodic, comm, process_grid)
+        wanted = layout or _layout_for(
+            obj, split, halo, periodic, comm, process_grid, bounds
+        )
         if wanted is None or wanted == obj.layout:
             return obj
     return array(
@@ -389,6 +419,7 @@ def asarray(
         periodic=periodic,
         comm=comm,
         process_grid=process_grid,
+        bounds=bounds,
         layout=layout,
     )
 
@@ -537,6 +568,7 @@ def arange(
     periodic: PeriodicLike = False,
     comm: Comm | None = None,
     process_grid: Sequence[int] | None = None,
+    bounds: Sequence[Sequence[int] | None] | None = None,
 ) -> DistributedArray:
     """Return evenly spaced values in ``[start, stop)``, like ``numpy.arange``.
 
@@ -552,6 +584,7 @@ def arange(
         periodic: Whether the axis wraps around.
         comm: The communicator.
         process_grid: Explicit process counts.
+        bounds: Explicit cut points, instead of the near-even split.
 
     Returns:
         A 1-D array.
@@ -573,6 +606,7 @@ def arange(
         halo=halo,
         periodic=periodic,
         process_grid=process_grid,
+        bounds=bounds,
     )
     first, last = layout.index_bounds[0]
     values = start + xp.arange(first, last) * step
@@ -593,6 +627,7 @@ def linspace(
     periodic: PeriodicLike = False,
     comm: Comm | None = None,
     process_grid: Sequence[int] | None = None,
+    bounds: Sequence[Sequence[int] | None] | None = None,
 ) -> DistributedArray:
     """Return ``num`` evenly spaced values from ``start`` to ``stop``, like ``numpy.linspace``.
 
@@ -609,6 +644,7 @@ def linspace(
         periodic: Whether the axis wraps around.
         comm: The communicator.
         process_grid: Explicit process counts.
+        bounds: Explicit cut points, instead of the near-even split.
 
     Returns:
         A 1-D array.
@@ -627,6 +663,7 @@ def linspace(
         halo=halo,
         periodic=periodic,
         process_grid=process_grid,
+        bounds=bounds,
     )
     first, last = layout.index_bounds[0]
     div = num - 1 if endpoint else num
@@ -650,6 +687,7 @@ def fromfunction(
     periodic: PeriodicLike = False,
     comm: Comm | None = None,
     process_grid: Sequence[int] | None = None,
+    bounds: Sequence[Sequence[int] | None] | None = None,
 ) -> DistributedArray:
     """Return an array whose values are ``function`` of the global indices.
 
@@ -666,6 +704,7 @@ def fromfunction(
         periodic: Whether each axis wraps around.
         comm: The communicator.
         process_grid: Explicit process counts per axis.
+        bounds: Explicit cut points per axis, instead of the near-even split.
 
     Returns:
         The array, with the dtype of the values ``function`` returns.
@@ -677,6 +716,7 @@ def fromfunction(
         halo=halo,
         periodic=periodic,
         process_grid=process_grid,
+        bounds=bounds,
     )
     axes = [xp.arange(start, end, dtype=dtype) for start, end in layout.index_bounds]
     indices = xp.meshgrid(*axes, indexing="ij") if axes else []

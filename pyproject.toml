@@ -5,7 +5,7 @@ requires = [ "setuptools", "wheel" ]
 
 [project]
 name = "mpiarray"
-version = "0.1.1"
+version = "0.2.0"
 description = "MPI domain decomposition and distributed NumPy/CuPy arrays with halo exchange."
 readme = "README.md"
 keywords = [ "array", "cupy", "domain decomposition", "halo exchange", "mpi", "numpy" ]
@@ -38,18 +38,26 @@ optional-dependencies.dev = [
   "mpiarray[test,docs,mpi]",
 ]
 optional-dependencies.docs = [
+  "astropy",
+  "h5py",
   "griffe",
   "ipykernel",
   "matplotlib",
   "nbclient>=0.10",
   "nbformat>=5.10",
+  "plasma-plots>=0.2.1",
+  "xarray",
 ]
 # without mpi4py, mpiarray runs serially on maybempi's stand-in for mpi4py.MPI
 # HDF5 files: save_hdf5/load_hdf5 (parallel with an MPI-enabled h5py build)
 optional-dependencies.hdf5 = [ "h5py" ]
 optional-dependencies.mpi = [ "mpi4py" ]
-# matplotlib and nbformat: the tutorials are also run as tests, under MPI
-optional-dependencies.test = [ "h5py", "matplotlib", "nbformat>=5.10", "pytest", "pytest-cov" ]
+# xarray interoperability (mpiarray.xarray): a gathered array as a labeled DataArray
+optional-dependencies.units = [ "astropy" ]
+optional-dependencies.xarray = [ "xarray" ]
+# PETSc interoperability (mpiarray.petsc): DMDAs with a layout's decomposition
+# matplotlib and nbformat: the guides are also run as tests, under MPI
+optional-dependencies.test = [ "astropy", "h5py", "matplotlib", "nbformat>=5.10", "pytest", "pytest-cov", "xarray" ]
 urls."Source" = "https://github.com/max-models/mpiarray"
 
 [tool.setuptools.packages.find]
@@ -70,7 +78,6 @@ ignore = [ "E501" ] # line length is handled by the formatter
 pydocstyle.convention = "google"
 per-file-ignores."**/tests/**" = [ "D" ]
 per-file-ignores."*.ipynb" = [ "D" ]
-per-file-ignores."docs/tools/*" = [ "D" ]
 
 [tool.pyright]
 include = [ "src" ]
@@ -89,7 +96,9 @@ addopts = "-ra"
 source = [ "mpiarray" ]
 # every `if` must be seen going both ways
 branch = true
-omit = [ "*/tests/*" ]
+# mpiarray/petsc.py: CI has no petsc4py (it builds PETSc from source without a matching
+# wheel), so its tests skip there; run them locally with petsc4py (see PETSC.md)
+omit = [ "*/tests/*", "*/mpiarray/petsc.py" ]
 # one data file per process (every MPI rank, and the jobs tests start), for `coverage combine`
 parallel = true
 patch = [ "subprocess" ]
@@ -105,5 +114,5 @@ python-version = "3.10"
 include = [ "src" ]
 
 [tool.ty.analysis]
-# CuPy is optional and not installed in CI
-allowed-unresolved-imports = [ "cupy" ]
+# CuPy and petsc4py are optional and not installed in CI
+allowed-unresolved-imports = [ "cupy", "petsc4py" ]

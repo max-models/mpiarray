@@ -1,7 +1,10 @@
 name: Docs
 
-# The Astro + Starlight site in docs/: hand-written pages, the executed tutorials and the API
-# reference. Built on every push and pull request; deployed to GitHub Pages from devel.
+# The Astro + Starlight site in docs/: hand-written pages, the executed notebooks and the API
+# reference. Built on every push and pull request with the shared workflow of
+# max-models/starlight-theme; deployed to GitHub Pages from devel.
+# The guides run on 4 ranks (docs/package.json), so their plots show the rank boundaries;
+# hence MPI and the mpi extra.
 
 on:
   push:
@@ -20,62 +23,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: astral-sh/setup-uv@v7
-        with:
-          python-version: "3.12"
-          enable-cache: true
-
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: docs/package-lock.json
-
-      - name: Install the package with the docs extra
-        run: |
-          uv sync --extra docs
-          uv run python -m ipykernel install --user --name python3
-
-      - name: Execute and convert the tutorials
-        run: |
-          uv run python docs/tools/notebooks.py execute
-          uv run python docs/tools/notebooks.py convert --strict
-
-      - name: Build the site
-        working-directory: docs
-        run: |
-          npm ci
-          npm run check:mdx
-          DOCS_PYTHON="$(pwd)/../.venv/bin/python" npm run build
-
-      - name: Smoke test the built site
-        working-directory: docs
-        run: |
-          for page in /index.html /getting-started/installation/index.html /tutorials/distributed-arrays/index.html /api/mpiarray/index.html /api/mpiarray/distributed_array/index.html /api/mpiarray/layout/index.html /guides/layouts/index.html /api/mpiarray/io/index.html /tutorials/heat-equation/index.html /tutorials/particles/index.html /tutorials/working-with-data/index.html; do
-            test -f "dist$page" || { echo "missing dist$page"; exit 1; }
-          done
-          grep -q 'href="/mpiarray/' dist/index.html || { echo "links do not use the base path"; exit 1; }
-          echo "all pages built with the /mpiarray base path"
-
-      - uses: actions/upload-pages-artifact@v5
-        with:
-          path: docs/dist
-
-  deploy:
-    needs: build
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/devel'
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@v5
+  docs:
+    uses: max-models/starlight-theme/.github/workflows/docs.yml@v0.4.0
+    with:
+      apt-packages: "libopenmpi-dev openmpi-bin"
+      extras: "docs mpi"
+      smoke-paths: |
+        getting-started/installation/index.html
+        guides/distributed-arrays/index.html
+        api/mpiarray/index.html
+        api/mpiarray/distributed_array/index.html
+        api/mpiarray/layout/index.html
+        guides/layouts/index.html
+        api/mpiarray/io/index.html
+        guides/heat-equation/index.html
+        guides/particles/index.html
+        guides/working-with-data/index.html
+        guides/units/index.html

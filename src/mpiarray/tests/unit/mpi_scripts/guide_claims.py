@@ -66,5 +66,16 @@ assert (lap + u).norm(np.inf) < 1e-2
 b = mpa.array([1, 2, 3, 4])
 assert b.local.tolist() == [[1], [2], [3], [4]][rank]
 assert "rank" in repr(b)
+
+# xarray.md: boundary_values turns index cuts into coordinate values
+x = np.linspace(0.0, 1.0, 64)
+rho = mpa.zeros((64, 48), split=0)
+assert rho.layout.bounds[0] == (0, 16, 32, 48, 64)
+assert rho.layout.boundary_values(0, x) == [
+    0.25396825396825395,
+    0.5079365079365079,
+    0.7619047619047619,
+]
+
 if rank == 0:
     print("all guide claims hold")

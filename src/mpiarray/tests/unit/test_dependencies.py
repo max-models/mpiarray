@@ -9,12 +9,15 @@ import pytest
 
 PACKAGE = Path(__file__).resolve().parents[2]
 ALLOWED = {
+    "astropy",  # lazily, for unit arithmetic (the units extra)
     "cunumpy",
     "maybempi",
     "mpi4py",
     "numpy",
     "cupy",  # lazily, in DistributedArray.to_cupy()
     "h5py",  # lazily, for save_hdf5/load_hdf5 (the hdf5 extra)
+    "petsc4py",  # lazily, in mpiarray.petsc (installed separately)
+    "xarray",  # lazily, in mpiarray.xarray (the xarray extra)
     "typing_extensions",  # under TYPE_CHECKING only
 }
 
@@ -51,10 +54,17 @@ from mpiarray import _mpi, distributed_array, layout
 assert maybempi.is_serial(_mpi.MPI)
 assert layout.MPI is distributed_array.MPI is _mpi.MPI
 a = mpa.arange(6.0, halo=1, periodic=True)
+a.set_units(None)
 a.update_halos()
 assert a.sum() == 15.0
+b = a.copy()
+b[:] = a
+assert (a == b).all()
 assert xp.to_numpy(a.local_with_halos).tolist() == [5, 0, 1, 2, 3, 4, 5, 0]
 assert "mpi4py" not in sys.modules, "a serial run imported mpi4py"
+assert "petsc4py" not in sys.modules, "import mpiarray imported petsc4py"
+assert "xarray" not in sys.modules, "import mpiarray imported xarray"
+assert "astropy" not in sys.modules, "import mpiarray imported astropy"
 """
 
 

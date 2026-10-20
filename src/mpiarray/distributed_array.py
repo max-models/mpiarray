@@ -205,10 +205,97 @@ class DistributedArray:
         self._data = storage
         # receive buffers and host staging, reused by every halo exchange
         self._halo_buffers: dict[tuple, Any] = {}
+        # set by `labeled`, for `to_xarray`'s default `dims`
+        self._dims: tuple[str, ...] | None = None
+        # set by `set_units`; an astropy.units.UnitBase, computed fresh by
+        # arithmetic (see `_elementwise`), never blindly copied by it
+        self._unit: Any = None
+
+    def _labeled_like(self, result: Self) -> Self:
+        """Copy this array's `labeled` ``dims`` onto ``result``; returns it."""
+        result._dims = self._dims
+        return result
 
     def _with_storage(self, storage: Array) -> Self:
         """Return an array with this layout and type that owns ``storage``."""
-        return type(self)(self._layout, storage)
+        return self._labeled_like(type(self)(self._layout, storage))
+
+    def labeled(self, *dims: str) -> Self:
+        """Attach axis names, for `to_xarray` to use as its default ``dims``.
+
+        Not part of the layout: a reshape, reduction, selection, `concatenate`
+        or `stack` does not carry them over, since what the result's axes mean
+        is not always obvious; call `labeled` again on the result if needed.
+        Operations that keep every axis as it was (elementwise arithmetic,
+        halo updates, `copy`, `astype`, `redistribute`, `rebalance`) do, since
+        which axis is which does not change when the values do.
+
+        A name for the array itself is deliberately not part of this: unlike
+        axis names, it describes what the *values* are, which arithmetic can
+        silently invalidate with no way for mpiarray to tell. Units have the
+        same problem in general, but `set_units` solves it by computing the
+        correct resulting unit for arithmetic instead of copying the old one.
+
+        Args:
+            dims: One name per axis, in order.
+
+        Returns:
+            This array (not a copy), for chaining, e.g.
+            ``mpa.zeros((64, 48)).labeled("x", "y")``.
+
+        Raises:
+            ValueError: If ``dims`` does not have one name per axis.
+        """
+        if len(dims) != self.ndim:
+            raise ValueError(
+                f"labeled() needs one name per axis; got {len(dims)} for a "
+                f"{self.ndim}-D array",
+            )
+        self._dims = dims
+        return self
+
+    @property
+    def dims(self) -> tuple[str, ...] | None:
+        """The axis names set by `labeled`, or ``None``."""
+        return self._dims
+
+    def set_units(self, unit: Any) -> Self:
+        """Attach a unit (needs astropy), computed correctly through arithmetic.
+
+        Unlike `labeled`'s ``dims``, a unit *is* carried through arithmetic —
+        correctly, not blindly: ``(a * b).units`` is the astropy combination
+        of ``a``'s and ``b``'s units (e.g. ``eV m``, not ``a``'s unit
+        unchanged), incompatible units raise instead of silently combining
+        (``a[eV] + a[m]``), and a function that needs a dimensionless input
+        (``sin``, ``exp``, ...) raises if the unit is not dimensionless. An
+        operation this module does not know how to combine units for raises,
+        rather than guessing; see `mpiarray._units` for exactly what is
+        covered. `copy`, `astype`, `redistribute`, `rebalance` and halo
+        updates keep the unit unchanged, the same as `labeled`'s ``dims``; a
+        reshape, selection, `concatenate` or `stack` drops it, the same as
+        ``dims``. Axis and index reductions are not supported with units.
+
+        Needs astropy, installed separately (``pip install astropy``, or the
+        ``units`` extra); imported lazily, so ``import mpiarray`` and arrays
+        with no unit attached never need it.
+
+        Args:
+            unit: An ``astropy.units.UnitBase``, or a string astropy can
+                parse (e.g. ``"eV"``), or ``None`` to clear the unit.
+
+        Returns:
+            This array (not a copy), for chaining, e.g.
+            ``mpa.zeros((64, 48)).labeled("x", "y").set_units("eV")``.
+        """
+        from mpiarray import _units
+
+        self._unit = _units.parse(unit)
+        return self
+
+    @property
+    def units(self) -> Any:
+        """The unit set by `set_units` (an ``astropy.units.UnitBase``), or ``None``."""
+        return self._unit
 
     # ------------------------------------------------------------------ #
     # Properties
@@ -258,9 +345,19 @@ class DistributedArray:
         """This rank's storage: the block and its halo cells (writable)."""
         return self._data
 
+    def _with_same_unit(self, result: Self) -> Self:
+        """Copy this array's unit (set by `set_units`) onto ``result``; returns it.
+
+        For operations that keep every value's physical meaning unchanged
+        (``copy``, ``astype``, ``redistribute``, ``rebalance``) — never for
+        arithmetic, which computes its own result unit (see `_elementwise`).
+        """
+        result._unit = self._unit
+        return result
+
     def copy(self) -> Self:
         """Return an independent copy with the same layout, halo cells included."""
-        return self._with_storage(self._data.copy())
+        return self._with_same_unit(self._with_storage(self._data.copy()))
 
     def astype(self, dtype: DTypeLike, copy: bool = True) -> Self:
         """Return the array converted to ``dtype``.
@@ -275,7 +372,7 @@ class DistributedArray:
         """
         if not copy and xp.dtype(dtype) == self.dtype:
             return self
-        return self._with_storage(self._data.astype(dtype))
+        return self._with_same_unit(self._with_storage(self._data.astype(dtype)))
 
     # ------------------------------------------------------------------ #
     # Gathering and global indexing
@@ -344,6 +441,80 @@ class DistributedArray:
         """
         gathered = self.gather(root)
         return None if gathered is None else xp.to_numpy(gathered)
+
+    def to_xarray(
+        self,
+        dims: Sequence[str] | None = None,
+        *,
+        name: str | None = None,
+        attrs: dict[str, Any] | None = None,
+        root: int | None = None,
+        coords: dict[str, Any] | None = None,
+        **axis_coords: Any,
+    ) -> Any:
+        """Return this array gathered and labeled as an ``xarray.DataArray`` (needs xarray).
+
+        See `mpiarray.xarray.to_xarray`. Collective; see `gather`.
+
+        Args:
+            dims: One name per axis, in order; default: `dims`, set by
+                `labeled`.
+            name: The result's name.
+            attrs: Attributes attached to the result (e.g. ``{"units": "eV"}``).
+            root: The rank that receives the array; default: every rank.
+            coords: Coordinate values, as ``xarray.DataArray`` accepts them
+                (e.g. a dict of dim name to a 1-D array); merged with
+                ``**axis_coords``, for an axis named like one of this
+                method's own parameters.
+            **axis_coords: Coordinate values keyed by axis name, e.g.
+                ``x=x_values`` for a `labeled` ``"x"`` axis.
+
+        Returns:
+            The labeled array, or ``None`` on a rank `gather` left out.
+
+        Raises:
+            ValueError: If ``dims`` is not given and the array was not
+                labeled, or it does not have one name per axis.
+        """
+        from mpiarray.xarray import to_xarray
+
+        return to_xarray(
+            self, dims, name=name, attrs=attrs, root=root, coords=coords, **axis_coords
+        )
+
+    def to_petsc(self, vec: Any = None) -> Any:
+        """Copy this rank's block into a global PETSc vector (needs petsc4py).
+
+        Local, without communication; halo cells are left out. See
+        `mpiarray.petsc.copy_to_petsc`.
+
+        Args:
+            vec: The ``PETSc.Vec`` to fill; default: a new global vector of
+                ``self.layout.dmda()`` (the cached DMDA; collective the first
+                time it is built for this layout).
+
+        Returns:
+            The filled vector.
+        """
+        from mpiarray.petsc import copy_to_petsc
+
+        if vec is None:
+            vec = self._layout.dmda().createGlobalVec()
+        copy_to_petsc(self, vec)
+        return vec
+
+    def copy_from_petsc(self, vec: Any) -> None:
+        """Overwrite this rank's block from a global PETSc vector (needs petsc4py).
+
+        Local; halo cells are left untouched. See
+        `mpiarray.petsc.copy_from_petsc`.
+
+        Args:
+            vec: A global vector of ``self.layout.dmda()``.
+        """
+        from mpiarray.petsc import copy_from_petsc
+
+        copy_from_petsc(vec, self)
 
     def local_index(self, index: int | tuple[int, ...]) -> tuple[int, ...] | None:
         """Return where a global index lies in this rank's storage.
@@ -432,8 +603,44 @@ class DistributedArray:
 
         Args:
             index: A global index, as for a NumPy array of shape `shape`.
-            value: The value to write, broadcast to the selection.
+            value: The value to write, broadcast to the selection. Compatible
+                Quantity or distributed values are converted to this array's unit.
+                Bare numbers are dimensionless; writing them to a dimensional
+                array raises. Unit-bearing integer assignments reject precision
+                loss or overflow. Direct writes to ``local`` remain raw numeric writes.
         """
+        from mpiarray import _units
+
+        source_unit = _units.unit_of(value)
+        factor = _units.conversion_factor(source_unit, self._unit, "assignment")
+        # Validate units on every rank before either gathering the RHS or writing.
+        value = (
+            value._gather_all()
+            if isinstance(value, DistributedArray)
+            else _units.raw(value)
+        )
+        if factor != 1:
+            value = xp.asarray(value) * factor
+        if (
+            source_unit is not None or self._unit is not None
+        ) and self.dtype.kind in "iu":
+            numeric = xp.asarray(value)
+            if numeric.dtype.kind == "c":
+                raise TypeError(
+                    "unit assignment to an integer array would lose precision"
+                )
+            with np.errstate(invalid="ignore", over="ignore"):
+                converted = numeric.astype(self.dtype)
+            exact = converted == numeric
+            if numeric.dtype.kind == "f":
+                limits = np.iinfo(self.dtype)
+                # Exclusive powers of two stay exact when integer maxima do not.
+                exact &= (numeric >= limits.min) & (numeric < limits.max + 1)
+            if not bool(xp.all(exact)):
+                raise TypeError(
+                    "unit assignment to an integer array would lose precision"
+                )
+            value = converted
         basic = self._normalize_basic_index(index)
         if basic is not None:
             self._assign_basic(basic, value)
@@ -611,7 +818,7 @@ class DistributedArray:
         storage = xp.zeros(layout.storage_shape, dtype=self.dtype)
         if not source.distributed:  # every rank holds the whole array
             storage[layout.interior] = self.local[layout.global_slices()]
-            return type(self)(layout, storage)
+            return self._with_same_unit(self._labeled_like(type(self)(layout, storage)))
         boxes: list[Box | None] = [
             source.index_bounds_of(r) for r in range(source.size)
         ]
@@ -625,7 +832,7 @@ class DistributedArray:
         )
         for _, box, piece in pieces:
             storage[local_index(box, layout.index_bounds, layout.halo)] = piece
-        return type(self)(layout, storage)
+        return self._with_same_unit(self._labeled_like(type(self)(layout, storage)))
 
     def rebalance(self, weights: Any) -> Self:
         """Return the array moved to blocks of about equal weight; see `Layout.weighted`.
@@ -657,8 +864,6 @@ class DistributedArray:
         ``value`` must be the same on every rank and broadcast to the shape of
         the selection. No communication happens, and halo cells are untouched.
         """
-        if isinstance(value, DistributedArray):
-            value = value._gather_all()
         selection_shape, own = self._selection_plan(index, self._layout.rank)
         # Broadcast on every rank, so a bad value raises everywhere alike.
         value = xp.broadcast_to(xp.asarray(value), selection_shape)
@@ -1234,9 +1439,23 @@ class DistributedArray:
 
         Without ``out`` the results get zero halo cells; with ``out`` the
         results are written into the blocks of ``out``, whose halo cells are
-        left as they are.
+        left as they are. If any input has a unit (`set_units`), the result's
+        unit is computed (not copied) by `mpiarray._units.plan`, which may
+        also rescale one input to align a differently-scaled but equivalent
+        unit with the other's (e.g. ``J`` against ``eV``); astropy is only
+        imported here, when at least one input actually has a unit.
         """
-        local_inputs = [self._interior_of(self._coerce_other_data(x)) for x in inputs]
+        result_unit = None
+        rescale = {}
+        from mpiarray import _units
+
+        if any(_units.unit_of(x) is not None for x in inputs):
+            result_unit, rescale = _units.plan(op, inputs)
+        local_inputs = [
+            self._interior_of(self._coerce_other_data(_units.raw(x))) for x in inputs
+        ]
+        for index, factor in rescale.items():
+            local_inputs[index] = local_inputs[index] * factor
         where = kwargs.get("where", True)
         if where is not True:
             kwargs["where"] = self._interior_of(self._coerce_other_data(where))
@@ -1244,8 +1463,14 @@ class DistributedArray:
         if out is not None:
             for item in out:
                 self._check_compatibility(item)
+                if where is not True and item._unit != result_unit:
+                    raise ValueError(
+                        "masked out requires the result unit on the output"
+                    )
             views = tuple(item._data[interior] for item in out)
             op(*local_inputs, out=views[0] if len(views) == 1 else views, **kwargs)
+            for item in out:
+                item._unit = result_unit
             return out[0] if len(out) == 1 else out
         result = op(*local_inputs, **kwargs)
         wrapped = []
@@ -1253,7 +1478,9 @@ class DistributedArray:
             block = xp.asarray(block)
             storage = xp.zeros(self._layout.storage_shape, dtype=block.dtype)
             storage[interior] = block
-            wrapped.append(self._with_storage(storage))
+            wrapped_block = self._with_storage(storage)
+            wrapped_block._unit = result_unit
+            wrapped.append(wrapped_block)
         return tuple(wrapped) if isinstance(result, tuple) else wrapped[0]
 
     def _binary_op(self, other: Any, op: Callable) -> Self:
@@ -1289,6 +1516,14 @@ class DistributedArray:
         """
         if method != "__call__":
             return NotImplemented
+        if ufunc is np.matmul:
+            # a generalized ufunc, not a function, so __array_function__ never
+            # sees it; dispatched here instead, to the same `dot` as np.dot.
+            if kwargs.pop("out", None) is not None:
+                raise TypeError("np.matmul on distributed arrays takes no out")
+            if kwargs:
+                return NotImplemented
+            return _dot(*inputs)
         template = next(
             (item for item in inputs if isinstance(item, DistributedArray)),
             self,
@@ -1405,6 +1640,8 @@ class DistributedArray:
         Each rank reduces its own block; the partial results go to the ranks
         that own them in the result and are combined there.
         """
+        if self._unit is not None:
+            raise TypeError("units are not supported for axis reductions yet")
         axes = _normalize_axes(axis, self.ndim)
         if name in ("min", "max") and any(self.shape[a] == 0 for a in axes):
             raise ValueError(f"zero-size array to reduction operation {name}")
@@ -1438,6 +1675,8 @@ class DistributedArray:
         keepdims: bool,
     ) -> Any:
         """Return the variance along ``axis``: blocks combined with Chan et al.'s update."""
+        if self._unit is not None:
+            raise TypeError("units are not supported for axis variance yet")
         axes = _normalize_axes(axis, self.ndim)
         if len(axes) == self.ndim and not keepdims:
             return self.var(dtype=dtype, ddof=ddof)
@@ -1492,6 +1731,8 @@ class DistributedArray:
 
     def _arg_extremum(self, name: str, axis: int | None, keepdims: bool) -> Any:
         """Return ``argmin``/``argmax``: a global flat index, or indices along ``axis``."""
+        if self._unit is not None:
+            raise TypeError(f"units are not supported for {name} yet")
         if self.dtype.kind == "c":
             raise TypeError(f"{name} is not supported for dtype {self.dtype}")
         if self.size == 0:
@@ -1547,10 +1788,21 @@ class DistributedArray:
             empty[index] = False
         return self._with_layout(target, best[1].astype(np.int64))
 
-    def _finish(self, value: Scalar, keepdims: bool) -> Scalar | Array:
-        """Apply ``keepdims`` to the result of a whole-array reduction."""
+    def _finish(
+        self, value: Scalar, keepdims: bool, unit: Any = None
+    ) -> Scalar | Array:
+        """Apply ``keepdims``, and ``unit`` if given, to a whole-array reduction.
+
+        Callers pass a raw, already-combined host value and its computed unit.
+        Unit-bearing results stay on the host, including with ``keepdims``;
+        boolean reductions omit the unit.
+        """
         if keepdims:
-            return xp.full((1,) * self.ndim, value)
+            value = (np if unit is not None else xp).full((1,) * self.ndim, value)
+        if unit is not None:
+            from mpiarray import _units
+
+            value = _units.wrap_scalar(value, unit)
         return value
 
     @staticmethod
@@ -1587,7 +1839,9 @@ class DistributedArray:
         self._reject_out(out)
         if axis is None:
             return self._finish(
-                self._global_reduction("sum", xp.sum, MPI.SUM, dtype=dtype), keepdims
+                self._global_reduction("sum", xp.sum, MPI.SUM, dtype=dtype),
+                keepdims,
+                unit=self._unit,
             )
         return self._reduce_along("sum", axis, keepdims, dtype=dtype)
 
@@ -1615,8 +1869,16 @@ class DistributedArray:
 
         Raises:
             TypeError: If ``out`` is given.
+            TypeError: If the array has a unit (`set_units`): the product's
+                unit depends on the element count (``unit ** n``), which
+                is not supported yet.
         """
         self._reject_out(out)
+        if self._unit is not None:
+            raise TypeError(
+                "prod() does not support a unit-bearing array: the result's "
+                "unit depends on the element count",
+            )
         if axis is None:
             return self._finish(
                 self._global_reduction("prod", xp.prod, MPI.PROD, dtype=dtype), keepdims
@@ -1650,7 +1912,9 @@ class DistributedArray:
         self._reject_out(out)
         if axis is None:
             return self._finish(
-                self._global_reduction("min", xp.min, MPI.MIN), keepdims
+                self._global_reduction("min", xp.min, MPI.MIN),
+                keepdims,
+                unit=self._unit,
             )
         return self._reduce_along("min", axis, keepdims)
 
@@ -1681,7 +1945,9 @@ class DistributedArray:
         self._reject_out(out)
         if axis is None:
             return self._finish(
-                self._global_reduction("max", xp.max, MPI.MAX), keepdims
+                self._global_reduction("max", xp.max, MPI.MAX),
+                keepdims,
+                unit=self._unit,
             )
         return self._reduce_along("max", axis, keepdims)
 
@@ -1712,7 +1978,11 @@ class DistributedArray:
         """
         self._reject_out(out)
         if axis is None:
-            return self._finish(self.sum(dtype=dtype) / self.size, keepdims)
+            return self._finish(
+                self._global_reduction("sum", xp.sum, MPI.SUM, dtype=dtype) / self.size,
+                keepdims,
+                unit=self._unit,
+            )
         total = self._reduce_along("sum", axis, keepdims, dtype=dtype)
         return total / math.prod(
             self.shape[a] for a in _normalize_axes(axis, self.ndim)
@@ -1770,7 +2040,11 @@ class DistributedArray:
             mean = mean + delta * n / (total + n)
             m2 = m2 + block_m2 + abs(delta) ** 2 * total * n / (total + n)
             total += n
-        return self._finish(m2 / (total - ddof), keepdims)
+        return self._finish(
+            m2 / (total - ddof),
+            keepdims,
+            unit=None if self._unit is None else self._unit**2,
+        )
 
     def std(
         self,
@@ -1802,7 +2076,11 @@ class DistributedArray:
         variance = self.var(
             axis=axis, dtype=dtype, out=out, ddof=ddof, keepdims=keepdims
         )
-        if isinstance(variance, DistributedArray) or (axis is None and not keepdims):
+        if (
+            self._unit is not None
+            or isinstance(variance, DistributedArray)
+            or (axis is None and not keepdims)
+        ):
             return np.sqrt(variance)
         return xp.sqrt(variance)
 
@@ -1974,11 +2252,16 @@ class DistributedArray:
         """Run the distributed version of a NumPy function, if there is one.
 
         Reductions, ``argmin``/``argmax``, ``cumsum``/``cumprod``, ``where``,
-        ``clip``, ``round``, ``real``/``imag``, ``isclose``, ``allclose``,
-        ``array_equal``, ``linalg.norm``, ``vdot``, ``copy``, the ``*_like``
-        functions, ``shape``/``ndim``/``size`` and ``astype`` work like their
-        NumPy versions. Any other NumPy function raises ``TypeError`` instead
-        of quietly gathering the array; call ``gather()`` first for those.
+        ``clip``, ``round``, ``real``/``imag``/``angle``, ``isclose``,
+        ``allclose``, ``array_equal``, ``linalg.norm``, ``vdot``,
+        ``dot``/``matmul`` (two 1-D arrays), ``concatenate``/``stack`` (along
+        an axis none of the arrays split), ``copy``, the ``*_like`` functions,
+        ``shape``/``ndim``/``size`` and ``astype`` work like their NumPy
+        versions. NumPy's ufuncs (``sin``, ``maximum``, ``isnan``, ...) work
+        through `__array_ufunc__` instead, and are aliased at module level in
+        `mpiarray.ufuncs`. Any other NumPy function raises ``TypeError``
+        instead of quietly gathering the array; call ``gather()`` first for
+        those.
 
         Args:
             func: The NumPy function.
@@ -2013,9 +2296,45 @@ class DistributedArray:
         if not isinstance(other, DistributedArray):
             raise TypeError("vdot needs another DistributedArray")
         self._check_compatibility(other)
-        return self._allreduce(xp.vdot(self.local, other.local), MPI.SUM, "vdot")
+        from mpiarray import _units
 
-    def norm(self, ord: float = 2) -> float:
+        return self._finish(
+            self._allreduce(xp.vdot(self.local, other.local), MPI.SUM, "vdot"),
+            False,
+            unit=_units.combine_multiplicative(self._unit, other._unit),
+        )
+
+    def dot(self, other: DistributedArray) -> Scalar:
+        """Return ``sum(self * other)`` over the whole array, on every rank.
+
+        Like ``numpy.dot`` on two 1-D arrays: unlike `vdot`, complex values
+        are not conjugated. Halo cells are excluded. Collective.
+
+        Args:
+            other: A 1-D array with the same layout.
+
+        Returns:
+            The dot product, a host scalar.
+
+        Raises:
+            TypeError: If ``other`` is not a `DistributedArray`, or either
+                array is not 1-D.
+            ValueError: If the layouts differ.
+        """
+        if not isinstance(other, DistributedArray):
+            raise TypeError("dot needs another DistributedArray")
+        if self.ndim != 1 or other.ndim != 1:
+            raise TypeError("dot on distributed arrays needs two 1-D arrays (vectors)")
+        self._check_compatibility(other)
+        from mpiarray import _units
+
+        return self._finish(
+            self._allreduce(xp.dot(self.local, other.local), MPI.SUM, "dot"),
+            False,
+            unit=_units.combine_multiplicative(self._unit, other._unit),
+        )
+
+    def norm(self, ord: float = 2) -> Any:
         """Return the vector norm of the whole array, on every rank.
 
         Halo cells are excluded. Collective.
@@ -2031,13 +2350,22 @@ class DistributedArray:
             ValueError: For any other ``ord``.
         """
         if ord == 2:
-            return float(np.sqrt(np.real(self.vdot(self))))
+            value = self._allreduce(xp.vdot(self.local, self.local), MPI.SUM, "vdot")
+            return self._finish(float(np.sqrt(np.real(value))), False, self._unit)
         local = xp.abs(self.local)
         if ord == 1:
-            return float(self._allreduce(xp.sum(local), MPI.SUM, "norm(1)"))
+            return self._finish(
+                float(self._allreduce(xp.sum(local), MPI.SUM, "norm(1)")),
+                False,
+                self._unit,
+            )
         if ord == np.inf:
             local_max = xp.max(local) if local.size else 0.0
-            return float(self._allreduce(local_max, MPI.MAX, "norm(inf)"))
+            return self._finish(
+                float(self._allreduce(local_max, MPI.MAX, "norm(inf)")),
+                False,
+                self._unit,
+            )
         raise ValueError(f"unsupported norm order {ord!r}; use 1, 2 or numpy.inf")
 
     def allreduce_replicated(self, op: MPI.Op | None = None) -> None:
@@ -2050,7 +2378,9 @@ class DistributedArray:
         Collective.
 
         Args:
-            op: The MPI reduction; default: ``MPI.SUM``.
+            op: The MPI reduction; default: ``MPI.SUM``. With units, SUM,
+                MIN and MAX preserve them, and PROD raises them to the number
+                of ranks. Other operations raise. Units must agree on all ranks.
 
         Raises:
             ValueError: If the array is split, so that the ranks hold different
@@ -2064,12 +2394,29 @@ class DistributedArray:
                 "allreduce_replicated needs every rank to hold the whole array "
                 "(split=None), but this array is split over the ranks",
             )
-        data = xp.ascontiguousarray(self._data)
         check_collective(layout.comm, "allreduce_replicated")
+        # All ranks participate, including ranks without a unit: disagreement must
+        # raise everywhere before any rank enters the buffer collective.
+        units = layout.comm.allgather(self._unit)
+        if any(unit != units[0] for unit in units):
+            raise ValueError(
+                "allreduce_replicated requires the same unit on every rank"
+            )
+        result_unit = self._unit
+        operation = MPI.SUM if op is None else op
+        if result_unit is not None:
+            if operation == MPI.PROD:
+                result_unit = result_unit**layout.size
+            elif operation not in (MPI.SUM, MPI.MIN, MPI.MAX):
+                raise TypeError(
+                    "units are not supported for this replicated MPI reduction"
+                )
+        data = xp.ascontiguousarray(self._data)
         with xp.mpi.mpi_buffer(data, recv=True) as buf:
-            layout.comm.Allreduce(MPI.IN_PLACE, buf, op=MPI.SUM if op is None else op)
+            layout.comm.Allreduce(MPI.IN_PLACE, buf, op=operation)
         if data is not self._data:
             self._data[...] = data
+        self._unit = result_unit
 
     # ------------------------------------------------------------------ #
     # Python protocols
@@ -2256,16 +2603,31 @@ def _clip(a: Any, a_min: Any = None, a_max: Any = None, **kwargs: Any) -> Any:
 
 
 def _isclose(
-    a: Any, b: Any, rtol: float = 1e-05, atol: float = 1e-08, equal_nan: bool = False
+    a: Any, b: Any, rtol: Any = 1e-05, atol: Any = 1e-08, equal_nan: bool = False
 ) -> Any:
-    def isclose(x: Any, y: Any) -> Any:
-        return xp.isclose(x, y, rtol=rtol, atol=atol, equal_nan=equal_nan)
+    from mpiarray import _units
 
-    return _template(a, b)._elementwise(isclose, (a, b))
+    template = _template(a, b)
+
+    def tolerance(value: Any, unit: Any, name: str) -> Any:
+        # Bare tolerances are numeric in the comparison's unit (NumPy convention).
+        scale = 1.0
+        if _units.unit_of(value) is not None:
+            scale = _units.conversion_factor(_units.unit_of(value), unit, name)
+        local = template._interior_of(template._coerce_other_data(_units.raw(value)))
+        return local if scale == 1 else local * scale
+
+    local_atol = tolerance(atol, _units.unit_of(a), "atol")
+    local_rtol = tolerance(rtol, None, "rtol")
+
+    def isclose(x: Any, y: Any) -> Any:
+        return xp.isclose(x, y, rtol=local_rtol, atol=local_atol, equal_nan=equal_nan)
+
+    return template._elementwise(isclose, (a, b))
 
 
 def _allclose(
-    a: Any, b: Any, rtol: float = 1e-05, atol: float = 1e-08, equal_nan: bool = False
+    a: Any, b: Any, rtol: Any = 1e-05, atol: Any = 1e-08, equal_nan: bool = False
 ) -> bool:
     return bool(_isclose(a, b, rtol=rtol, atol=atol, equal_nan=equal_nan).all())
 
@@ -2283,7 +2645,10 @@ def _array_equal(a: Any, b: Any, equal_nan: bool = False) -> bool:
 
 
 def _round(a: DistributedArray, decimals: int = 0) -> Any:
-    return a._elementwise(lambda x: x.round(decimals), (a,))
+    def round(x: Any) -> Any:
+        return x.round(decimals)
+
+    return a._elementwise(round, (a,))
 
 
 def _norm(
@@ -2300,6 +2665,127 @@ def _norm(
     raise TypeError(
         f"np.linalg.norm(ord={ord!r}) is not supported for {x.ndim}-D distributed arrays"
     )
+
+
+def _dot(a: Any, b: Any, out: Any = None) -> Scalar:
+    if out is not None:
+        raise TypeError("np.dot/np.matmul on distributed arrays take no out")
+    template = _template(a, b)
+    other = b if template is a else a
+    if not isinstance(other, DistributedArray):
+        raise TypeError(
+            "np.dot/np.matmul on distributed arrays need two DistributedArrays"
+        )
+    return template.dot(other)
+
+
+def _axis_matches(a: Layout, b: Layout, skip: int) -> bool:
+    """Return whether layouts ``a`` and ``b`` agree everywhere but axis ``skip``."""
+    same_comm = a.comm is b.comm or bool(a.comm == b.comm)
+    return (
+        same_comm
+        and a.halo == b.halo
+        and a.periodic == b.periodic
+        and a.process_grid == b.process_grid
+        and all(
+            a.bounds[axis] == b.bounds[axis] for axis in range(a.ndim) if axis != skip
+        )
+    )
+
+
+def _bounds_layout(
+    layout: Layout,
+    shape: tuple[int, ...],
+    bounds: Sequence[Sequence[int] | None],
+    halo: tuple[int, ...],
+    periodic: tuple[bool, ...],
+) -> Layout:
+    """Return a layout of ``shape``, replicated like ``layout`` or split at ``bounds``.
+
+    A non-distributed ``layout`` (one rank, or every rank holding everything)
+    has no process grid for explicit ``bounds`` to imply, so it is rebuilt
+    with ``split=None`` instead.
+    """
+    if not layout.distributed:
+        return Layout(shape, comm=layout.comm, split=None, halo=halo, periodic=periodic)
+    return Layout(shape, comm=layout.comm, bounds=bounds, halo=halo, periodic=periodic)
+
+
+def _concatenate(arrays: Sequence[Any], axis: int = 0, **kwargs: Any) -> Any:
+    if kwargs:
+        raise TypeError(
+            "np.concatenate on distributed arrays takes no further keyword arguments"
+        )
+    # NumPy's dispatch needs a relevant argument to route here at all, so
+    # ``arrays`` is never empty (``np.concatenate([])`` never reaches this
+    # function; it is NumPy's own ValueError, before any dispatch).
+    arrays = list(arrays)
+    if not all(isinstance(a, DistributedArray) for a in arrays):
+        raise TypeError(
+            "np.concatenate on distributed arrays needs every array to be one"
+        )
+    template = arrays[0]
+    ndim = template.ndim
+    axis = _normalize_axes(axis, ndim)[0]
+    layout = template._layout
+    if layout.distributed and axis in layout.split:
+        raise TypeError(
+            "np.concatenate on distributed arrays needs an axis outside the split axes"
+        )
+    for other in arrays[1:]:
+        if other.ndim != ndim or not _axis_matches(other._layout, layout, axis):
+            raise ValueError(
+                "np.concatenate needs arrays with the same layout except along axis"
+            )
+    local = xp.concatenate([a.local for a in arrays], axis=axis)
+    new_length = local.shape[axis]
+    shape = tuple(
+        new_length if ax == axis else template.shape[ax] for ax in range(ndim)
+    )
+    bounds = [
+        (0, new_length) if ax == axis else layout.bounds[ax] for ax in range(ndim)
+    ]
+    target = _bounds_layout(layout, shape, bounds, layout.halo, layout.periodic)
+    return template._with_layout(target, local)
+
+
+def _stack(arrays: Sequence[Any], axis: int = 0, **kwargs: Any) -> Any:
+    if kwargs:
+        raise TypeError(
+            "np.stack on distributed arrays takes no further keyword arguments"
+        )
+    # see _concatenate: NumPy's dispatch guarantees ``arrays`` is non-empty.
+    arrays = list(arrays)
+    if not all(isinstance(a, DistributedArray) for a in arrays):
+        raise TypeError("np.stack on distributed arrays needs every array to be one")
+    template = arrays[0]
+    ndim = template.ndim + 1
+    axis = _normalize_axes(axis, ndim)[0]
+    layout = template._layout
+    for other in arrays[1:]:
+        if other.shape != template.shape:
+            raise ValueError("all input arrays must have the same shape")
+        template._check_compatibility(other)
+    local = xp.concatenate([xp.expand_dims(a.local, axis) for a in arrays], axis=axis)
+    shape: list[int] = []
+    bounds: list[tuple[int, ...]] = []
+    halo: list[int] = []
+    periodic: list[bool] = []
+    source = 0
+    for ax in range(ndim):
+        if ax == axis:
+            shape.append(len(arrays))
+            bounds.append((0, len(arrays)))
+            halo.append(0)
+            periodic.append(False)
+        else:
+            shape.append(template.shape[source])
+            bounds.append(layout.bounds[source])
+            halo.append(layout.halo[source])
+            periodic.append(layout.periodic[source])
+            source += 1
+    target = _bounds_layout(layout, tuple(shape), bounds, tuple(halo), tuple(periodic))
+    return template._with_layout(target, local)
 
 
 def _like(name: str) -> Callable:
@@ -2351,11 +2837,16 @@ _ARRAY_FUNCTIONS: dict[Callable, Callable] = {
     np.around: _round,
     np.real: lambda a: a._elementwise(lambda x: x.real, (a,)),
     np.imag: lambda a: a._elementwise(lambda x: x.imag, (a,)),
+    np.angle: lambda a, deg=False: a._elementwise(lambda x: xp.angle(x, deg=deg), (a,)),
     np.isclose: _isclose,
     np.allclose: _allclose,
     np.array_equal: _array_equal,
     np.linalg.norm: _norm,
     np.vdot: lambda a, b: _template(a, b).vdot(b if _template(a, b) is a else a),
+    np.dot: _dot,
+    # np.matmul is a generalized ufunc, not a function: see __array_ufunc__.
+    np.concatenate: _concatenate,
+    np.stack: _stack,
     np.shape: lambda a: a.shape,
     np.ndim: lambda a: a.ndim,
     np.size: lambda a, axis=None: a.size if axis is None else a.shape[axis],

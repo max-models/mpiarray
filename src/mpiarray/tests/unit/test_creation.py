@@ -113,6 +113,27 @@ def test_process_grid_and_split_must_agree() -> None:
             mpa.zeros((N, 3), process_grid=(size, 1), split=1)
 
 
+def test_bounds_sets_uneven_blocks_on_every_creation_function() -> None:
+    if size == 1:
+        cuts = (0, N)
+    else:
+        rest = [1 + chunk_bounds(N - 1, size - 1, i)[1] for i in range(size - 1)]
+        cuts = (0, 1, *rest)
+    zeros = mpa.zeros(N, bounds=[cuts])
+    assert zeros.layout.bounds == (cuts,)
+    assert mpa.ones(N, bounds=[cuts]).layout.bounds == (cuts,)
+    assert mpa.empty(N, bounds=[cuts]).layout.bounds == (cuts,)
+    assert mpa.full(N, 1.0, bounds=[cuts]).layout.bounds == (cuts,)
+    assert mpa.array(list(range(N)), bounds=[cuts]).layout.bounds == (cuts,)
+    assert mpa.asarray(list(range(N)), bounds=[cuts]).layout.bounds == (cuts,)
+    assert mpa.arange(N, bounds=[cuts]).layout.bounds == (cuts,)
+    assert mpa.linspace(0, N, N, bounds=[cuts]).layout.bounds == (cuts,)
+    assert mpa.fromfunction(lambda i: i, N, bounds=[cuts]).layout.bounds == (cuts,)
+    redistributed = mpa.array(mpa.arange(N), bounds=[cuts])  # moves to the new cuts
+    assert redistributed.layout.bounds == (cuts,)
+    np.testing.assert_array_equal(_np(redistributed.gather()), np.arange(N))
+
+
 def test_debug_check_accepts_identical_data(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MPIARRAY_DEBUG", "1")
     np.testing.assert_array_equal(_np(mpa.array(list(range(N))).gather()), range(N))

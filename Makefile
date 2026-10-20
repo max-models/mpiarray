@@ -1,7 +1,7 @@
 # Development environment (uv), README (Quarto) and the documentation site (docs/, Astro + Starlight).
-# Notebook tool: docs/tools/notebooks.py.
+# Notebook tool: starlight-notebooks, from @max-models/starlight-theme (docs/node_modules).
 PYTHON ?= .venv/bin/python
-NOTEBOOKS = $(PYTHON) docs/tools/notebooks.py
+NOTEBOOKS = cd docs && $(DOCS_ENV) npx starlight-notebooks
 DOCS_ENV = DOCS_PYTHON=$(shell $(PYTHON) -c "import sys; print(sys.executable)")
 FORCE ?=
 # Open MPI needs --oversubscribe for more ranks than cores; with MPICH: make coverage MPIEXEC=mpiexec
@@ -45,7 +45,7 @@ docs-install:  ## Python docs extra and the npm packages
 	$(PYTHON) -m pip install -e ".[docs]"
 	cd docs && npm ci
 
-docs-notebooks:  ## execute the changed tutorials and convert all of them (FORCE=1 reruns all)
+docs-notebooks:  ## execute the changed guides and convert all of them (FORCE=1 reruns all)
 	$(NOTEBOOKS) execute $(if $(FORCE),--force,)
 	$(NOTEBOOKS) convert
 
@@ -53,8 +53,7 @@ docs-dev:  ## live preview at http://localhost:4321/mpiarray/
 	$(NOTEBOOKS) convert
 	cd docs && $(DOCS_ENV) DOCS_VALIDATE_LINKS=false npm run dev
 
-docs-build:  ## the static site in docs/dist, as in CI
-	$(NOTEBOOKS) convert
+docs-build:  ## execute notebooks and build the static site in docs/dist, as in CI
 	cd docs && npm run check:mdx && $(DOCS_ENV) npm run build
 
 docs-preview:  ## serve docs/dist
