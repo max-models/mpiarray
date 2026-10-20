@@ -7,6 +7,7 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- The combined coverage of the serial and MPI runs must be at least 95% (was 100%).
 - `__version__` is read from the installed package metadata (`importlib.metadata`), not hardcoded,
   so it can no longer disagree with `pyproject.toml` (the 0.2.1 wheel reported 0.1.0).
 
