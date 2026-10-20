@@ -5,7 +5,7 @@ requires = [ "setuptools", "wheel" ]
 
 [project]
 name = "mpiarray"
-version = "0.2.0"
+version = "0.2.1"
 description = "MPI domain decomposition and distributed NumPy/CuPy arrays with halo exchange."
 readme = "README.md"
 keywords = [ "array", "cupy", "domain decomposition", "halo exchange", "mpi", "numpy" ]
@@ -20,10 +20,10 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
 ]
-# cunumpy from its devel branch for now; PyPI rejects direct references, so switch
-# to a version range ("cunumpy>=0.6") before a release
+# PyPI rejects direct references (git URLs), so the published requirement is a version range; the
+# development environment (uv sync) takes cunumpy from its devel branch, see [tool.uv.sources]
 dependencies = [
-  "cunumpy @ git+https://github.com/max-models/cunumpy.git@devel",
+  "cunumpy>=0.6.3",
   "maybempi>=0.1.2",
   "numpy",
 ]
@@ -116,3 +116,6 @@ include = [ "src" ]
 [tool.ty.analysis]
 # CuPy and petsc4py are optional and not installed in CI
 allowed-unresolved-imports = [ "cupy", "petsc4py" ]
+
+[tool.uv.sources]
+cunumpy = { git = "https://github.com/max-models/cunumpy.git", branch = "devel" }
