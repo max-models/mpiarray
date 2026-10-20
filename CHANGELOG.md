@@ -5,6 +5,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- `__version__` is read from the installed package metadata (`importlib.metadata`), not hardcoded,
+  so it can no longer disagree with `pyproject.toml` (the 0.2.1 wheel reported 0.1.0).
+
 ### Fixed
 
 - The published requirement on cunumpy is `cunumpy>=0.6.3` instead of a git URL, which PyPI rejects

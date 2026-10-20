@@ -17,6 +17,8 @@ backend call ``xp.mpi.mpi_is_cuda_aware(comm)`` or
 ``xp.mpi.set_mpi_cuda_aware(...)`` once at startup.
 """
 
+from importlib.metadata import PackageNotFoundError, version
+
 from mpiarray._mpi import default_comm
 from mpiarray.copy import CopyPlan, copy_boxes
 from mpiarray.creation import (
@@ -116,7 +118,10 @@ from mpiarray.ufuncs import (
 # xarray is imported only when a function here needs it
 from mpiarray.xarray import to_xarray
 
-__version__ = "0.1.0"
+try:
+    __version__ = version("mpiarray")
+except PackageNotFoundError:  # not installed, e.g. run from a source tree
+    __version__ = "0.0.0+unknown"
 
 __all__ = [
     "CopyPlan",
