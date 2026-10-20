@@ -5,6 +5,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- The published requirement on cunumpy is `cunumpy>=0.6.3` instead of a git URL, which PyPI rejects
+  ("Can't have direct dependency"), so 0.2.0 could not be uploaded. Development environments still
+  take cunumpy from its `devel` branch through `[tool.uv.sources]`.
+
 ### Added
 
 - `mpa.CopyPlan` and `mpa.copy_boxes`: copy boxes between arrays that live on different
