@@ -47,7 +47,7 @@ jobs:
         run: uv run pytest --cov --cov-report=xml --cov-report=term .
 
       # serially and on 2, 3, 4 and 6 ranks (some tests need exactly 2 or 6), with the
-      # coverage of all runs combined, which must be 100%
+      # coverage of all runs combined, which must be at least 95%
       - name: Run tests serially and under MPI with coverage
         if: matrix.mpi
         run: |
