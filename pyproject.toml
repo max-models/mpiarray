@@ -21,11 +21,13 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
 ]
 # PyPI rejects direct references (git URLs), so the published requirement is a version range; the
-# development environment (uv sync) takes cunumpy from its devel branch, see [tool.uv.sources]
+# development environment (uv sync) takes cunumpy and scope-profiler from their devel branches,
+# see [tool.uv.sources]
 dependencies = [
   "cunumpy>=0.6.3",
   "maybempi>=0.1.2",
   "numpy",
+  "scope-profiler>=0.7.5",
 ]
 
 optional-dependencies.dev = [
@@ -119,3 +121,4 @@ allowed-unresolved-imports = [ "cupy", "petsc4py" ]
 
 [tool.uv.sources]
 cunumpy = { git = "https://github.com/max-models/cunumpy.git", branch = "devel" }
+scope-profiler = { git = "https://github.com/max-models/scope-profiler", branch = "devel" }

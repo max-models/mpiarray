@@ -20,8 +20,10 @@ from typing import Any, cast
 
 import cunumpy as xp
 import numpy as np
+import scope_profiler as sp
 
 from mpiarray._mpi import MPI, Comm, check_collective
+from mpiarray._profiling import PROFILE_TAGS
 from mpiarray.creation import _HaloArg, _make_layout, _PeriodicArg, array
 from mpiarray.distributed_array import DistributedArray, _subarray
 from mpiarray.layout import DEFAULT, Layout, SplitArg
@@ -54,6 +56,7 @@ def _block_view(layout: Layout, dtype: np.dtype) -> tuple[Any, Any]:
     return dtlib.from_numpy_dtype(np.dtype(dtype)), filetype
 
 
+@sp.profile("mpiarray.save", tags=PROFILE_TAGS)
 def save(path: PathLike, a: DistributedArray) -> None:
     """Write ``a`` to a ``.npy`` file, each rank writing its own block.
 
@@ -89,6 +92,7 @@ def save(path: PathLike, a: DistributedArray) -> None:
         handle.Close()
 
 
+@sp.profile("mpiarray.load", tags=PROFILE_TAGS)
 def load(
     path: PathLike,
     *,
@@ -174,6 +178,7 @@ def _h5py() -> Any:
     return h5py
 
 
+@sp.profile("mpiarray.save_hdf5", tags=PROFILE_TAGS)
 def save_hdf5(
     path: PathLike,
     arrays: Mapping[str, DistributedArray],
@@ -225,6 +230,7 @@ def save_hdf5(
         comm.Barrier()
 
 
+@sp.profile("mpiarray.load_hdf5", tags=PROFILE_TAGS)
 def load_hdf5(
     path: PathLike,
     names: Sequence[str] | None = None,

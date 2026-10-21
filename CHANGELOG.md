@@ -19,6 +19,11 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Opt-in [scope-profiler](https://github.com/max-models/scope-profiler) regions (named
+  `mpiarray.<operation>`, tag `mpiarray`) for halo exchanges, gathers, redistribution,
+  reductions, copy plans, particle migration, stencils and I/O. They are off unless the
+  application enables the tag, e.g. `sp.setup(enable_tags=["mpiarray"])` or
+  `SCOPE_PROFILER_ENABLE_TAGS=mpiarray`. scope-profiler (>=0.7.5) is a new dependency.
 - `mpa.CopyPlan` and `mpa.copy_boxes`: copy boxes between arrays that live on different
   communicators, all made of ranks of one parent communicator, e.g. the patches of an adaptive
   mesh each on its own ranks. A target box may reach into the target's halo at its walls. The

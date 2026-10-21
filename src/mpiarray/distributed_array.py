@@ -23,10 +23,12 @@ from typing import TYPE_CHECKING, Any, TypeAlias, TypeGuard, cast, overload
 
 import cunumpy as xp
 import numpy as np
+import scope_profiler as sp
 from numpy.typing import DTypeLike
 
 from mpiarray._exchange import Box, exchange_boxes, local_index, target_ranks
 from mpiarray._mpi import MPI, check_collective
+from mpiarray._profiling import PROFILE_TAGS
 from mpiarray.layout import Layout
 
 if TYPE_CHECKING:
@@ -381,6 +383,7 @@ class DistributedArray:
     def gather(self, root: None = None) -> Array: ...
     @overload
     def gather(self, root: int) -> Array | None: ...
+    @sp.profile("mpiarray.gather", tags=PROFILE_TAGS)
     def gather(self, root: int | None = None) -> Array | None:
         """Return the whole global array, halo cells not included.
 
@@ -786,6 +789,7 @@ class DistributedArray:
             storage[local_index(box, target.index_bounds, target.halo)] = piece
         return type(self)(target, storage)
 
+    @sp.profile("mpiarray.redistribute", tags=PROFILE_TAGS)
     def redistribute(self, layout: Layout) -> Self:
         """Return the array moved to another layout of the same shape and communicator.
 
@@ -1240,6 +1244,7 @@ class DistributedArray:
 
         return HaloUpdate(finish)
 
+    @sp.profile("mpiarray.update_halos", tags=PROFILE_TAGS)
     def update_halos(
         self,
         axis: int | None = None,
@@ -1287,14 +1292,12 @@ class DistributedArray:
                 narrow blocks (on every rank).
         """
         self._check_boundary(boundary)
-        if wait:
+        # without ranks to send to, wait=False is done at once too
+        if wait or not self._layout.distributed:
             for ax in self._axes(axis):
                 self._exchange(self._exchanged_axes(ax), False).wait()
                 self._fill_walls(ax, boundary)
-            return None
-        if not self._layout.distributed:  # nothing to send: done at once
-            self.update_halos(axis, boundary=boundary)
-            return HaloUpdate(lambda: None)
+            return None if wait else HaloUpdate(lambda: None)
         if axis is not None:
             pending = self._exchange(self._exchanged_axes(axis), False)
 
@@ -1305,6 +1308,7 @@ class DistributedArray:
             return HaloUpdate(finish)
         return self._neighbourhood_exchange(accumulate=False, boundary=boundary)
 
+    @sp.profile("mpiarray.accumulate_halos", tags=PROFILE_TAGS)
     def accumulate_halos(
         self, axis: int | None = None, *, wait: bool = True
     ) -> HaloUpdate | None:
@@ -1566,9 +1570,11 @@ class DistributedArray:
         local_value = _host(local_value)
         if not self._layout.distributed:
             return local_value
-        check_collective(self._layout.comm, name)
-        return self._layout.comm.allreduce(local_value, op=mpi_op)
+        with sp.region("mpiarray.allreduce", tags=PROFILE_TAGS):
+            check_collective(self._layout.comm, name)
+            return self._layout.comm.allreduce(local_value, op=mpi_op)
 
+    @sp.profile("mpiarray.reduce", tags=PROFILE_TAGS)
     def _global_reduction(
         self, name: str, op: Callable, mpi_op: MPI.Op, **op_kwargs: Any
     ) -> Scalar:
@@ -1628,6 +1634,7 @@ class DistributedArray:
         ]
         return self._layout_like(shape, split), boxes, False
 
+    @sp.profile("mpiarray.reduce_along", tags=PROFILE_TAGS)
     def _reduce_along(
         self,
         name: str,
@@ -1679,7 +1686,8 @@ class DistributedArray:
             raise TypeError("units are not supported for axis variance yet")
         axes = _normalize_axes(axis, self.ndim)
         if len(axes) == self.ndim and not keepdims:
-            return self.var(dtype=dtype, ddof=ddof)
+            # not self.var(), which would record the "var" region a second time
+            return self._var_whole(dtype, ddof, False)
         local = self.local
         total = math.prod(self.shape[a] for a in axes)
         count = math.prod(local.shape[a] for a in axes)
@@ -1988,6 +1996,7 @@ class DistributedArray:
             self.shape[a] for a in _normalize_axes(axis, self.ndim)
         )
 
+    @sp.profile("mpiarray.var", tags=PROFILE_TAGS)
     def var(
         self,
         axis: int | tuple[int, ...] | None = None,
@@ -2018,6 +2027,12 @@ class DistributedArray:
         self._reject_out(out)
         if axis is not None:
             return self._var_along(axis, dtype, ddof, keepdims)
+        return self._var_whole(dtype, ddof, keepdims)
+
+    def _var_whole(
+        self, dtype: DTypeLike | None, ddof: int, keepdims: bool
+    ) -> Scalar | Array:
+        """Return the whole array's variance, for `var` and `_var_along`."""
         # Each rank's count, mean and sum of squared deviations, combined in
         # one collective with Chan et al.'s parallel update (numerically like
         # two passes, but one round of communication).
@@ -2394,29 +2409,30 @@ class DistributedArray:
                 "allreduce_replicated needs every rank to hold the whole array "
                 "(split=None), but this array is split over the ranks",
             )
-        check_collective(layout.comm, "allreduce_replicated")
-        # All ranks participate, including ranks without a unit: disagreement must
-        # raise everywhere before any rank enters the buffer collective.
-        units = layout.comm.allgather(self._unit)
-        if any(unit != units[0] for unit in units):
-            raise ValueError(
-                "allreduce_replicated requires the same unit on every rank"
-            )
-        result_unit = self._unit
-        operation = MPI.SUM if op is None else op
-        if result_unit is not None:
-            if operation == MPI.PROD:
-                result_unit = result_unit**layout.size
-            elif operation not in (MPI.SUM, MPI.MIN, MPI.MAX):
-                raise TypeError(
-                    "units are not supported for this replicated MPI reduction"
+        with sp.region("mpiarray.allreduce_replicated", tags=PROFILE_TAGS):
+            check_collective(layout.comm, "allreduce_replicated")
+            # All ranks participate, including ranks without a unit: disagreement must
+            # raise everywhere before any rank enters the buffer collective.
+            units = layout.comm.allgather(self._unit)
+            if any(unit != units[0] for unit in units):
+                raise ValueError(
+                    "allreduce_replicated requires the same unit on every rank"
                 )
-        data = xp.ascontiguousarray(self._data)
-        with xp.mpi.mpi_buffer(data, recv=True) as buf:
-            layout.comm.Allreduce(MPI.IN_PLACE, buf, op=operation)
-        if data is not self._data:
-            self._data[...] = data
-        self._unit = result_unit
+            result_unit = self._unit
+            operation = MPI.SUM if op is None else op
+            if result_unit is not None:
+                if operation == MPI.PROD:
+                    result_unit = result_unit**layout.size
+                elif operation not in (MPI.SUM, MPI.MIN, MPI.MAX):
+                    raise TypeError(
+                        "units are not supported for this replicated MPI reduction"
+                    )
+            data = xp.ascontiguousarray(self._data)
+            with xp.mpi.mpi_buffer(data, recv=True) as buf:
+                layout.comm.Allreduce(MPI.IN_PLACE, buf, op=operation)
+            if data is not self._data:
+                self._data[...] = data
+            self._unit = result_unit
 
     # ------------------------------------------------------------------ #
     # Python protocols
