@@ -40,6 +40,10 @@ and changelog manually.
 Open the PR against `devel`. CI runs the tests on every supported Python version, ruff, pyright, ty,
 the guides and the documentation build. One approving review is required to merge.
 
+A PR to `devel` is tested against the devel branches of the max-models dependencies, pinned in
+`uv.lock` (refresh them with `uv lock --upgrade-package cunumpy`); a PR to `main` uses their PyPI
+releases only.
+
 ## Releases
 
 Before merging a release to `main`, update the versions in `pyproject.toml`,
