@@ -20,8 +20,8 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
 ]
-# PyPI rejects direct references (git URLs), so the published requirement is a version range; the
-# development environment (uv sync) takes cunumpy from its devel branch, see [tool.uv.sources]
+# only version ranges: PyPI rejects direct references (git URLs); devel takes the max-models
+# packages from their devel branches, see [tool.uv.sources]
 dependencies = [
   "cunumpy>=0.6.3",
   "maybempi>=0.1.2",
@@ -117,5 +117,9 @@ include = [ "src" ]
 # CuPy and petsc4py are optional and not installed in CI
 allowed-unresolved-imports = [ "cupy", "petsc4py" ]
 
+# PRs to devel test against the devel branches of the max-models packages (pinned in
+# uv.lock); PRs to main and the release use PyPI only (CI sets UV_NO_SOURCES).
 [tool.uv.sources]
-cunumpy = { git = "https://github.com/max-models/cunumpy.git", branch = "devel" }
+cunumpy = { git = "https://github.com/max-models/cunumpy", branch = "devel" }
+maybempi = { git = "https://github.com/max-models/maybempi", branch = "devel" }
+plasma-plots = { git = "https://github.com/max-models/plasma-plots", branch = "devel" }

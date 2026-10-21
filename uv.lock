@@ -970,8 +970,8 @@ toml = [
 
 [[package]]
 name = "cunumpy"
-version = "0.7.0"
-source = { git = "https://github.com/max-models/cunumpy.git?branch=devel#d4b1969b61a91290d49227f8961d3f5007260567" }
+version = "0.7.1"
+source = { git = "https://github.com/max-models/cunumpy?branch=devel#9fb918b130b08a2c159005997186efdb5edacb4f" }
 dependencies = [
     { name = "array-api-compat" },
     { name = "maybempi" },
@@ -2307,11 +2307,7 @@ wheels = [
 [[package]]
 name = "maybempi"
 version = "0.1.2"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/c4/0d/ed782142085f56da45eb4511dd3fb2a7b1ed167fe5495dd429c61272774e/maybempi-0.1.2.tar.gz", hash = "sha256:0b0fadd2897281df50a2cf3f08ddf080d1ca00c9d2e4e5aee2af7cf5222ba04d", size = 42851, upload-time = "2026-10-07T05:38:48.594Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/88/d3/b161669937ee87dba4c61a6ac2be70bd1399269c76c66524e3f8be071839/maybempi-0.1.2-py3-none-any.whl", hash = "sha256:1fc9a2eb7e4f55a6b91da32e8e77bade35df157e6ce5de3b228cdf799e99970b", size = 47478, upload-time = "2026-10-07T05:38:47.046Z" },
-]
+source = { git = "https://github.com/max-models/maybempi?branch=devel#0146f000137c58b84381c176e03ffd2b3e191ce7" }
 
 [[package]]
 name = "mistune"
@@ -2375,7 +2371,7 @@ wheels = [
 
 [[package]]
 name = "mpiarray"
-version = "0.2.0"
+version = "0.2.1"
 source = { editable = "." }
 dependencies = [
     { name = "cunumpy" },
@@ -2457,7 +2453,7 @@ requires-dist = [
     { name = "astropy", marker = "extra == 'docs'" },
     { name = "astropy", marker = "extra == 'test'" },
     { name = "astropy", marker = "extra == 'units'" },
-    { name = "cunumpy", git = "https://github.com/max-models/cunumpy.git?branch=devel" },
+    { name = "cunumpy", git = "https://github.com/max-models/cunumpy?branch=devel" },
     { name = "griffe", marker = "extra == 'docs'" },
     { name = "h5py", marker = "extra == 'docs'" },
     { name = "h5py", marker = "extra == 'hdf5'" },
@@ -2466,14 +2462,14 @@ requires-dist = [
     { name = "jupyterlab", marker = "extra == 'dev'" },
     { name = "matplotlib", marker = "extra == 'docs'" },
     { name = "matplotlib", marker = "extra == 'test'" },
-    { name = "maybempi", specifier = ">=0.1.2" },
+    { name = "maybempi", git = "https://github.com/max-models/maybempi?branch=devel" },
     { name = "mpi4py", marker = "extra == 'mpi'" },
     { name = "mpiarray", extras = ["test", "docs", "mpi"], marker = "extra == 'dev'" },
     { name = "nbclient", marker = "extra == 'docs'", specifier = ">=0.10" },
     { name = "nbformat", marker = "extra == 'docs'", specifier = ">=5.10" },
     { name = "nbformat", marker = "extra == 'test'", specifier = ">=5.10" },
     { name = "numpy" },
-    { name = "plasma-plots", marker = "extra == 'docs'", specifier = ">=0.2.1" },
+    { name = "plasma-plots", marker = "extra == 'docs'", git = "https://github.com/max-models/plasma-plots?branch=devel" },
     { name = "pre-commit", marker = "extra == 'dev'" },
     { name = "pyproject-fmt", marker = "extra == 'dev'" },
     { name = "pyright", marker = "extra == 'dev'" },
@@ -3092,8 +3088,8 @@ wheels = [
 
 [[package]]
 name = "plasma-plots"
-version = "0.2.1"
-source = { registry = "https://pypi.org/simple" }
+version = "0.2.3"
+source = { git = "https://github.com/max-models/plasma-plots?branch=devel#3f5a1912711b693e53a6209bea14e10ec81ea0e3" }
 dependencies = [
     { name = "ipywidgets" },
     { name = "matplotlib", version = "3.10.9", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -3103,10 +3099,6 @@ dependencies = [
     { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "xarray", version = "2025.6.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "xarray", version = "2026.9.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/26/c3/376b3ce0c9850f030ec3451ad004d8fe9aeca6c3e13742ab787c440f2aad/plasma_plots-0.2.1.tar.gz", hash = "sha256:d4b90a9abb799db458ed38e851e08bb2b14ef17886d342bfb4d586f8ed4854ec", size = 417240, upload-time = "2026-10-11T15:26:51.456Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/4e/29/30c50e334875b4c5cc5d12f1467e3310e840a454683639fceec2293e4723/plasma_plots-0.2.1-py3-none-any.whl", hash = "sha256:fa27166a8f2d1ccca6ba7ec1856cadf16294b48014a197b7301407c2504ef088", size = 326945, upload-time = "2026-10-11T15:26:50.065Z" },
 ]
 
 [[package]]
