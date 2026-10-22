@@ -26,6 +26,7 @@ dependencies = [
   "cunumpy>=0.6.3",
   "maybempi>=0.1.2",
   "numpy",
+  "scope-profiler>=0.7.5",
 ]
 
 optional-dependencies.dev = [
@@ -123,3 +124,4 @@ allowed-unresolved-imports = [ "cupy", "petsc4py" ]
 cunumpy = { git = "https://github.com/max-models/cunumpy", branch = "devel" }
 maybempi = { git = "https://github.com/max-models/maybempi", branch = "devel" }
 plasma-plots = { git = "https://github.com/max-models/plasma-plots", branch = "devel" }
+scope-profiler = { git = "https://github.com/max-models/scope-profiler", branch = "devel" }

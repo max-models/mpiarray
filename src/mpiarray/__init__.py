@@ -19,7 +19,10 @@ backend call ``xp.mpi.mpi_is_cuda_aware(comm)`` or
 
 from importlib.metadata import PackageNotFoundError, version
 
+import scope_profiler as sp
+
 from mpiarray._mpi import default_comm
+from mpiarray._profiling import PROFILE_TAGS
 from mpiarray.copy import CopyPlan, copy_boxes
 from mpiarray.creation import (
     arange,
@@ -117,6 +120,10 @@ from mpiarray.ufuncs import (
 
 # xarray is imported only when a function here needs it
 from mpiarray.xarray import to_xarray
+
+# mpiarray's profiling regions (tagged "mpiarray") stay off unless the application
+# enables the tag
+sp.register_opt_in_tag(*PROFILE_TAGS)
 
 try:
     __version__ = version("mpiarray")

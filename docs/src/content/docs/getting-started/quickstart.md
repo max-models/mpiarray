@@ -62,6 +62,23 @@ xp.mpi.mpi_is_cuda_aware(MPI.COMM_WORLD)  # collective probe, or:
 xp.mpi.set_mpi_cuda_aware(True)  # MPI takes device buffers (default: through the host)
 ```
 
+## Profiling
+
+mpiarray ships [scope-profiler](https://github.com/max-models/scope-profiler) regions for
+its communication, reductions and I/O (`mpiarray.update_halos`, `mpiarray.gather`,
+`mpiarray.redistribute`, `mpiarray.reduce`, `mpiarray.save`, ...). They are off by default
+and cost well under a microsecond per call. A program that profiles itself with
+scope-profiler records them once it enables the `mpiarray` tag:
+
+```python
+import scope_profiler as sp
+
+sp.setup(enable_tags=["mpiarray"])  # or "*" for every library's regions
+```
+
+or, without changing the program, `SCOPE_PROFILER_ENABLE_TAGS=mpiarray` or
+`scope-profiler run --enable-tag mpiarray script.py`.
+
 ## Next steps
 
 - [Distributed arrays](/mpiarray/guides/distributed-arrays/): creating arrays, storage,

@@ -17,6 +17,7 @@ ALLOWED = {
     "cupy",  # lazily, in DistributedArray.to_cupy()
     "h5py",  # lazily, for save_hdf5/load_hdf5 (the hdf5 extra)
     "petsc4py",  # lazily, in mpiarray.petsc (installed separately)
+    "scope_profiler",  # the opt-in profiling regions (off unless enabled)
     "xarray",  # lazily, in mpiarray.xarray (the xarray extra)
     "typing_extensions",  # under TYPE_CHECKING only
 }

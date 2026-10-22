@@ -30,9 +30,11 @@ from typing import Any
 
 import cunumpy as xp
 import numpy as np
+import scope_profiler as sp
 
 from mpiarray._exchange import Box, local_index, overlap
 from mpiarray._mpi import check_collective, default_comm
+from mpiarray._profiling import PROFILE_TAGS
 from mpiarray.distributed_array import DistributedArray
 
 #: One copy: the source array (``None`` on ranks that do not hold it), the box
@@ -158,21 +160,22 @@ class CopyPlan:
                 roles.append((send, receive))
         except ValueError as problem:
             error = str(problem)  # raised on every rank, after the collective
-        everyone = self._comm.allgather((roles, sorted(dtypes), error))
-        errors = [their_error for _, _, their_error in everyone if their_error]
-        if errors:
-            raise ValueError(errors[0])
-        if len({len(their_roles) for their_roles, _, _ in everyone}) != 1:
-            raise ValueError("the ranks were given different numbers of copies")
-        all_dtypes = {
-            dtype for _, their_dtypes, _ in everyone for dtype in their_dtypes
-        }
-        if len(all_dtypes) > 1:
-            raise ValueError(
-                f"the arrays of a copy plan differ in dtype: {sorted(all_dtypes)}"
-            )
-        self._dtype = np.dtype(all_dtypes.pop()) if all_dtypes else np.dtype(float)
-        self._plan(everyone)
+        with sp.region("mpiarray.CopyPlan.plan", tags=PROFILE_TAGS):
+            everyone = self._comm.allgather((roles, sorted(dtypes), error))
+            errors = [their_error for _, _, their_error in everyone if their_error]
+            if errors:
+                raise ValueError(errors[0])
+            if len({len(their_roles) for their_roles, _, _ in everyone}) != 1:
+                raise ValueError("the ranks were given different numbers of copies")
+            all_dtypes = {
+                dtype for _, their_dtypes, _ in everyone for dtype in their_dtypes
+            }
+            if len(all_dtypes) > 1:
+                raise ValueError(
+                    f"the arrays of a copy plan differ in dtype: {sorted(all_dtypes)}"
+                )
+            self._dtype = np.dtype(all_dtypes.pop()) if all_dtypes else np.dtype(float)
+            self._plan(everyone)
 
     def _plan(self, everyone: list) -> None:
         """What this rank sends to and receives from every rank, in order."""
@@ -265,6 +268,7 @@ class CopyPlan:
         """Elements this rank sends per `execute`, to itself included."""
         return sum(self._send_counts)
 
+    @sp.profile("mpiarray.CopyPlan.execute", tags=PROFILE_TAGS)
     def execute(self) -> None:
         """Copy the boxes. Collective over the plan's communicator."""
         parts = [

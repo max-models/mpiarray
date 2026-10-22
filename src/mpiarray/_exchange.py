@@ -15,8 +15,10 @@ from collections.abc import Sequence
 from typing import Any
 
 import cunumpy as xp
+import scope_profiler as sp
 
 from mpiarray._mpi import MPI, check_collective
+from mpiarray._profiling import PROFILE_TAGS
 from mpiarray.layout import Layout
 
 #: A box of global indices: one ``(start, end)`` per axis.
@@ -31,6 +33,7 @@ def overlap(a: Box, b: Box) -> Box | None:
     return box if all(start < end for start, end in box) else None
 
 
+@sp.profile("mpiarray.exchange_boxes", tags=PROFILE_TAGS)
 def exchange_boxes(
     target: Layout,
     data: Any,

@@ -31,7 +31,9 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 import cunumpy as xp
+import scope_profiler as sp
 
+from mpiarray._profiling import PROFILE_TAGS
 from mpiarray.creation import zeros_like
 from mpiarray.distributed_array import DistributedArray
 from mpiarray.layout import Layout
@@ -156,6 +158,7 @@ class StencilOperator:
         """The regular stencil's coefficients, one per `offsets` entry."""
         return self._coefficients
 
+    @sp.profile("mpiarray.StencilOperator.apply", tags=PROFILE_TAGS)
     def apply(
         self,
         u: DistributedArray,

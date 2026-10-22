@@ -13,10 +13,13 @@ from typing import Any
 
 import cunumpy as xp
 import numpy as np
+import scope_profiler as sp
 
 from mpiarray._mpi import Comm, check_collective, default_comm
+from mpiarray._profiling import PROFILE_TAGS
 
 
+@sp.profile("mpiarray.migrate", tags=PROFILE_TAGS)
 def migrate(
     destinations: Any, *arrays: Any, comm: Comm | None = None
 ) -> tuple[Any, ...]:
