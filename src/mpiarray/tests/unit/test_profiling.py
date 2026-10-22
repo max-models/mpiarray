@@ -10,6 +10,8 @@ import mpiarray as mpa
 
 MPI = maybempi.get_mpi()
 size = MPI.COMM_WORLD.Get_size()
+# finalize() gathers the run on rank 0; the other ranks get an empty result set
+root = MPI.COMM_WORLD.Get_rank() == 0
 N = size + 3
 
 
@@ -38,7 +40,8 @@ def test_regions_are_off_by_default() -> None:
 
 def test_enable_tags_records_the_regions() -> None:
     regions = _regions_of_a_halo_update_and_a_sum(enable_tags=["mpiarray"])
-    assert {"mpiarray.update_halos", "mpiarray.reduce"} <= regions
+    if root:
+        assert {"mpiarray.update_halos", "mpiarray.reduce"} <= regions
 
 
 def test_a_region_calling_itself_is_recorded_once() -> None:
@@ -50,5 +53,6 @@ def test_a_region_calling_itself_is_recorded_once() -> None:
     update.wait()
     a.var(axis=0)
     results = sp.finalize(verbose=False, return_results=True)
-    for name in ("mpiarray.update_halos", "mpiarray.var"):
-        assert set(results.get_region(name).num_calls_per_rank().values()) == {1}
+    if root:
+        for name in ("mpiarray.update_halos", "mpiarray.var"):
+            assert set(results.get_region(name).num_calls_per_rank().values()) == {1}
