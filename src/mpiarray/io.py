@@ -230,6 +230,13 @@ def save_hdf5(
         comm.Barrier()
 
 
+def _plain(value: Any) -> Any:
+    """Return an HDF5 attribute as a Python value where it is a scalar."""
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
 @sp.profile("mpiarray.load_hdf5", tags=PROFILE_TAGS)
 def load_hdf5(
     path: PathLike,
@@ -290,10 +297,3 @@ def load_hdf5(
             storage[layout.interior] = xp.asarray(np.ascontiguousarray(block))
             arrays[name] = DistributedArray(layout, storage)
     return arrays, attrs
-
-
-def _plain(value: Any) -> Any:
-    """Return an HDF5 attribute as a Python value where it is a scalar."""
-    if isinstance(value, np.generic):
-        return value.item()
-    return value

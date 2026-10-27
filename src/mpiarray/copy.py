@@ -140,43 +140,6 @@ class CopyPlan:
             outside its array, an empty box or boxes of different shapes.
     """
 
-    def __init__(self, copies: Sequence[Copy], comm: Any = None) -> None:
-        """Find where every box goes; collective (one ``allgather``)."""
-        self._comm = default_comm() if comm is None else comm
-        self._size = self._comm.Get_size()
-        self._copies = []
-        roles = []
-        dtypes = set()
-        error = None
-        try:
-            for source, source_box, target, target_box in copies:
-                source_box, target_box = _boxes(source_box, target_box)
-                send = _sending_block(source, source_box)
-                receive = _receiving_region(target, target_box)
-                for array in (source, target):
-                    if array is not None:
-                        dtypes.add(np.dtype(array.dtype).str)
-                self._copies.append((source, source_box, target, target_box))
-                roles.append((send, receive))
-        except ValueError as problem:
-            error = str(problem)  # raised on every rank, after the collective
-        with sp.region("mpiarray.CopyPlan.plan", tags=PROFILE_TAGS):
-            everyone = self._comm.allgather((roles, sorted(dtypes), error))
-            errors = [their_error for _, _, their_error in everyone if their_error]
-            if errors:
-                raise ValueError(errors[0])
-            if len({len(their_roles) for their_roles, _, _ in everyone}) != 1:
-                raise ValueError("the ranks were given different numbers of copies")
-            all_dtypes = {
-                dtype for _, their_dtypes, _ in everyone for dtype in their_dtypes
-            }
-            if len(all_dtypes) > 1:
-                raise ValueError(
-                    f"the arrays of a copy plan differ in dtype: {sorted(all_dtypes)}"
-                )
-            self._dtype = np.dtype(all_dtypes.pop()) if all_dtypes else np.dtype(float)
-            self._plan(everyone)
-
     def _plan(self, everyone: list) -> None:
         """What this rank sends to and receives from every rank, in order."""
         rank = self._comm.Get_rank()
@@ -257,6 +220,43 @@ class CopyPlan:
                 offset += count
         order.sort(key=lambda piece: (piece[0], piece[1]))
         self._unpack = order
+
+    def __init__(self, copies: Sequence[Copy], comm: Any = None) -> None:
+        """Find where every box goes; collective (one ``allgather``)."""
+        self._comm = default_comm() if comm is None else comm
+        self._size = self._comm.Get_size()
+        self._copies = []
+        roles = []
+        dtypes = set()
+        error = None
+        try:
+            for source, source_box, target, target_box in copies:
+                source_box, target_box = _boxes(source_box, target_box)
+                send = _sending_block(source, source_box)
+                receive = _receiving_region(target, target_box)
+                for array in (source, target):
+                    if array is not None:
+                        dtypes.add(np.dtype(array.dtype).str)
+                self._copies.append((source, source_box, target, target_box))
+                roles.append((send, receive))
+        except ValueError as problem:
+            error = str(problem)  # raised on every rank, after the collective
+        with sp.region("mpiarray.CopyPlan.plan", tags=PROFILE_TAGS):
+            everyone = self._comm.allgather((roles, sorted(dtypes), error))
+            errors = [their_error for _, _, their_error in everyone if their_error]
+            if errors:
+                raise ValueError(errors[0])
+            if len({len(their_roles) for their_roles, _, _ in everyone}) != 1:
+                raise ValueError("the ranks were given different numbers of copies")
+            all_dtypes = {
+                dtype for _, their_dtypes, _ in everyone for dtype in their_dtypes
+            }
+            if len(all_dtypes) > 1:
+                raise ValueError(
+                    f"the arrays of a copy plan differ in dtype: {sorted(all_dtypes)}"
+                )
+            self._dtype = np.dtype(all_dtypes.pop()) if all_dtypes else np.dtype(float)
+            self._plan(everyone)
 
     @property
     def num_copies(self) -> int:

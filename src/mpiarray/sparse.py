@@ -244,75 +244,6 @@ class StencilOperator:
             )
         ]
 
-    def __add__(self, other: StencilOperator) -> StencilOperator:
-        """Return the operator ``self + other``, on their shared layout.
-
-        Regular offsets are merged, adding coefficients where both operators
-        use the same offset. Overridden rows are merged the same way, row by
-        row; a row overridden in only one operand is combined with the
-        other's regular stencil at that row.
-
-        Args:
-            other: An operator of the same `layout`.
-
-        Returns:
-            The combined `StencilOperator`.
-
-        Raises:
-            ValueError: If ``other``'s layout differs from this operator's.
-        """
-        if not isinstance(other, StencilOperator):
-            return NotImplemented
-        if self._layout != other._layout:
-            raise ValueError("can only add StencilOperators of the same layout")
-        coefficients = dict(zip(self._offsets, self._coefficients, strict=True))
-        for offset, coefficient in zip(
-            other._offsets, other._coefficients, strict=True
-        ):
-            coefficients[offset] = coefficients.get(offset, 0.0) + coefficient
-        offsets = tuple(coefficients)
-        overrides = {}
-        for index in self._overrides.keys() | other._overrides.keys():
-            a, b = self._terms_at(index), other._terms_at(index)
-            if a is None or b is None:  # not owned by this rank
-                continue
-            merged: dict[Offset, Any] = {}
-            for offset, coefficient in itertools.chain(a, b):
-                merged[offset] = merged.get(offset, 0.0) + coefficient
-            overrides[index] = list(merged.items())
-        return StencilOperator(
-            self._layout,
-            offsets,
-            [coefficients[offset] for offset in offsets],
-            overrides=overrides,
-        )
-
-    def __sub__(self, other: StencilOperator) -> StencilOperator:
-        """Return ``self - other``; see `__add__`."""
-        if not isinstance(other, StencilOperator):
-            return NotImplemented
-        return self + (-1.0) * other
-
-    def __neg__(self) -> StencilOperator:
-        """Return ``-self``."""
-        return -1.0 * self
-
-    def __mul__(self, scalar: Any) -> StencilOperator:
-        """Return this operator scaled by ``scalar`` (a number)."""
-        if not _is_scalar(scalar):
-            return NotImplemented
-        return StencilOperator(
-            self._layout,
-            self._offsets,
-            [scalar * coefficient for coefficient in self._coefficients],
-            overrides={
-                index: [(offset, scalar * coefficient) for offset, coefficient in terms]
-                for index, terms in self._overrides.items()
-            },
-        )
-
-    __rmul__ = __mul__
-
     def to_petsc_mat(self) -> Any:  # pragma: no cover - needs petsc4py, see petsc.py
         """Assemble this operator's pattern as a ``PETSc.Mat``.
 
@@ -364,6 +295,75 @@ class StencilOperator:
             matrix.setValues([int(numbering[index])], columns, values)
         matrix.assemble()
         return matrix
+
+    def __add__(self, other: StencilOperator) -> StencilOperator:
+        """Return the operator ``self + other``, on their shared layout.
+
+        Regular offsets are merged, adding coefficients where both operators
+        use the same offset. Overridden rows are merged the same way, row by
+        row; a row overridden in only one operand is combined with the
+        other's regular stencil at that row.
+
+        Args:
+            other: An operator of the same `layout`.
+
+        Returns:
+            The combined `StencilOperator`.
+
+        Raises:
+            ValueError: If ``other``'s layout differs from this operator's.
+        """
+        if not isinstance(other, StencilOperator):
+            return NotImplemented
+        if self._layout != other._layout:
+            raise ValueError("can only add StencilOperators of the same layout")
+        coefficients = dict(zip(self._offsets, self._coefficients, strict=True))
+        for offset, coefficient in zip(
+            other._offsets, other._coefficients, strict=True
+        ):
+            coefficients[offset] = coefficients.get(offset, 0.0) + coefficient
+        offsets = tuple(coefficients)
+        overrides = {}
+        for index in self._overrides.keys() | other._overrides.keys():
+            a, b = self._terms_at(index), other._terms_at(index)
+            if a is None or b is None:  # not owned by this rank
+                continue
+            merged: dict[Offset, Any] = {}
+            for offset, coefficient in itertools.chain(a, b):
+                merged[offset] = merged.get(offset, 0.0) + coefficient
+            overrides[index] = list(merged.items())
+        return StencilOperator(
+            self._layout,
+            offsets,
+            [coefficients[offset] for offset in offsets],
+            overrides=overrides,
+        )
+
+    def __sub__(self, other: StencilOperator) -> StencilOperator:
+        """Return ``self - other``; see `__add__`."""
+        if not isinstance(other, StencilOperator):
+            return NotImplemented
+        return self + (-1.0) * other
+
+    def __mul__(self, scalar: Any) -> StencilOperator:
+        """Return this operator scaled by ``scalar`` (a number)."""
+        if not _is_scalar(scalar):
+            return NotImplemented
+        return StencilOperator(
+            self._layout,
+            self._offsets,
+            [scalar * coefficient for coefficient in self._coefficients],
+            overrides={
+                index: [(offset, scalar * coefficient) for offset, coefficient in terms]
+                for index, terms in self._overrides.items()
+            },
+        )
+
+    __rmul__ = __mul__
+
+    def __neg__(self) -> StencilOperator:
+        """Return ``-self``."""
+        return -1.0 * self
 
     def __repr__(self) -> str:
         """Return the number of offsets, the layout, and any overrides."""
