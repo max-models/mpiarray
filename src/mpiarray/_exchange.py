@@ -33,6 +33,24 @@ def overlap(a: Box, b: Box) -> Box | None:
     return box if all(start < end for start, end in box) else None
 
 
+def target_ranks(comm: Any, other: Any) -> list[int]:
+    """Return, for each rank of ``comm``, its rank in ``other`` (the same processes).
+
+    Raises:
+        ValueError: If the communicators do not hold the same processes.
+    """
+    size = comm.Get_size()
+    if comm is other or bool(comm == other) or size == 1:
+        return list(range(size))
+    if other.Get_size() == size:
+        translated = MPI.Group.Translate_ranks(
+            comm.Get_group(), list(range(size)), other.Get_group()
+        )
+        if MPI.UNDEFINED not in translated:
+            return [int(r) for r in translated]
+    raise ValueError("the communicators do not hold the same processes")
+
+
 @sp.profile("mpiarray.exchange_boxes", tags=PROFILE_TAGS)
 def exchange_boxes(
     target: Layout,
@@ -112,24 +130,6 @@ def exchange_boxes(
         offset = receive_offsets[r]
         pieces.append((r, part, recv[offset : offset + count].reshape(shape)))
     return pieces
-
-
-def target_ranks(comm: Any, other: Any) -> list[int]:
-    """Return, for each rank of ``comm``, its rank in ``other`` (the same processes).
-
-    Raises:
-        ValueError: If the communicators do not hold the same processes.
-    """
-    size = comm.Get_size()
-    if comm is other or bool(comm == other) or size == 1:
-        return list(range(size))
-    if other.Get_size() == size:
-        translated = MPI.Group.Translate_ranks(
-            comm.Get_group(), list(range(size)), other.Get_group()
-        )
-        if MPI.UNDEFINED not in translated:
-            return [int(r) for r in translated]
-    raise ValueError("the communicators do not hold the same processes")
 
 
 def local_index(

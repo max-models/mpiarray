@@ -574,85 +574,6 @@ class DistributedArray:
         check_collective(self._layout.comm, f"get({index!r})")
         return self._layout.comm.bcast(value, root=owner)
 
-    def __getitem__(self, index: IndexLike) -> Scalar | Array:
-        """Return an element or a selection of the global array, on every rank.
-
-        Collective. An integer per axis is `get`: a host scalar, the same on
-        every rank. Any other index returns a new `DistributedArray`: basic
-        indices (integers, slices, Ellipsis) move only the selected cells to the
-        ranks that own them in the result; index arrays and masks gather the
-        array first. Call ``gather()`` on the result for a NumPy array.
-
-        Args:
-            index: A global index, as for a NumPy array of shape `shape`.
-
-        Returns:
-            A host scalar, or a `DistributedArray`.
-        """
-        basic = self._normalize_basic_index(index)
-        if basic is not None and all(_is_int(item) for item in basic):
-            return self.get(tuple(int(item) for item in basic if _is_int(item)))
-        if basic is not None:
-            return self._select(basic)
-        return self._spread(self._gather_all()[index])
-
-    def __setitem__(self, index: IndexLike, value: Any) -> None:
-        """Set an element or a selection of the global array.
-
-        Integers, slices and Ellipsis are written by each rank into the cells
-        it owns, without communication; ``value`` must then be the same on
-        every rank. Advanced indices (arrays, masks) gather the whole array,
-        are collective, and zero the halo cells.
-
-        Args:
-            index: A global index, as for a NumPy array of shape `shape`.
-            value: The value to write, broadcast to the selection. Compatible
-                Quantity or distributed values are converted to this array's unit.
-                Bare numbers are dimensionless; writing them to a dimensional
-                array raises. Unit-bearing integer assignments reject precision
-                loss or overflow. Direct writes to ``local`` remain raw numeric writes.
-        """
-        from mpiarray import _units
-
-        source_unit = _units.unit_of(value)
-        factor = _units.conversion_factor(source_unit, self._unit, "assignment")
-        # Validate units on every rank before either gathering the RHS or writing.
-        value = (
-            value._gather_all()
-            if isinstance(value, DistributedArray)
-            else _units.raw(value)
-        )
-        if factor != 1:
-            value = xp.asarray(value) * factor
-        if (
-            source_unit is not None or self._unit is not None
-        ) and self.dtype.kind in "iu":
-            numeric = xp.asarray(value)
-            if numeric.dtype.kind == "c":
-                raise TypeError(
-                    "unit assignment to an integer array would lose precision"
-                )
-            with np.errstate(invalid="ignore", over="ignore"):
-                converted = numeric.astype(self.dtype)
-            exact = converted == numeric
-            if numeric.dtype.kind == "f":
-                limits = np.iinfo(self.dtype)
-                # Exclusive powers of two stay exact when integer maxima do not.
-                exact &= (numeric >= limits.min) & (numeric < limits.max + 1)
-            if not bool(xp.all(exact)):
-                raise TypeError(
-                    "unit assignment to an integer array would lose precision"
-                )
-            value = converted
-        basic = self._normalize_basic_index(index)
-        if basic is not None:
-            self._assign_basic(basic, value)
-            return
-        data = self._gather_all()
-        data[index] = value
-        self._data[...] = 0
-        self._data[self._layout.interior] = data[self._layout.global_slices()]
-
     def _normalize_basic_index(self, index: Any) -> tuple[int | slice, ...] | None:
         """Return ``index`` as one int or slice per axis, or None if it is not basic.
 
@@ -749,16 +670,16 @@ class DistributedArray:
                 pass
         return Layout(shape, comm=layout.comm, split=None)
 
-    def _spread(self, data: Array) -> Self:
-        """Return a global array that every rank holds as a distributed array."""
-        target = self._layout_like(tuple(data.shape), (0,) if data.ndim else ())
-        return self._with_layout(target, data[target.global_slices()])
-
     def _with_layout(self, layout: Layout, block: Array) -> Self:
         """Return an array of this type with ``layout`` around a block (halos zero)."""
         storage = xp.zeros(layout.storage_shape, dtype=block.dtype)
         storage[layout.interior] = block
         return type(self)(layout, storage)
+
+    def _spread(self, data: Array) -> Self:
+        """Return a global array that every rank holds as a distributed array."""
+        target = self._layout_like(tuple(data.shape), (0,) if data.ndim else ())
+        return self._with_layout(target, data[target.global_slices()])
 
     def _select(self, index: tuple[int | slice, ...]) -> Self:
         """Return a basic selection as a distributed array, moving only its cells."""
@@ -1674,6 +1595,55 @@ class DistributedArray:
             result[index] = combine(result[index], piece)
         return self._with_layout(target, result)
 
+    def _finish(
+        self, value: Scalar, keepdims: bool, unit: Any = None
+    ) -> Scalar | Array:
+        """Apply ``keepdims``, and ``unit`` if given, to a whole-array reduction.
+
+        Callers pass a raw, already-combined host value and its computed unit.
+        Unit-bearing results stay on the host, including with ``keepdims``;
+        boolean reductions omit the unit.
+        """
+        if keepdims:
+            value = (np if unit is not None else xp).full((1,) * self.ndim, value)
+        if unit is not None:
+            from mpiarray import _units
+
+            value = _units.wrap_scalar(value, unit)
+        return value
+
+    def _var_whole(
+        self, dtype: DTypeLike | None, ddof: int, keepdims: bool
+    ) -> Scalar | Array:
+        """Return the whole array's variance, for `var` and `_var_along`."""
+        # Each rank's count, mean and sum of squared deviations, combined in
+        # one collective with Chan et al.'s parallel update (numerically like
+        # two passes, but one round of communication).
+        local = self.local
+        count = int(local.size)
+        local_mean = _host(xp.sum(local, dtype=dtype)) / count if count else 0.0
+        deviation = local - local_mean
+        if deviation.dtype.kind == "c":
+            squares = xp.sum(deviation.real**2 + deviation.imag**2, dtype=dtype)
+        else:
+            squares = xp.sum(deviation * deviation, dtype=dtype)
+        squares = _host(squares)
+        stats = [(count, local_mean, squares)]
+        if self._layout.distributed:
+            check_collective(self._layout.comm, "var")
+            stats = self._layout.comm.allgather(stats[0])
+        total, mean, m2 = 0, 0.0, 0.0
+        for n, block_mean, block_m2 in stats:
+            delta = block_mean - mean
+            mean = mean + delta * n / (total + n)
+            m2 = m2 + block_m2 + abs(delta) ** 2 * total * n / (total + n)
+            total += n
+        return self._finish(
+            m2 / (total - ddof),
+            keepdims,
+            unit=None if self._unit is None else self._unit**2,
+        )
+
     def _var_along(
         self,
         axis: int | tuple[int, ...],
@@ -1795,23 +1765,6 @@ class DistributedArray:
             best[(slice(None), *index)] = xp.where(better, piece, current)
             empty[index] = False
         return self._with_layout(target, best[1].astype(np.int64))
-
-    def _finish(
-        self, value: Scalar, keepdims: bool, unit: Any = None
-    ) -> Scalar | Array:
-        """Apply ``keepdims``, and ``unit`` if given, to a whole-array reduction.
-
-        Callers pass a raw, already-combined host value and its computed unit.
-        Unit-bearing results stay on the host, including with ``keepdims``;
-        boolean reductions omit the unit.
-        """
-        if keepdims:
-            value = (np if unit is not None else xp).full((1,) * self.ndim, value)
-        if unit is not None:
-            from mpiarray import _units
-
-            value = _units.wrap_scalar(value, unit)
-        return value
 
     @staticmethod
     def _reject_out(out: object) -> None:
@@ -2028,38 +1981,6 @@ class DistributedArray:
         if axis is not None:
             return self._var_along(axis, dtype, ddof, keepdims)
         return self._var_whole(dtype, ddof, keepdims)
-
-    def _var_whole(
-        self, dtype: DTypeLike | None, ddof: int, keepdims: bool
-    ) -> Scalar | Array:
-        """Return the whole array's variance, for `var` and `_var_along`."""
-        # Each rank's count, mean and sum of squared deviations, combined in
-        # one collective with Chan et al.'s parallel update (numerically like
-        # two passes, but one round of communication).
-        local = self.local
-        count = int(local.size)
-        local_mean = _host(xp.sum(local, dtype=dtype)) / count if count else 0.0
-        deviation = local - local_mean
-        if deviation.dtype.kind == "c":
-            squares = xp.sum(deviation.real**2 + deviation.imag**2, dtype=dtype)
-        else:
-            squares = xp.sum(deviation * deviation, dtype=dtype)
-        squares = _host(squares)
-        stats = [(count, local_mean, squares)]
-        if self._layout.distributed:
-            check_collective(self._layout.comm, "var")
-            stats = self._layout.comm.allgather(stats[0])
-        total, mean, m2 = 0, 0.0, 0.0
-        for n, block_mean, block_m2 in stats:
-            delta = block_mean - mean
-            mean = mean + delta * n / (total + n)
-            m2 = m2 + block_m2 + abs(delta) ** 2 * total * n / (total + n)
-            total += n
-        return self._finish(
-            m2 / (total - ddof),
-            keepdims,
-            unit=None if self._unit is None else self._unit**2,
-        )
 
     def std(
         self,
@@ -2434,32 +2355,6 @@ class DistributedArray:
                 self._data[...] = data
             self._unit = result_unit
 
-    # ------------------------------------------------------------------ #
-    # Python protocols
-
-    def __len__(self) -> int:
-        """Return the length of the first axis."""
-        if self.ndim == 0:
-            raise TypeError("len() of unsized object")
-        return self.shape[0]
-
-    def __iter__(self) -> Iterator[Any]:
-        """Iterate over the first axis of the gathered array. Collective."""
-        return iter(self._gather_all())
-
-    def __bool__(self) -> bool:
-        """Return the truth value of a one-element array. Collective.
-
-        Raises:
-            ValueError: For more or fewer than one element, as NumPy does.
-        """
-        if self.size != 1:
-            raise ValueError(
-                "The truth value of an array with more than one element is "
-                "ambiguous. Use a.any() or a.all()",
-            )
-        return bool(self.get((0,) * self.ndim))
-
     def _summary(self, edge: int = 3) -> str:
         """Return this rank's block as text, copying at most ``2 * edge`` values."""
         block = self.local
@@ -2470,16 +2365,97 @@ class DistributedArray:
         tail = np.array2string(xp.to_numpy(flat[-edge:]), separator=", ")[1:-1]
         return f"[{head}, ..., {tail}] ({block.size} values)"
 
-    def __repr__(self) -> str:
-        """Return the layout and this rank's block; no communication."""
-        layout = self._layout
-        bounds = ", ".join(f"{start}:{end}" for start, end in layout.index_bounds)
-        local = self._summary()
-        return (
-            f"{type(self).__name__}(shape={self.shape}, dtype={self.dtype}, "
-            f"split={layout.split}, rank {layout.rank} of {layout.size} holds "
-            f"[{bounds}]: {local})"
+    def __getitem__(self, index: IndexLike) -> Scalar | Array:
+        """Return an element or a selection of the global array, on every rank.
+
+        Collective. An integer per axis is `get`: a host scalar, the same on
+        every rank. Any other index returns a new `DistributedArray`: basic
+        indices (integers, slices, Ellipsis) move only the selected cells to the
+        ranks that own them in the result; index arrays and masks gather the
+        array first. Call ``gather()`` on the result for a NumPy array.
+
+        Args:
+            index: A global index, as for a NumPy array of shape `shape`.
+
+        Returns:
+            A host scalar, or a `DistributedArray`.
+        """
+        basic = self._normalize_basic_index(index)
+        if basic is not None and all(_is_int(item) for item in basic):
+            return self.get(tuple(int(item) for item in basic if _is_int(item)))
+        if basic is not None:
+            return self._select(basic)
+        return self._spread(self._gather_all()[index])
+
+    def __setitem__(self, index: IndexLike, value: Any) -> None:
+        """Set an element or a selection of the global array.
+
+        Integers, slices and Ellipsis are written by each rank into the cells
+        it owns, without communication; ``value`` must then be the same on
+        every rank. Advanced indices (arrays, masks) gather the whole array,
+        are collective, and zero the halo cells.
+
+        Args:
+            index: A global index, as for a NumPy array of shape `shape`.
+            value: The value to write, broadcast to the selection. Compatible
+                Quantity or distributed values are converted to this array's unit.
+                Bare numbers are dimensionless; writing them to a dimensional
+                array raises. Unit-bearing integer assignments reject precision
+                loss or overflow. Direct writes to ``local`` remain raw numeric writes.
+        """
+        from mpiarray import _units
+
+        source_unit = _units.unit_of(value)
+        factor = _units.conversion_factor(source_unit, self._unit, "assignment")
+        # Validate units on every rank before either gathering the RHS or writing.
+        value = (
+            value._gather_all()
+            if isinstance(value, DistributedArray)
+            else _units.raw(value)
         )
+        if factor != 1:
+            value = xp.asarray(value) * factor
+        if (
+            source_unit is not None or self._unit is not None
+        ) and self.dtype.kind in "iu":
+            numeric = xp.asarray(value)
+            if numeric.dtype.kind == "c":
+                raise TypeError(
+                    "unit assignment to an integer array would lose precision"
+                )
+            with np.errstate(invalid="ignore", over="ignore"):
+                converted = numeric.astype(self.dtype)
+            exact = converted == numeric
+            if numeric.dtype.kind == "f":
+                limits = np.iinfo(self.dtype)
+                # Exclusive powers of two stay exact when integer maxima do not.
+                exact &= (numeric >= limits.min) & (numeric < limits.max + 1)
+            if not bool(xp.all(exact)):
+                raise TypeError(
+                    "unit assignment to an integer array would lose precision"
+                )
+            value = converted
+        basic = self._normalize_basic_index(index)
+        if basic is not None:
+            self._assign_basic(basic, value)
+            return
+        data = self._gather_all()
+        data[index] = value
+        self._data[...] = 0
+        self._data[self._layout.interior] = data[self._layout.global_slices()]
+
+    def __iter__(self) -> Iterator[Any]:
+        """Iterate over the first axis of the gathered array. Collective."""
+        return iter(self._gather_all())
+
+    # ------------------------------------------------------------------ #
+    # Python protocols
+
+    def __len__(self) -> int:
+        """Return the length of the first axis."""
+        if self.ndim == 0:
+            raise TypeError("len() of unsized object")
+        return self.shape[0]
 
     def __add__(self, other: Any) -> Self:
         """Add elementwise."""
@@ -2582,6 +2558,30 @@ class DistributedArray:
         return self._binary_op(other, xp.greater_equal)
 
     __hash__ = None  # type: ignore[assignment]  # mutable, and == is elementwise
+
+    def __bool__(self) -> bool:
+        """Return the truth value of a one-element array. Collective.
+
+        Raises:
+            ValueError: For more or fewer than one element, as NumPy does.
+        """
+        if self.size != 1:
+            raise ValueError(
+                "The truth value of an array with more than one element is "
+                "ambiguous. Use a.any() or a.all()",
+            )
+        return bool(self.get((0,) * self.ndim))
+
+    def __repr__(self) -> str:
+        """Return the layout and this rank's block; no communication."""
+        layout = self._layout
+        bounds = ", ".join(f"{start}:{end}" for start, end in layout.index_bounds)
+        local = self._summary()
+        return (
+            f"{type(self).__name__}(shape={self.shape}, dtype={self.dtype}, "
+            f"split={layout.split}, rank {layout.rank} of {layout.size} holds "
+            f"[{bounds}]: {local})"
+        )
 
 
 # --------------------------------------------------------------------------- #

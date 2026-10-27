@@ -364,6 +364,68 @@ class Layout:
             an axis that exchanges halos. Every rank raises alike.
     """
 
+    def _explicit_cuts(
+        self, bounds: Sequence[Sequence[int] | None]
+    ) -> tuple[tuple[int, ...] | None, ...]:
+        """Return ``bounds`` checked: per axis None or cuts increasing from 0 to the length."""
+        checked: list[tuple[int, ...] | None] = []
+        for axis, (cuts, length) in enumerate(
+            zip(_per_axis(bounds, self.ndim, "bounds"), self._shape, strict=True)
+        ):
+            if cuts is None:
+                checked.append(None)
+                continue
+            cuts = tuple(int(c) for c in cuts)
+            if (
+                len(cuts) < 2
+                or cuts[0] != 0
+                or cuts[-1] != length
+                or any(b <= a for a, b in zip(cuts, cuts[1:], strict=False))
+            ):
+                raise ValueError(
+                    f"bounds {cuts} along axis {axis} must increase from 0 to {length}, "
+                    "with at least one element per block",
+                )
+            checked.append(cuts)
+        return tuple(checked)
+
+    def _check_blocks(self) -> None:
+        """Raise unless every rank owns cells and every halo fits in a block."""
+        for axis, (length, n, h, periodic, cuts) in enumerate(
+            zip(
+                self._shape,
+                self._grid,
+                self._halo,
+                self._periodic,
+                self._cuts,
+                strict=True,
+            )
+        ):
+            if n > 1 and n > length:
+                raise ValueError(
+                    f"axis {axis} has {length} elements but is split over {n} ranks; "
+                    "use fewer ranks, split=None, another split axis, or a "
+                    "process_grid",
+                )
+            # A halo is filled from the neighbouring block only, so it must
+            # not be wider than any block it is exchanged with.
+            smallest = min(b - a for a, b in zip(cuts, cuts[1:], strict=False))
+            if h and (n > 1 or periodic) and smallest < h:
+                raise ValueError(
+                    f"halo {h} along axis {axis} is wider than the smallest block "
+                    f"({smallest} elements); use a smaller halo or fewer ranks",
+                )
+
+    def _shifted(self, axis: int, step: int) -> int:
+        """Return the rank one step along ``axis``, or ``PROC_NULL`` past a wall."""
+        coord = list(self._coord)
+        coord[axis] += step
+        if not 0 <= coord[axis] < self._grid[axis]:
+            if not self._periodic[axis]:
+                return MPI.PROC_NULL
+            coord[axis] %= self._grid[axis]
+        return self.rank_of(coord)
+
     def __init__(
         self,
         shape: ShapeLike,
@@ -449,68 +511,6 @@ class Layout:
                 for axis in range(ndim)
             )
         self._index_bounds = self.index_bounds_of(self._rank)
-
-    def _explicit_cuts(
-        self, bounds: Sequence[Sequence[int] | None]
-    ) -> tuple[tuple[int, ...] | None, ...]:
-        """Return ``bounds`` checked: per axis None or cuts increasing from 0 to the length."""
-        checked: list[tuple[int, ...] | None] = []
-        for axis, (cuts, length) in enumerate(
-            zip(_per_axis(bounds, self.ndim, "bounds"), self._shape, strict=True)
-        ):
-            if cuts is None:
-                checked.append(None)
-                continue
-            cuts = tuple(int(c) for c in cuts)
-            if (
-                len(cuts) < 2
-                or cuts[0] != 0
-                or cuts[-1] != length
-                or any(b <= a for a, b in zip(cuts, cuts[1:], strict=False))
-            ):
-                raise ValueError(
-                    f"bounds {cuts} along axis {axis} must increase from 0 to {length}, "
-                    "with at least one element per block",
-                )
-            checked.append(cuts)
-        return tuple(checked)
-
-    def _check_blocks(self) -> None:
-        """Raise unless every rank owns cells and every halo fits in a block."""
-        for axis, (length, n, h, periodic, cuts) in enumerate(
-            zip(
-                self._shape,
-                self._grid,
-                self._halo,
-                self._periodic,
-                self._cuts,
-                strict=True,
-            )
-        ):
-            if n > 1 and n > length:
-                raise ValueError(
-                    f"axis {axis} has {length} elements but is split over {n} ranks; "
-                    "use fewer ranks, split=None, another split axis, or a "
-                    "process_grid",
-                )
-            # A halo is filled from the neighbouring block only, so it must
-            # not be wider than any block it is exchanged with.
-            smallest = min(b - a for a, b in zip(cuts, cuts[1:], strict=False))
-            if h and (n > 1 or periodic) and smallest < h:
-                raise ValueError(
-                    f"halo {h} along axis {axis} is wider than the smallest block "
-                    f"({smallest} elements); use a smaller halo or fewer ranks",
-                )
-
-    def _shifted(self, axis: int, step: int) -> int:
-        """Return the rank one step along ``axis``, or ``PROC_NULL`` past a wall."""
-        coord = list(self._coord)
-        coord[axis] += step
-        if not 0 <= coord[axis] < self._grid[axis]:
-            if not self._periodic[axis]:
-                return MPI.PROC_NULL
-            coord[axis] %= self._grid[axis]
-        return self.rank_of(coord)
 
     # ------------------------------------------------------------------ #
     # Ranks and process coordinates
@@ -785,31 +785,11 @@ class Layout:
         """
         return (self._shape, self._halo, self._periodic, self._grid, self._cuts)
 
-    def __eq__(self, other: object) -> bool:
-        """Return whether ``other`` describes the same decomposition."""
-        if not isinstance(other, Layout):
-            return NotImplemented
-        same_comm = self._comm is other._comm or bool(self._comm == other._comm)
-        return same_comm and self._key() == other._key()
-
-    def __hash__(self) -> int:
-        """Return a hash consistent with ``==``."""
-        return hash(self._key())
-
     def _uneven(self) -> bool:
         """Return whether the cuts differ from the near-even split."""
         return any(
             cuts != (*(chunk_bounds(length, n, i)[0] for i in range(n)), length)
             for cuts, length, n in zip(self._cuts, self._shape, self._grid, strict=True)
-        )
-
-    def __repr__(self) -> str:
-        """Return the defining values; no communication."""
-        bounds = f"bounds={self._cuts}, " if self._uneven() else ""
-        return (
-            f"Layout(shape={self._shape}, split={self._split}, halo={self._halo}, "
-            f"periodic={self._periodic}, process_grid={self._grid}, {bounds}"
-            f"rank={self._rank} of {self._size})"
         )
 
     # ------------------------------------------------------------------ #
@@ -962,4 +942,24 @@ class Layout:
             periodic=periodic,
             bounds=bounds,
             reorder=reorder,
+        )
+
+    def __eq__(self, other: object) -> bool:
+        """Return whether ``other`` describes the same decomposition."""
+        if not isinstance(other, Layout):
+            return NotImplemented
+        same_comm = self._comm is other._comm or bool(self._comm == other._comm)
+        return same_comm and self._key() == other._key()
+
+    def __hash__(self) -> int:
+        """Return a hash consistent with ``==``."""
+        return hash(self._key())
+
+    def __repr__(self) -> str:
+        """Return the defining values; no communication."""
+        bounds = f"bounds={self._cuts}, " if self._uneven() else ""
+        return (
+            f"Layout(shape={self._shape}, split={self._split}, halo={self._halo}, "
+            f"periodic={self._periodic}, process_grid={self._grid}, {bounds}"
+            f"rank={self._rank} of {self._size})"
         )
