@@ -56,3 +56,17 @@ def test_a_region_calling_itself_is_recorded_once() -> None:
     if root:
         for name in ("mpiarray.update_halos", "mpiarray.var"):
             assert set(results.get_region(name).num_calls_per_rank().values()) == {1}
+
+
+def test_the_opt_in_tag_has_an_entry_point():
+    """``scope-profiler tags`` finds the tag through the package's entry point."""
+    from importlib.metadata import entry_points
+
+    from mpiarray._profiling import PROFILE_TAGS
+
+    found = {
+        entry_point.name: entry_point.value
+        for entry_point in entry_points(group="scope_profiler.opt_in_tags")
+    }
+    assert found.get("mpiarray") == "mpiarray"
+    assert "mpiarray" in PROFILE_TAGS
