@@ -479,7 +479,9 @@ def test_array_operands_broadcast_like_numpy_on_the_global_shape(operand_shape) 
     difference = b - a  # ndarray - DistributedArray defers to __array_ufunc__
     assert isinstance(difference, DistributedArray)
     np.testing.assert_allclose(difference.to_numpy(), operand - data)
-    np.testing.assert_allclose(np.multiply(a, b).to_numpy(), data * operand)
+    product = np.multiply(a, b)
+    assert isinstance(product, DistributedArray)
+    np.testing.assert_allclose(product.to_numpy(), data * operand)
     a += b
     np.testing.assert_allclose(a.to_numpy(), data + operand)
 
