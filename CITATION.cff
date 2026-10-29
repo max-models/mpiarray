@@ -9,4 +9,3 @@ version: 0.1.0
 date-released: "2026-10-05"
 repository-code: https://github.com/max-models/mpiarray
 url: https://max-models.github.io/mpiarray/
-license: MIT
