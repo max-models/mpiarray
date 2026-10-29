@@ -7,7 +7,7 @@ FORCE ?=
 # Open MPI needs --oversubscribe for more ranks than cores; with MPICH: make coverage MPIEXEC=mpiexec
 MPIEXEC ?= mpiexec --oversubscribe
 
-.PHONY: help install test coverage lint readme readme-check docs-install docs-notebooks docs-dev docs-build docs-preview docs-clean
+.PHONY: help install test coverage lint readme readme-check docs-install docs-notebooks docs-hero docs-dev docs-build docs-preview docs-clean
 
 help:  ## list the targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-16s %s\n", $$1, $$2}'
@@ -49,6 +49,9 @@ docs-install:  ## Python docs extra and the npm packages
 docs-notebooks:  ## execute the changed guides and convert all of them (FORCE=1 reruns all)
 	$(NOTEBOOKS) execute $(if $(FORCE),--force,)
 	$(NOTEBOOKS) convert
+
+docs-hero:  ## redraw the home page figure (docs/src/assets/hero.svg)
+	$(MPIEXEC) -n 4 $(PYTHON) docs/hero.py
 
 docs-dev:  ## live preview at http://localhost:4321/mpiarray/
 	$(NOTEBOOKS) convert
