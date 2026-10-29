@@ -107,7 +107,7 @@ def test_reductions_norms_and_shape_functions() -> None:
     with pytest.raises(TypeError, match="DistributedArray"):
         np.dot(v, vdata)
     with pytest.raises(TypeError, match="DistributedArray"):
-        v.dot(vdata)
+        v.dot(cast("Any", vdata))  # a plain array, which dot rejects at runtime
     with pytest.raises(TypeError, match="no out"):
         np.dot(v, w, np.empty(()))
     with pytest.raises(TypeError, match="no out"):
