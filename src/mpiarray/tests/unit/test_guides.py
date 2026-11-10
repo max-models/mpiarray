@@ -43,6 +43,7 @@ def test_every_guide_is_tested() -> None:
         "working_with_data",
         "units",
         "layouts",
+        "decomposition",
         "halo_exchange",
         "operations",
         "gpu",
