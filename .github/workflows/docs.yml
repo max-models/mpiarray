@@ -35,6 +35,7 @@ jobs:
         api/mpiarray/distributed_array/index.html
         api/mpiarray/layout/index.html
         guides/layouts/index.html
+        guides/decomposition/index.html
         api/mpiarray/io/index.html
         guides/heat-equation/index.html
         guides/particles/index.html

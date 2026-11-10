@@ -19,6 +19,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- A [Domain decomposition](https://max-models.github.io/mpiarray/guides/decomposition/) guide: how
+  the process grid, the cut points, the rank numbering, the neighbours and the halo cells are
+  decided, with figures drawn from `Layout` and an interactive explorer.
 - Opt-in [scope-profiler](https://github.com/max-models/scope-profiler) regions (named
   `mpiarray.<operation>`, tag `mpiarray`) for halo exchanges, gathers, redistribution,
   reductions, copy plans, particle migration, stencils and I/O. They are off unless the
