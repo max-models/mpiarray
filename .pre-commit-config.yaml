@@ -20,7 +20,7 @@ repos:
     hooks:
       - id: ssort # order statements so names are defined before they are used
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.17.3
+    rev: v0.17.4
     hooks:
       - id: ruff-check # lint, including import sorting (the I rules)
         args: [--fix]
