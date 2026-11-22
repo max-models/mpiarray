@@ -7,6 +7,20 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Faster halo exchanges on host storage: each array keeps the persistent MPI requests of its
+  exchanges, made by the first one, so later exchanges only start and wait for them. On 4 ranks
+  with 16×32×16 blocks, `update_halos(wait=False)` went from 850 to 65 µs and `update_halos()`
+  from 157 to 88 µs. Starting an exchange of an array again before `wait()` on the previous one
+  now raises.
+- Faster elementwise operations: arithmetic and ufuncs on arrays with the same layout (and
+  scalars) are computed in one pass over the whole storage, then the halo cells are zeroed, instead
+  of a strided pass over the block and a copy into new storage (about 2–3× faster on large
+  blocks). Floating-point warnings are not raised there, since the halo cells may hold anything
+  (as on CuPy); under `np.errstate(...="raise")` the blocks alone are computed, so errors in
+  them still raise.
+- Faster whole-array reductions (`sum`, `min`, `max`, `dot`, `norm`, `all`, `any`, ...): the
+  per-rank values are combined with a buffer `Allreduce` instead of a pickled `allreduce` (about
+  10× less latency).
 - The combined coverage of the serial and MPI runs must be at least 95% (was 100%).
 - `__version__` is read from the installed package metadata (`importlib.metadata`), not hardcoded,
   so it can no longer disagree with `pyproject.toml` (the 0.2.1 wheel reported 0.1.0).

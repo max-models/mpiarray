@@ -865,3 +865,56 @@ def test_host_staged_communication_matches_direct(tmp_path) -> None:
         for key in expected.files:
             if key != "backend":
                 np.testing.assert_array_equal(actual[key], expected[key], err_msg=key)
+
+
+def test_views_of_the_storage_do_not_change_the_operands() -> None:
+    a = mpa.ones((W, 3), halo=1)
+    a.local_with_halos[...] = 5.0
+    results = cast(
+        "tuple[DistributedArray, ...]", (np.real(a), +a, np.where(a > 0, a, 0.0))
+    )
+    for result in results:
+        assert not np.shares_memory(
+            _np(result.local_with_halos), _np(a.local_with_halos)
+        )
+        assert not _np(result.local_with_halos)[_halo_mask(a)].any()
+    np.testing.assert_array_equal(_np(a.local_with_halos), 5.0)
+
+
+def test_floating_point_errors_raise_only_from_the_blocks() -> None:
+    a = mpa.ones((W, 3), halo=1)
+    with np.errstate(all="raise"):
+        np.testing.assert_array_equal(_np((1 / a).local), 1.0)
+        b = a.copy()
+        b[0, 0] = 0.0
+        if b.layout.owner((0, 0)) == b.layout.rank:  # elementwise: no communication
+            with pytest.raises(FloatingPointError):
+                _ = 1 / b
+        else:
+            _ = 1 / b
+        quotient, remainder = cast(
+            "tuple[DistributedArray, DistributedArray]", np.divmod(a, 2.0)
+        )
+        assert not _np(quotient.local_with_halos)[_halo_mask(a)].any()
+        np.testing.assert_array_equal(_np(remainder.local), 1.0)
+
+
+@pytest.mark.parametrize(
+    "value", [True, np.True_, 3, np.int32(3), 2.5, np.float32(2.5), 1 + 2j, 10**30]
+)
+def test_allreduce_keeps_the_type_of_the_value(value) -> None:
+    from mpiarray.distributed_array import _allreduce_scalar
+
+    result = _allreduce_scalar(comm, value, MPI.SUM if value is not True else MPI.LAND)
+    assert type(result) is type(value)
+    if not isinstance(value, bool | np.bool_):
+        assert result == value * size
+
+
+def test_allreduce_of_booleans_takes_min_and_max_as_and_and_or() -> None:
+    from mpiarray.distributed_array import _allreduce_scalar
+
+    mine = bool(rank == 0)
+    assert _allreduce_scalar(comm, mine, MPI.MIN) is (size == 1)
+    assert _allreduce_scalar(comm, mine, MPI.MAX) is True
+    assert _allreduce_scalar(comm, np.float16(1.0), MPI.SUM) == size
