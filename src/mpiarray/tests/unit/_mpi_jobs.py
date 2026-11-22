@@ -20,13 +20,16 @@ def _launcher() -> list[str] | None:
     launcher = shutil.which("mpiexec") or shutil.which("mpirun")
     if launcher is None:
         return None
-    version = subprocess.run(
+    result = subprocess.run(
         [launcher, "--version"], capture_output=True, text=True, check=False
-    ).stdout
+    )
+    version = (result.stdout + result.stderr).lower()
     # Open MPI refuses more ranks than cores without it; MPICH has no such flag.
-    # Open MPI 5 calls itself "Open MPI", Open MPI 4 (Ubuntu's) "OpenRTE".
+    # Open MPI 5 calls itself "Open MPI", Open MPI 4 (Ubuntu's) "OpenRTE", and
+    # Debian's Open MPI 5 (Ubuntu 26.04) launches through PRRTE's prterun.
     is_open_mpi = any(
-        name in version.lower() for name in ("open mpi", "openrte", "open-mpi")
+        name in version
+        for name in ("open mpi", "openrte", "open-mpi", "prrte", "prterun")
     )
     return [launcher, "--oversubscribe"] if is_open_mpi else [launcher]
 
