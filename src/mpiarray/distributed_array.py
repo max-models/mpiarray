@@ -14,11 +14,12 @@ from __future__ import annotations
 
 import bisect
 import contextlib
+import contextvars
 import functools
 import itertools
 import math
 import weakref
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterator, Sequence
 from types import EllipsisType, NotImplementedType
 from typing import TYPE_CHECKING, Any, TypeAlias, TypeGuard, cast, overload
 
@@ -67,6 +68,46 @@ def _subarray(
 
     base = dtlib.from_numpy_dtype(np.dtype(dtype))
     return base.Create_subarray(list(shape), list(sizes), list(starts)).Commit()
+
+
+#: Storage cells from which in-place operations go over a contiguous slab
+#: (see `DistributedArray._elementwise_into`); below it the halo cells cost
+#: more to save and restore than the slab saves.
+_SLAB_MIN_SIZE = 16384
+
+_COMPUTE_HALOS: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "mpiarray_compute_halos", default=False
+)
+
+
+@contextlib.contextmanager
+def compute_halos() -> Generator[None, None, None]:
+    """Compute elementwise operations on the halo cells too, inside the block.
+
+    Normally results get zero halo cells and in-place operations
+    (``a += b``, ``out=``) leave them as they are. Inside this context both
+    compute the halo cells like the block: a result's halo cell holds the
+    operation applied to the inputs' halo cells. When the inputs' halos are
+    up to date (`DistributedArray.update_halos`), so are the results', and
+    no halo update is needed after the operation; it is also faster, since
+    whole storages are computed in one pass.
+
+    Only for halos filled with neighbour values: halo cells that still hold
+    values to accumulate (before `DistributedArray.accumulate_halos`) would
+    be changed. Operands that do not line up with the storage (other layouts,
+    plain arrays) and ``where=`` take the usual path.
+
+    Example:
+        >>> a.update_halos(); b.update_halos()
+        >>> with mpa.compute_halos():
+        ...     c = a * b + 1.0  # c's halos are up to date too
+        ...     a += c  # and so are a's
+    """
+    token = _COMPUTE_HALOS.set(True)
+    try:
+        yield
+    finally:
+        _COMPUTE_HALOS.reset(token)
 
 
 def _posting(comm: Any, persistent: bool) -> tuple[Callable, Callable]:
@@ -1557,46 +1598,99 @@ class DistributedArray:
         result_unit: Any,
         **kwargs: Any,
     ) -> Any:
-        """Apply ``op`` to whole storages, then zero the halo cells of the results.
+        """Apply ``op`` to whole storages; new results with zero halo cells.
 
         The fast path of `_elementwise`: one pass over contiguous memory
         instead of a strided pass over the blocks and a copy into new storage.
-        The halo cells hold anything, so floating-point errors are ignored
-        here, as on CuPy; under ``numpy.errstate(...="raise")`` (or
-        ``"call"``) the blocks are computed alone instead, so that errors in
-        them still raise.
+        Inside `compute_halos` the halo cells of the results keep the values
+        computed from the inputs' halo cells instead of being zeroed.
         """
-        if any(mode in ("raise", "call") for mode in np.geterr().values()):
-            interior = self._layout.interior
-            storages = [s if xp.isscalar(s) else s[interior] for s in storages]
-            blocks_only = True
-        else:
-            blocks_only = False
         for index, factor in rescale.items():
             storages[index] = storages[index] * factor
-        if blocks_only:
+        with np.errstate(all="ignore"):  # the halo cells may hold anything
             result = op(*storages, **kwargs)
-        else:
-            with np.errstate(all="ignore"):
-                result = op(*storages, **kwargs)
+        keep_halos = _COMPUTE_HALOS.get()
         wrapped = []
         for block in result if isinstance(result, tuple) else (result,):
             block = xp.asarray(block)
-            if blocks_only:
-                storage = xp.zeros(self._layout.storage_shape, dtype=block.dtype)
-                storage[self._layout.interior] = block
-            else:
-                # a view (e.g. ``x.real``) or an input itself must not be zeroed
-                storage = (
-                    block
-                    if block.base is None and all(block is not s for s in storages)
-                    else block.copy()
-                )
+            # a view (e.g. ``x.real``) or an input itself must not be changed
+            storage = (
+                block
+                if block.base is None and all(block is not s for s in storages)
+                else block.copy()
+            )
+            if not keep_halos:
                 self._zero_halos(storage)
             wrapped_block = self._with_storage(storage)
             wrapped_block._unit = result_unit
             wrapped.append(wrapped_block)
         return tuple(wrapped) if isinstance(result, tuple) else wrapped[0]
+
+    def _halo_faces(self, slab: tuple[slice]) -> list[tuple[slice, ...]]:
+        """Return the halo layers of axes 1, 2, ... inside ``slab`` of the storage."""
+        faces = []
+        shape = self._layout.storage_shape
+        for axis, h in enumerate(self._layout.halo):
+            if axis == 0 or h == 0:
+                continue
+            for side in (slice(0, h), slice(shape[axis] - h, shape[axis])):
+                index = [*slab] + [slice(None)] * (self.ndim - 1)
+                index[axis] = side
+                faces.append(tuple(index))
+        return faces
+
+    def _elementwise_into(
+        self,
+        op: Callable,
+        storages: list[Any],
+        rescale: dict[int, Any],
+        result_unit: Any,
+        out: tuple[DistributedArray, ...],
+        **kwargs: Any,
+    ) -> Any:
+        """Apply ``op`` into ``out`` over a contiguous slab; None if not worth it.
+
+        The in-place fast path of `_elementwise`. The slab is the storage
+        without the halo layers of the first axis: one contiguous run of
+        memory, which NumPy and CuPy process much faster than the strided
+        block (1.5-2x in 3-D). The halo cells of ``out`` inside it (those of
+        the other axes) are saved first and written back afterwards, so they
+        are kept, as the in-place operations promise. Inside `compute_halos`
+        the whole storage is computed and nothing is restored.
+
+        Returns None (use the block path) when the block itself is
+        contiguous already (no halo cells but along the first axis), when it
+        is small (fewer than `_SLAB_MIN_SIZE` storage cells, where saving and
+        restoring the halo cells costs more than it saves), or when the
+        outputs are not C-ordered.
+        """
+        keep_halos = not _COMPUTE_HALOS.get()
+        halo = self._layout.halo
+        shape = self._layout.storage_shape
+        if not all(item._data.flags.c_contiguous for item in out) or (
+            keep_halos and (not any(halo[1:]) or math.prod(shape) < _SLAB_MIN_SIZE)
+        ):
+            return None
+        if keep_halos:
+            slab = (slice(halo[0], shape[0] - halo[0]),)
+            faces = self._halo_faces(slab)
+        else:
+            slab = (slice(None),)
+            faces = []
+        inputs = [s if xp.isscalar(s) else s[slab] for s in storages]
+        for index, factor in rescale.items():
+            inputs[index] = inputs[index] * factor
+        saved = [
+            (item, face, item._data[face].copy()) for item in out for face in faces
+        ]
+        views = tuple(item._data[slab] for item in out)
+        with np.errstate(all="ignore"):  # the halo cells may hold anything
+            op(*inputs, out=views[0] if len(views) == 1 else views, **kwargs)
+        for item, face, values in saved:
+            item._data[face] = values
+        for item in out:
+            item._unit = result_unit
+        return out[0] if len(out) == 1 else out
 
     def _elementwise(
         self,
@@ -1610,8 +1704,12 @@ class DistributedArray:
 
         With ``whole_storage`` (default), operands that line up with the whole
         storage (this layout's distributed arrays and scalars) are computed in
-        one pass over it, see `_elementwise_on_storage`; pass False for an
-        ``op`` that holds block-shaped data of its own.
+        one pass over it, see `_elementwise_on_storage` and
+        `_elementwise_into`; pass False for an ``op`` that holds block-shaped
+        data of its own. Floating-point errors are then ignored, since the
+        halo cells may hold anything, except under
+        ``numpy.errstate(...="raise")`` (or ``"call"``), where the blocks
+        alone are computed so that errors in them still raise.
 
         Without ``out`` the results get zero halo cells; with ``out`` the
         results are written into the blocks of ``out``, whose halo cells are
@@ -1629,10 +1727,24 @@ class DistributedArray:
             result_unit, rescale = _units.plan(op, inputs)
         raw = tuple(_units.raw(x) for x in inputs)
         storages = self._storage_operands(raw) if whole_storage else None
-        if storages is not None and out is None and "where" not in kwargs:
-            return self._elementwise_on_storage(
-                op, storages, rescale, result_unit, **kwargs
+        if (
+            storages is not None
+            and "where" not in kwargs
+            and not any(mode in ("raise", "call") for mode in np.geterr().values())
+        ):
+            # Whole storages (or slabs) at once; under errstate "raise" the
+            # blocks alone, below, so that only errors in them raise.
+            if out is None:
+                return self._elementwise_on_storage(
+                    op, list(storages), rescale, result_unit, **kwargs
+                )
+            for item in out:
+                self._check_compatibility(item)
+            done = self._elementwise_into(
+                op, storages, rescale, result_unit, out, **kwargs
             )
+            if done is not None:
+                return done
         if storages is not None:  # no coercion needed: the blocks of the storages
             interior = self._layout.interior
             local_inputs: list[Any] = [

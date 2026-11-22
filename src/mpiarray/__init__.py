@@ -40,7 +40,7 @@ from mpiarray.creation import (
     zeros,
     zeros_like,
 )
-from mpiarray.distributed_array import DistributedArray, HaloUpdate
+from mpiarray.distributed_array import DistributedArray, HaloUpdate, compute_halos
 from mpiarray.io import load, load_hdf5, save, save_hdf5
 from mpiarray.layout import Layout, block_numbering, chunk_bounds, process_grid
 
@@ -154,6 +154,7 @@ __all__ = [
     "cbrt",
     "ceil",
     "chunk_bounds",
+    "compute_halos",
     "conj",
     "conjugate",
     "copy_boxes",

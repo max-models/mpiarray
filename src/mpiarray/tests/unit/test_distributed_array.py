@@ -918,3 +918,55 @@ def test_allreduce_of_booleans_takes_min_and_max_as_and_and_or() -> None:
     assert _allreduce_scalar(comm, mine, MPI.MIN) is (size == 1)
     assert _allreduce_scalar(comm, mine, MPI.MAX) is True
     assert _allreduce_scalar(comm, np.float16(1.0), MPI.SUM) == size
+
+
+@pytest.mark.parametrize(
+    ("shape", "halo"),
+    [((W, 5, 4), (1, 1, 1)), ((W, 6), (2, 1)), ((W, 6), (0, 2)), ((W, 6), (1, 0))],
+)
+@pytest.mark.parametrize("slab_min_size", [0, 10**9])
+def test_in_place_operations_keep_every_halo_cell(
+    shape, halo, slab_min_size, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "mpiarray.distributed_array._SLAB_MIN_SIZE", slab_min_size
+    )  # the slab path and the block path
+    rng = np.random.default_rng(5)
+    a = mpa.array(rng.normal(size=shape), halo=halo)
+    b = mpa.array(rng.normal(size=shape), halo=halo)
+    expected = _np(a.local) + 2 * _np(b.local)
+    halos = rng.normal(size=a.layout.storage_shape)
+    mask = _halo_mask(a)
+    storage = _np(a.local_with_halos).copy()
+    storage[mask] = halos[mask]
+    a.local_with_halos[...] = xp.asarray(storage)
+    a += b
+    np.add(a, b, out=a)  # ty: ignore[no-matching-overload]
+    np.testing.assert_allclose(_np(a.local), expected)
+    np.testing.assert_array_equal(_np(a.local_with_halos)[mask], halos[mask])
+    quotient, remainder = mpa.zeros_like(a), mpa.zeros_like(a)
+    quotient.local_with_halos[...] = 7.0
+    np.divmod(a, 3.0, out=(quotient, remainder))  # ty: ignore[no-matching-overload]
+    assert (_np(quotient.local_with_halos)[mask] == 7.0).all()
+    np.testing.assert_array_equal(_np(quotient.local), np.floor(_np(a.local) / 3.0))
+
+
+def test_compute_halos_keeps_filled_halos_up_to_date() -> None:
+    rng = np.random.default_rng(9)
+    shape = (W, 6, 5)
+    a = mpa.array(rng.normal(size=shape), halo=1, periodic=True, split=(0, 1))
+    b = mpa.array(rng.normal(size=shape) + 3, halo=1, periodic=True, split=(0, 1))
+    a.update_halos()
+    b.update_halos()
+    with mpa.compute_halos():
+        c = a * b + 1.0
+        c /= b
+        d = cast("DistributedArray", np.sqrt(np.abs(c)))
+    for result in (c, d):
+        reference = result.copy()
+        reference.update_halos()
+        np.testing.assert_allclose(
+            _np(result.local_with_halos), _np(reference.local_with_halos)
+        )
+    e = a * b  # outside the context the halos are zero again
+    assert not _np(e.local_with_halos)[_halo_mask(e)].any()

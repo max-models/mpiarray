@@ -18,6 +18,10 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   blocks). Floating-point warnings are not raised there, since the halo cells may hold anything
   (as on CuPy); under `np.errstate(...="raise")` the blocks alone are computed, so errors in
   them still raise.
+- Faster in-place operations (`a += b`, `out=`): on C-ordered storage of at least 16384 cells
+  with halo cells along more than the first axis, they go over the storage without the first
+  axis's halo layers, one contiguous run, and save and restore the other halo cells, which they
+  still keep (about 2× faster on 3-D blocks of 64³ cells and more).
 - Faster whole-array reductions (`sum`, `min`, `max`, `dot`, `norm`, `all`, `any`, ...): the
   per-rank values are combined with a buffer `Allreduce` instead of a pickled `allreduce` (about
   10× less latency).
@@ -32,6 +36,12 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   take cunumpy from its `devel` branch through `[tool.uv.sources]`.
 
 ### Added
+
+- `mpa.compute_halos()`, a context in which elementwise operations compute the halo cells too:
+  results are the operation applied to the inputs' halo cells, so arrays whose halos were up to
+  date stay up to date without another `update_halos`, and in-place operations go over the whole
+  storage at once. Only for halos filled from the neighbours, not for values waiting for
+  `accumulate_halos`.
 
 - A [Domain decomposition](https://max-models.github.io/mpiarray/guides/decomposition/) guide: how
   the process grid, the cut points, the rank numbering, the neighbours and the halo cells are
