@@ -14,10 +14,12 @@ from __future__ import annotations
 
 import bisect
 import contextlib
+import contextvars
 import functools
 import itertools
 import math
-from collections.abc import Callable, Iterator, Sequence
+import weakref
+from collections.abc import Callable, Generator, Iterator, Sequence
 from types import EllipsisType, NotImplementedType
 from typing import TYPE_CHECKING, Any, TypeAlias, TypeGuard, cast, overload
 
@@ -66,6 +68,103 @@ def _subarray(
 
     base = dtlib.from_numpy_dtype(np.dtype(dtype))
     return base.Create_subarray(list(shape), list(sizes), list(starts)).Commit()
+
+
+#: Storage cells from which in-place operations go over a contiguous slab
+#: (see `DistributedArray._elementwise_into`); below it the halo cells cost
+#: more to save and restore than the slab saves.
+_SLAB_MIN_SIZE = 16384
+
+_COMPUTE_HALOS: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "mpiarray_compute_halos", default=False
+)
+
+
+@contextlib.contextmanager
+def compute_halos() -> Generator[None, None, None]:
+    """Compute elementwise operations on the halo cells too, inside the block.
+
+    Normally results get zero halo cells and in-place operations
+    (``a += b``, ``out=``) leave them as they are. Inside this context both
+    compute the halo cells like the block: a result's halo cell holds the
+    operation applied to the inputs' halo cells. When the inputs' halos are
+    up to date (`DistributedArray.update_halos`), so are the results', and
+    no halo update is needed after the operation; it is also faster, since
+    whole storages are computed in one pass.
+
+    Only for halos filled with neighbour values: halo cells that still hold
+    values to accumulate (before `DistributedArray.accumulate_halos`) would
+    be changed. Operands that do not line up with the storage (other layouts,
+    plain arrays) and ``where=`` take the usual path.
+
+    Example:
+        >>> a.update_halos(); b.update_halos()
+        >>> with mpa.compute_halos():
+        ...     c = a * b + 1.0  # c's halos are up to date too
+        ...     a += c  # and so are a's
+    """
+    token = _COMPUTE_HALOS.set(True)
+    try:
+        yield
+    finally:
+        _COMPUTE_HALOS.reset(token)
+
+
+def _posting(comm: Any, persistent: bool) -> tuple[Callable, Callable]:
+    """Return ``(receive, send)``: started or persistent (not started) requests."""
+    if persistent:
+        return comm.Recv_init, comm.Send_init
+    return comm.Irecv, comm.Isend
+
+
+def _free_requests(requests: list) -> None:
+    """Free persistent requests, unless MPI is already finalized."""
+    if MPI.Is_finalized():
+        return
+    for request in requests:
+        if request != MPI.REQUEST_NULL:
+            request.Free()
+
+
+class _HaloPlan:
+    """The persistent requests of one kind of halo exchange of one array.
+
+    Made by the first exchange and started again by every later one, so an
+    exchange costs one ``Startall`` and one ``Waitall`` instead of building
+    and posting every message anew. Freed with the array.
+
+    Args:
+        requests: The persistent requests, not started.
+        arrivals: ``(storage region, buffer)`` of the receives into buffers.
+    """
+
+    def __init__(
+        self, requests: list, arrivals: list[tuple[tuple[slice, ...], Array]]
+    ) -> None:
+        """Keep the requests; free them when the plan is collected."""
+        self.requests = requests
+        self.arrivals = arrivals
+        self.active = False
+        weakref.finalize(self, _free_requests, requests)
+
+    def start(self) -> None:
+        """Start every request.
+
+        Raises:
+            RuntimeError: If the previous exchange of this kind was not waited for.
+        """
+        if self.active:
+            raise RuntimeError(
+                "the previous halo exchange of this array is still in flight; "
+                "call its wait() first",
+            )
+        MPI.Prequest.Startall(self.requests)
+        self.active = True
+
+    def wait(self) -> None:
+        """Wait for every request; they can be started again afterwards."""
+        MPI.Request.Waitall(self.requests)
+        self.active = False
 
 
 class HaloUpdate:
@@ -170,6 +269,31 @@ def _host(value: Any) -> Any:
     if xp.is_gpu(value):
         return xp.to_numpy(value)[()]
     return value
+
+
+def _allreduce_scalar(comm: Any, value: Any, mpi_op: Any) -> Any:
+    """Combine a host scalar over ``comm`` with a buffer ``Allreduce``.
+
+    About ten times faster than mpi4py's pickling ``allreduce`` for one
+    number. A Python scalar comes back as a Python scalar, a NumPy scalar as a
+    NumPy scalar. Values without an MPI type (e.g. objects) are pickled.
+    """
+    array = np.asarray(value)
+    if array.dtype.kind not in "biufc" or array.dtype.char == "e":  # no MPI half
+        return comm.allreduce(value, op=mpi_op)
+    if array.dtype.kind == "b":
+        # MPI combines booleans only logically; min and max are and and or
+        if mpi_op == MPI.MIN:
+            mpi_op = MPI.LAND
+        elif mpi_op == MPI.MAX:
+            mpi_op = MPI.LOR
+        if not (mpi_op == MPI.LAND or mpi_op == MPI.LOR or mpi_op == MPI.LXOR):
+            return comm.allreduce(value, op=mpi_op)
+    result = np.empty((), dtype=array.dtype)
+    comm.Allreduce(array, result, op=mpi_op)
+    return (
+        result.item() if isinstance(value, bool | int | float | complex) else result[()]
+    )
 
 
 def _is_int(item: object) -> TypeGuard[int | np.integer]:
@@ -862,19 +986,67 @@ class DistributedArray:
             self._halo_buffers[key] = staging
         return staging
 
+    def _halo_plan(self, key: tuple, post: Callable[[list, list], None]) -> _HaloPlan:
+        """Return the persistent requests of a halo exchange, made on first use.
+
+        ``post(requests, arrivals)`` makes them; they are kept with the array
+        and started again by every later exchange of the same kind.
+        """
+        key = ("plan", *key)
+        plan = self._halo_buffers.get(key)
+        if plan is None:
+            requests: list = []
+            arrivals: list[tuple[tuple[slice, ...], Array]] = []
+            post(requests, arrivals)
+            plan = _HaloPlan(requests, arrivals)
+            self._halo_buffers[key] = plan
+        return plan
+
+    def _arrive(
+        self, arrivals: list[tuple[tuple[slice, ...], Array]], accumulate: bool
+    ) -> None:
+        """Write (update) or add (accumulate) received buffers into the storage."""
+        for region, buffer in arrivals:
+            if accumulate:
+                self._data[region] += buffer
+            else:
+                self._data[region] = buffer
+
+    def _receiving(
+        self,
+        buffer: Array,
+        key: tuple,
+        sizes: tuple[int, ...],
+        stack: contextlib.ExitStack | None,
+    ) -> Any:
+        """Return what MPI receives into for ``buffer``: itself, or its host staging.
+
+        Without a ``stack`` (persistent requests, host storage) the buffer
+        itself; otherwise the buffer as `xp.mpi.mpi_buffer` hands it to MPI,
+        copied back to the device when ``stack`` closes.
+        """
+        if stack is None:
+            return buffer
+        receiving = xp.mpi.mpi_buffer(
+            buffer, send=False, recv=True, staging=self._staging(key, sizes)
+        )
+        return stack.enter_context(receiving)
+
     def _post_axis(
         self,
         axis: int,
         accumulate: bool,
         requests: list,
         arrivals: list[tuple[tuple[slice, ...], Array]],
-        stack: contextlib.ExitStack,
+        stack: contextlib.ExitStack | None,
     ) -> None:
         """Post the two receives and two sends of a halo exchange along ``axis``.
 
         Fills ``requests`` with the MPI requests and ``arrivals`` with the
         ``(storage region, buffer)`` pairs whose received values are written
-        (update) or added (accumulate) once the requests are done.
+        (update) or added (accumulate) once the requests are done. Without a
+        ``stack`` the requests are persistent ones, not started, for host
+        storage sent in place (see `_halo_plan`).
         """
         layout = self._layout
         # Exchanges only run between different ranks, so under a real MPI
@@ -894,25 +1066,23 @@ class DistributedArray:
                 ("upper_interior", right, "lower_halo", left, tag),
                 ("lower_interior", left, "upper_halo", right, tag + 1),
             ]
+        receive, send = _posting(comm, persistent=stack is None)
         in_place = self._sends_in_place()
         for send_name, dest, recv_name, source, message_tag in transfers:
             starts, sizes = self._region_bounds(axis, recv_name)
             if in_place and not accumulate:
                 datatype = _subarray(self._data.shape, starts, sizes, self.dtype.str)
                 requests.append(
-                    comm.Irecv(
-                        [self._data, 1, datatype], source=source, tag=message_tag
-                    )
+                    receive([self._data, 1, datatype], source=source, tag=message_tag)
                 )
             else:
                 key = (axis, recv_name)
                 buffer = self._buffer(key, sizes)
-                receiving = xp.mpi.mpi_buffer(
-                    buffer, send=False, recv=True, staging=self._staging(key, sizes)
-                )
                 requests.append(
-                    comm.Irecv(
-                        stack.enter_context(receiving), source=source, tag=message_tag
+                    receive(
+                        self._receiving(buffer, key, sizes, stack),
+                        source=source,
+                        tag=message_tag,
                     )
                 )
                 if source != MPI.PROC_NULL:
@@ -922,36 +1092,50 @@ class DistributedArray:
             if in_place:
                 datatype = _subarray(self._data.shape, starts, sizes, self.dtype.str)
                 requests.append(
-                    comm.Isend([self._data, 1, datatype], dest=dest, tag=message_tag)
+                    send([self._data, 1, datatype], dest=dest, tag=message_tag)
                 )
             else:
+                assert stack is not None  # persistent requests send in place
                 key = (axis, send_name, "send")
                 buffer = self._buffer(key, sizes)
                 buffer[...] = self._data[self._region(axis, send_name)]
                 sending = xp.mpi.mpi_buffer(buffer, staging=self._staging(key, sizes))
                 requests.append(
-                    comm.Isend(stack.enter_context(sending), dest=dest, tag=message_tag)
+                    send(stack.enter_context(sending), dest=dest, tag=message_tag)
                 )
 
     def _exchange(self, axes: Sequence[int], accumulate: bool) -> HaloUpdate:
-        """Start the halo exchange along ``axes``; return the handle that finishes it."""
-        requests: list = []
-        arrivals: list[tuple[tuple[slice, ...], Array]] = []
-        stack = contextlib.ExitStack()
+        """Start the halo exchange along ``axes``; return the handle that finishes it.
+
+        Host storage reuses persistent requests made by the first exchange
+        (see `_halo_plan`); device storage posts new ones through buffers.
+        """
         if axes:
             name = "accumulate_halos" if accumulate else "update_halos"
             check_collective(self._layout.comm, f"{name} (axes {tuple(axes)})")
-        for axis in axes:
-            self._post_axis(axis, accumulate, requests, arrivals, stack)
+        if axes and self._sends_in_place():
+
+            def post(requests: list, arrivals: list) -> None:
+                for axis in axes:
+                    self._post_axis(axis, accumulate, requests, arrivals, None)
+
+            plan = self._halo_plan(("axes", tuple(axes), accumulate), post)
+            plan.start()
+            wait, arrivals = plan.wait, plan.arrivals
+        else:
+            requests: list = []
+            arrivals = []
+            stack = contextlib.ExitStack()
+            for axis in axes:
+                self._post_axis(axis, accumulate, requests, arrivals, stack)
+
+            def wait() -> None:
+                MPI.Request.Waitall(requests)
+                stack.close()  # copies staged receives back to the device
 
         def finish() -> None:
-            MPI.Request.Waitall(requests)
-            stack.close()  # copies staged receives back to the device
-            for region, buffer in arrivals:
-                if accumulate:
-                    self._data[region] += buffer
-                else:
-                    self._data[region] = buffer
+            wait()
+            self._arrive(arrivals, accumulate)
             if accumulate:
                 for axis in axes:
                     self.clear_halos(axis)
@@ -1066,14 +1250,17 @@ class DistributedArray:
             coord.append(c)
         return layout.rank_of(coord)
 
-    def _neighbourhood_exchange(
-        self, accumulate: bool, boundary: Boundary
-    ) -> HaloUpdate:
-        """Exchange every halo region directly with its neighbour, diagonals included.
+    def _post_neighbourhood(
+        self,
+        accumulate: bool,
+        requests: list,
+        arrivals: list[tuple[tuple[slice, ...], Array]],
+        stack: contextlib.ExitStack | None,
+    ) -> None:
+        """Post the messages to every neighbour, diagonal ones included.
 
-        One round of messages for all axes (up to 26 neighbours in 3-D), so
-        corners need no second step; see `update_halos` and `accumulate_halos`
-        with ``wait=False``.
+        Like `_post_axis`: without a ``stack`` the requests are persistent
+        ones, not started.
         """
         layout = self._layout
         comm = cast("MPI.Comm", layout.comm)
@@ -1086,15 +1273,11 @@ class DistributedArray:
         tags: dict[tuple[int, ...], int] = {
             offset: _NEIGHBOUR_TAG + k for k, offset in enumerate(offsets)
         }
-        name = "accumulate_halos" if accumulate else "update_halos"
-        check_collective(comm, f"{name} (neighbourhood)")
+        receive, send = _posting(comm, persistent=stack is None)
         in_place = self._sends_in_place() and not accumulate
-        requests: list = []
-        arrivals: list[tuple[tuple[slice, ...], Array]] = []
-        stack = contextlib.ExitStack()
         for offset in offsets:
             opposite = tuple(-o for o in offset)
-            source, dest = self._neighbour(offset), self._neighbour(offset)
+            source = dest = self._neighbour(offset)
             # receive: what the neighbour at ``offset`` sent towards us
             target = self._box(offset, halo_side=not accumulate)
             sizes = tuple(sl.stop - sl.start for sl in target)
@@ -1106,19 +1289,16 @@ class DistributedArray:
                     self.dtype.str,
                 )
                 requests.append(
-                    comm.Irecv(
+                    receive(
                         [self._data, 1, datatype], source=source, tag=tags[opposite]
                     )
                 )
             else:
                 key = ("neighbourhood", offset, accumulate)
                 buffer = self._buffer(key, sizes)
-                receiving = xp.mpi.mpi_buffer(
-                    buffer, send=False, recv=True, staging=self._staging(key, sizes)
-                )
                 requests.append(
-                    comm.Irecv(
-                        stack.enter_context(receiving),
+                    receive(
+                        self._receiving(buffer, key, sizes, stack),
                         source=source,
                         tag=tags[opposite],
                     )
@@ -1136,27 +1316,52 @@ class DistributedArray:
                     self.dtype.str,
                 )
                 requests.append(
-                    comm.Isend([self._data, 1, datatype], dest=dest, tag=tags[offset])
+                    send([self._data, 1, datatype], dest=dest, tag=tags[offset])
                 )
             else:
+                assert stack is not None  # persistent requests send in place
                 key = ("neighbourhood send", offset, accumulate)
                 buffer = self._buffer(key, sizes)
                 buffer[...] = self._data[box]
                 sending = xp.mpi.mpi_buffer(buffer, staging=self._staging(key, sizes))
                 requests.append(
-                    comm.Isend(
-                        stack.enter_context(sending), dest=dest, tag=tags[offset]
-                    )
+                    send(stack.enter_context(sending), dest=dest, tag=tags[offset])
                 )
 
+    def _neighbourhood_exchange(
+        self, accumulate: bool, boundary: Boundary
+    ) -> HaloUpdate:
+        """Exchange every halo region directly with its neighbour, diagonals included.
+
+        One round of messages for all axes (up to 26 neighbours in 3-D), so
+        corners need no second step; see `update_halos` and `accumulate_halos`
+        with ``wait=False``. Host storage reuses persistent requests made by
+        the first exchange (see `_halo_plan`).
+        """
+        name = "accumulate_halos" if accumulate else "update_halos"
+        check_collective(self._layout.comm, f"{name} (neighbourhood)")
+        if self._sends_in_place():
+            plan = self._halo_plan(
+                ("neighbourhood", accumulate),
+                lambda requests, arrivals: self._post_neighbourhood(
+                    accumulate, requests, arrivals, None
+                ),
+            )
+            plan.start()
+            wait, arrivals = plan.wait, plan.arrivals
+        else:
+            requests: list = []
+            arrivals = []
+            stack = contextlib.ExitStack()
+            self._post_neighbourhood(accumulate, requests, arrivals, stack)
+
+            def wait() -> None:
+                MPI.Request.Waitall(requests)
+                stack.close()  # copies staged receives back to the device
+
         def finish() -> None:
-            MPI.Request.Waitall(requests)
-            stack.close()
-            for region, buffer in arrivals:
-                if accumulate:
-                    self._data[region] += buffer
-                else:
-                    self._data[region] = buffer
+            wait()
+            self._arrive(arrivals, accumulate)
             if accumulate:
                 self.clear_halos()
             else:
@@ -1178,7 +1383,9 @@ class DistributedArray:
         This is what a finite-difference stencil needs before it is applied.
         At walls (non-periodic boundaries) the halo cells are left unchanged.
         Both directions of an axis are exchanged at the same time, and host
-        storage is sent and received in place, without copies.
+        storage is sent and received in place, without copies, with
+        persistent MPI requests that the first exchange makes and later ones
+        reuse.
 
         With ``wait=True`` the axes are updated one after the other, so the
         corner halo cells are filled too. With ``wait=False`` the messages to
@@ -1211,6 +1418,8 @@ class DistributedArray:
         Raises:
             ValueError: For an unknown ``boundary``, or ``"reflect"`` with too
                 narrow blocks (on every rank).
+            RuntimeError: If an earlier ``wait=False`` update of this array
+                was not waited for.
         """
         self._check_boundary(boundary)
         # without ranks to send to, wait=False is done at once too
@@ -1353,14 +1562,154 @@ class DistributedArray:
             )
         ]
 
+    def _storage_operands(self, inputs: tuple[Any, ...]) -> list[Any] | None:
+        """Return the operands as whole storages, or None if one does not line up.
+
+        Distributed arrays with this layout give their storage, scalars stay
+        scalars; anything else (other arrays, other layouts) returns None and
+        goes through `_coerce_other_data`.
+        """
+        layout = self._layout
+        storages = []
+        for x in inputs:
+            if isinstance(x, DistributedArray) and x._layout == layout:
+                storages.append(x._data)
+            elif isinstance(x, int | float | complex | np.generic):
+                storages.append(x)
+            else:
+                return None
+        return storages
+
+    def _zero_halos(self, storage: Array) -> None:
+        """Set the halo cells of a storage array with this layout to zero."""
+        for axis, h in enumerate(self._layout.halo):
+            if h:
+                index: list[slice] = [slice(None)] * storage.ndim
+                index[axis] = slice(0, h)
+                storage[tuple(index)] = 0
+                index[axis] = slice(storage.shape[axis] - h, None)
+                storage[tuple(index)] = 0
+
+    def _elementwise_on_storage(
+        self,
+        op: Callable,
+        storages: list[Any],
+        rescale: dict[int, Any],
+        result_unit: Any,
+        **kwargs: Any,
+    ) -> Any:
+        """Apply ``op`` to whole storages; new results with zero halo cells.
+
+        The fast path of `_elementwise`: one pass over contiguous memory
+        instead of a strided pass over the blocks and a copy into new storage.
+        Inside `compute_halos` the halo cells of the results keep the values
+        computed from the inputs' halo cells instead of being zeroed.
+        """
+        for index, factor in rescale.items():
+            storages[index] = storages[index] * factor
+        with np.errstate(all="ignore"):  # the halo cells may hold anything
+            result = op(*storages, **kwargs)
+        keep_halos = _COMPUTE_HALOS.get()
+        wrapped = []
+        for block in result if isinstance(result, tuple) else (result,):
+            block = xp.asarray(block)
+            # a view (e.g. ``x.real``) or an input itself must not be changed
+            storage = (
+                block
+                if block.base is None and all(block is not s for s in storages)
+                else block.copy()
+            )
+            if not keep_halos:
+                self._zero_halos(storage)
+            wrapped_block = self._with_storage(storage)
+            wrapped_block._unit = result_unit
+            wrapped.append(wrapped_block)
+        return tuple(wrapped) if isinstance(result, tuple) else wrapped[0]
+
+    def _halo_faces(self, slab: tuple[slice]) -> list[tuple[slice, ...]]:
+        """Return the halo layers of axes 1, 2, ... inside ``slab`` of the storage."""
+        faces = []
+        shape = self._layout.storage_shape
+        for axis, h in enumerate(self._layout.halo):
+            if axis == 0 or h == 0:
+                continue
+            for side in (slice(0, h), slice(shape[axis] - h, shape[axis])):
+                index = [*slab] + [slice(None)] * (self.ndim - 1)
+                index[axis] = side
+                faces.append(tuple(index))
+        return faces
+
+    def _elementwise_into(
+        self,
+        op: Callable,
+        storages: list[Any],
+        rescale: dict[int, Any],
+        result_unit: Any,
+        out: tuple[DistributedArray, ...],
+        **kwargs: Any,
+    ) -> Any:
+        """Apply ``op`` into ``out`` over a contiguous slab; None if not worth it.
+
+        The in-place fast path of `_elementwise`. The slab is the storage
+        without the halo layers of the first axis: one contiguous run of
+        memory, which NumPy and CuPy process much faster than the strided
+        block (1.5-2x in 3-D). The halo cells of ``out`` inside it (those of
+        the other axes) are saved first and written back afterwards, so they
+        are kept, as the in-place operations promise. Inside `compute_halos`
+        the whole storage is computed and nothing is restored.
+
+        Returns None (use the block path) when the block itself is
+        contiguous already (no halo cells but along the first axis), when it
+        is small (fewer than `_SLAB_MIN_SIZE` storage cells, where saving and
+        restoring the halo cells costs more than it saves), or when the
+        outputs are not C-ordered.
+        """
+        keep_halos = not _COMPUTE_HALOS.get()
+        halo = self._layout.halo
+        shape = self._layout.storage_shape
+        if not all(item._data.flags.c_contiguous for item in out) or (
+            keep_halos and (not any(halo[1:]) or math.prod(shape) < _SLAB_MIN_SIZE)
+        ):
+            return None
+        if keep_halos:
+            slab = (slice(halo[0], shape[0] - halo[0]),)
+            faces = self._halo_faces(slab)
+        else:
+            slab = (slice(None),)
+            faces = []
+        inputs = [s if xp.isscalar(s) else s[slab] for s in storages]
+        for index, factor in rescale.items():
+            inputs[index] = inputs[index] * factor
+        saved = [
+            (item, face, item._data[face].copy()) for item in out for face in faces
+        ]
+        views = tuple(item._data[slab] for item in out)
+        with np.errstate(all="ignore"):  # the halo cells may hold anything
+            op(*inputs, out=views[0] if len(views) == 1 else views, **kwargs)
+        for item, face, values in saved:
+            item._data[face] = values
+        for item in out:
+            item._unit = result_unit
+        return out[0] if len(out) == 1 else out
+
     def _elementwise(
         self,
         op: Callable,
         inputs: tuple[Any, ...],
         out: tuple[DistributedArray, ...] | None = None,
+        whole_storage: bool = True,
         **kwargs: Any,
     ) -> Any:
         """Apply ``op`` to the blocks of ``inputs``; halo cells are not computed.
+
+        With ``whole_storage`` (default), operands that line up with the whole
+        storage (this layout's distributed arrays and scalars) are computed in
+        one pass over it, see `_elementwise_on_storage` and
+        `_elementwise_into`; pass False for an ``op`` that holds block-shaped
+        data of its own. Floating-point errors are then ignored, since the
+        halo cells may hold anything, except under
+        ``numpy.errstate(...="raise")`` (or ``"call"``), where the blocks
+        alone are computed so that errors in them still raise.
 
         Without ``out`` the results get zero halo cells; with ``out`` the
         results are written into the blocks of ``out``, whose halo cells are
@@ -1376,9 +1725,33 @@ class DistributedArray:
 
         if any(_units.unit_of(x) is not None for x in inputs):
             result_unit, rescale = _units.plan(op, inputs)
-        local_inputs = [
-            self._interior_of(self._coerce_other_data(_units.raw(x))) for x in inputs
-        ]
+        raw = tuple(_units.raw(x) for x in inputs)
+        storages = self._storage_operands(raw) if whole_storage else None
+        if (
+            storages is not None
+            and "where" not in kwargs
+            and not any(mode in ("raise", "call") for mode in np.geterr().values())
+        ):
+            # Whole storages (or slabs) at once; under errstate "raise" the
+            # blocks alone, below, so that only errors in them raise.
+            if out is None:
+                return self._elementwise_on_storage(
+                    op, list(storages), rescale, result_unit, **kwargs
+                )
+            for item in out:
+                self._check_compatibility(item)
+            done = self._elementwise_into(
+                op, storages, rescale, result_unit, out, **kwargs
+            )
+            if done is not None:
+                return done
+        if storages is not None:  # no coercion needed: the blocks of the storages
+            interior = self._layout.interior
+            local_inputs: list[Any] = [
+                s if xp.isscalar(s) else s[interior] for s in storages
+            ]
+        else:
+            local_inputs = [self._interior_of(self._coerce_other_data(x)) for x in raw]
         for index, factor in rescale.items():
             local_inputs[index] = local_inputs[index] * factor
         where = kwargs.get("where", True)
@@ -1428,6 +1801,10 @@ class DistributedArray:
         The result gets zero halo cells. ``out=`` accepts distributed arrays
         with the same layout and writes into their blocks in place (their halo
         cells are kept), so ``np.multiply(a, 2.0, out=a)`` allocates nothing.
+        Without ``out`` and ``where``, operands with the same layout are
+        computed over their whole storage at once: floating-point warnings
+        are not raised then (the halo cells may hold anything), but errors in
+        the blocks still raise under ``np.errstate(...="raise")``.
 
         Args:
             ufunc: The ufunc being called.
@@ -1493,7 +1870,7 @@ class DistributedArray:
             return local_value
         with sp.region("mpiarray.allreduce", tags=PROFILE_TAGS):
             check_collective(self._layout.comm, name)
-            return self._layout.comm.allreduce(local_value, op=mpi_op)
+            return _allreduce_scalar(self._layout.comm, local_value, mpi_op)
 
     @sp.profile("mpiarray.reduce", tags=PROFILE_TAGS)
     def _global_reduction(
@@ -2639,7 +3016,9 @@ def _isclose(
     def isclose(x: Any, y: Any) -> Any:
         return xp.isclose(x, y, rtol=local_rtol, atol=local_atol, equal_nan=equal_nan)
 
-    return template._elementwise(isclose, (a, b))
+    # array tolerances line up with the blocks, not with the whole storages
+    whole = all(xp.isscalar(t) for t in (local_atol, local_rtol))
+    return template._elementwise(isclose, (a, b), whole_storage=whole)
 
 
 def _allclose(

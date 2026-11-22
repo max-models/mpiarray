@@ -84,3 +84,47 @@ def test_kept_buffers_are_reused(wait: bool) -> None:
     np.testing.assert_array_equal(
         xp.to_numpy(a.local_with_halos), xp.to_numpy(reference.local_with_halos)
     )
+
+
+@pytest.mark.parametrize("wait", [True, False])
+def test_repeated_exchanges_reuse_their_requests_and_see_new_values(wait) -> None:
+    rng = np.random.default_rng(3)
+    shape, halo, periodic = (L, L - 1, 5), (1, 2, 1), (True, True, False)
+    for step in range(3):
+        data = rng.normal(size=shape)
+        a = mpa.array(data, split=(0, 1), halo=halo, periodic=periodic)
+        reference = mpa.array(data, split=(0, 1), halo=halo, periodic=periodic)
+        if step == 0:
+            b = a
+        else:  # the same array again, with new values: its requests are reused
+            b.local_with_halos[...] = a.local_with_halos
+        reference.update_halos()
+        pending = b.update_halos(wait=wait)
+        if pending is not None:
+            pending.wait()
+        np.testing.assert_array_equal(
+            xp.to_numpy(b.local_with_halos), xp.to_numpy(reference.local_with_halos)
+        )
+        storage = rng.normal(size=b.layout.storage_shape) * (b.layout.rank + 1)
+        b.local_with_halos[...] = xp.asarray(storage)
+        reference.local_with_halos[...] = xp.asarray(storage)
+        reference.accumulate_halos()
+        pending = b.accumulate_halos(wait=wait)
+        if pending is not None:
+            pending.wait()
+        np.testing.assert_allclose(
+            xp.to_numpy(b.local_with_halos), xp.to_numpy(reference.local_with_halos)
+        )
+
+
+def test_starting_an_exchange_in_flight_raises() -> None:
+    a = mpa.ones((L, L), split=(0, 1), halo=1, periodic=True)
+    pending = a.update_halos(wait=False)
+    assert pending is not None
+    if a.layout.distributed and not xp.is_gpu(a.local_with_halos):
+        with pytest.raises(RuntimeError, match="still in flight"):
+            a.update_halos(wait=False)
+    pending.wait()
+    pending = a.update_halos(wait=False)
+    assert pending is not None
+    pending.wait()
