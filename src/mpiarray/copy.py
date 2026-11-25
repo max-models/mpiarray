@@ -24,7 +24,6 @@ halo cells between the target's own blocks are its own business
 
 from __future__ import annotations
 
-import math
 from collections.abc import Sequence
 from typing import Any
 
@@ -111,6 +110,14 @@ def _receiving_region(array: DistributedArray | None, box: Box) -> Box | None:
     return tuple(region)
 
 
+def _elements(array: DistributedArray) -> Any:
+    """The storage of an array, halos included, as one flat view."""
+    storage = array.local_with_halos
+    if not storage.flags.c_contiguous:
+        raise ValueError("a copy plan needs arrays with C-contiguous storage")
+    return storage.reshape(-1)
+
+
 class CopyPlan:
     """Copy boxes between arrays on parts of one communicator, again and again.
 
@@ -188,6 +195,30 @@ class CopyPlan:
                 layouts[id(array)] = found
             return found
 
+        # every copy's source and target as an index into the arrays (-1: none here)
+        order: dict[int, int] = {}
+        known: list[DistributedArray] = []
+
+        def number_of(array: DistributedArray | None) -> int:
+            if array is None:
+                return -1
+            found = order.get(id(array))
+            if found is None:
+                found = order[id(array)] = len(known)
+                known.append(array)
+            return found
+
+        source_of = np.array([number_of(c[0]) for c in copies], dtype=np.int64)
+        target_of = np.array([number_of(c[2]) for c in copies], dtype=np.int64)
+        infos = [layout(array) for array in known]
+
+        def table(ndim: int, item: int, empty: Any) -> np.ndarray:
+            """One item of every array's layout, a last row for none (index -1)."""
+            rows = [info[item] if len(info[0]) == ndim else empty for info in infos] + [
+                empty
+            ]
+            return np.array(rows, dtype=np.int64)
+
         roles = {}
         self._groups = []
         for ndim, numbers in groups.items():
@@ -197,45 +228,19 @@ class CopyPlan:
             sources = sources.reshape(k, ndim, 2)
             targets = targets.reshape(k, ndim, 2)
             # per copy: the source's shape, block, halo; the target's
-            zero = ((0, 0),) * ndim
-            source_info = [
-                None if (source := copies[n][0]) is None else layout(source)
-                for n in numbers
-            ]
-            target_info = [
-                None if (target := copies[n][2]) is None else layout(target)
-                for n in numbers
-            ]
-            has_source = np.array([info is not None for info in source_info])
-            has_target = np.array([info is not None for info in target_info])
-            source_shape = np.array(
-                [(0,) * ndim if i is None else i[0] for i in source_info],
-                dtype=np.int64,
-            ).reshape(k, ndim)
-            target_shape = np.array(
-                [(0,) * ndim if i is None else i[0] for i in target_info],
-                dtype=np.int64,
-            ).reshape(k, ndim)
-            source_halo = np.array(
-                [(0,) * ndim if i is None else i[1] for i in source_info],
-                dtype=np.int64,
-            ).reshape(k, ndim)
-            target_halo = np.array(
-                [(0,) * ndim if i is None else i[1] for i in target_info],
-                dtype=np.int64,
-            ).reshape(k, ndim)
-            source_block = np.array(
-                [zero if i is None else i[2] for i in source_info], dtype=np.int64
-            ).reshape(k, ndim, 2)
-            target_block = np.array(
-                [zero if i is None else i[2] for i in target_info], dtype=np.int64
-            ).reshape(k, ndim, 2)
-            writes = np.array(
-                [zero if i is None else i[4] for i in target_info], dtype=np.int64
-            ).reshape(k, ndim, 2)
-            sending = has_source & np.array(
-                [i is not None and i[3] for i in source_info], dtype=bool
-            )
+            zero, none = ((0, 0),) * ndim, (0,) * ndim
+            shapes, halos = table(ndim, 0, none), table(ndim, 1, none)
+            blocks, regions = table(ndim, 2, zero), table(ndim, 4, zero)
+            sends = np.array([bool(info[3]) for info in infos] + [False])
+            fits = np.array([len(info[0]) == ndim for info in infos] + [True])
+            source = source_of[np.asarray(numbers)]
+            target = target_of[np.asarray(numbers)]
+            has_source, has_target = source >= 0, target >= 0
+            source_shape, target_shape = shapes[source], shapes[target]
+            source_halo, target_halo = halos[source], halos[target]
+            source_block, target_block = blocks[source], blocks[target]
+            writes = regions[target]
+            sending = has_source & sends[source]
             extent = sources[..., 1] - sources[..., 0]
             bad = np.any(extent != targets[..., 1] - targets[..., 0], axis=1)
             bad |= np.any(extent <= 0, axis=1)
@@ -247,6 +252,7 @@ class CopyPlan:
                 | (targets[..., 1] > target_shape + target_halo),
                 axis=1,
             )
+            bad |= ~fits[source] | ~fits[target]  # an array of other dimensions
             if bad.any():  # the message of the first bad copy, checked alone
                 source, source_box, target, target_box = copies[
                     numbers[int(np.argmax(bad))]
@@ -268,21 +274,103 @@ class CopyPlan:
             roles[ndim] = (source_block, sending, writes, has_target)
         return roles, dtypes
 
+    def _layout(
+        self, parts: list[tuple], role: int, width: int, last: bool
+    ) -> tuple[list[tuple], list[int]]:
+        """The flat indices and buffer places per array of pieces, and the counts per rank.
+
+        A buffer holds the pieces for rank 0, then rank 1, ...; for each rank in
+        the order of the copies, the elements of a box in C order. ``role`` picks
+        the source (0) or the target (2) of a copy. With ``last``, an element that
+        several pieces write keeps only the last piece in the order of the
+        copies, so that the writes are one assignment and the last copy wins.
+        """
+        counts = [0] * self._size
+        if not parts:
+            return [], counts
+        numbers = np.concatenate([n for n, _, _ in parts])
+        others = np.concatenate([np.full(n.size, o) for n, o, _ in parts])
+        boxes = np.concatenate([b for _, _, b in parts])
+        # the arrays, and the strides of their storage (padded like the boxes)
+        index: dict[int, int] = {}
+        arrays: list[DistributedArray] = []
+        owner = np.empty(numbers.size, dtype=np.int64)
+        for k, n in enumerate(numbers.tolist()):
+            array = self._copies[n][role]
+            found = index.get(id(array))
+            if found is None:
+                found = index[id(array)] = len(arrays)
+                arrays.append(array)
+            owner[k] = found
+        strides = np.zeros((len(arrays), width), dtype=np.int64)
+        for a, array in enumerate(arrays):
+            shape = array.local_with_halos.shape
+            strides[a, width - len(shape) :] = np.cumprod(
+                (tuple(shape[1:]) + (1,))[::-1]
+            )[::-1]
+        extent = boxes[..., 1] - boxes[..., 0]
+        sizes = np.prod(extent, axis=1)
+        # buffer order: by rank, then by copy
+        order = np.lexsort((numbers, others))
+        offsets = np.empty(numbers.size, dtype=np.int64)
+        offsets[order] = np.cumsum(sizes[order]) - sizes[order]
+        for other, size in zip(others.tolist(), sizes.tolist(), strict=True):
+            counts[other] += size
+        # every element: its piece, its place in the buffer, its flat index
+        if last:  # written in the order of the copies (then of the ranks)
+            pieces = np.lexsort((others, numbers))
+        else:
+            pieces = order
+        piece = np.repeat(pieces, sizes[pieces])
+        start = np.repeat(np.cumsum(sizes[pieces]) - sizes[pieces], sizes[pieces])
+        within = np.arange(piece.size) - start
+        at = offsets[piece] + within
+        flat = np.zeros(piece.size, dtype=np.int64)
+        rest = within
+        for axis in range(width - 1, -1, -1):
+            span = extent[piece, axis]
+            flat += (boxes[piece, axis, 0] + rest % span) * strides[owner[piece], axis]
+            rest = rest // span
+        target = owner[piece]
+        if last:  # the last write of every element of every array
+            key = target * (int(flat.max()) + 1) + flat
+            _, keep = np.unique(key[::-1], return_index=True)
+            keep = np.sort(key.size - 1 - keep)
+            flat, at, target = flat[keep], at[keep], target[keep]
+        grouped = np.argsort(target, kind="stable")
+        bounds = np.searchsorted(target[grouped], np.arange(len(arrays) + 1))
+        result = []
+        for a, array in enumerate(arrays):
+            chosen = grouped[bounds[a] : bounds[a + 1]]
+            if chosen.size:
+                result.append((array, xp.asarray(flat[chosen]), xp.asarray(at[chosen])))
+        return result, counts
+
     def _plan(self, everyone: list) -> None:
-        """What this rank sends to and receives from every rank, in the order of the copies."""
+        """What this rank sends to and receives from every rank, in the order of the copies.
+
+        The pieces (a copy's part between two ranks) are rows of arrays: copy
+        number, the other rank, the box in the storage of the array; their
+        elements become flat storage indices and places in the buffers, per array.
+        """
         rank = self._comm.Get_rank()
-        sends: list[list[tuple]] = [[] for _ in range(self._size)]
-        receives: list[list[tuple]] = [[] for _ in range(self._size)]
+        width = max((group[1].shape[1] for group in self._groups), default=1)
+        sends: list[tuple] = []  # (copy numbers, other rank, storage boxes)
+        receives: list[tuple] = []
 
         def intersect(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             lower = np.maximum(a[..., 0], b[..., 0])
             upper = np.minimum(a[..., 1], b[..., 1])
             return np.stack([lower, upper], axis=-1), np.all(lower < upper, axis=-1)
 
-        def pieces(rows: np.ndarray) -> tuple[list[tuple[slice, ...]], list[int]]:
-            """The storage index of every box, and its number of elements."""
-            sizes = np.prod(rows[..., 1] - rows[..., 0], axis=1).tolist()
-            return [tuple(slice(a, b) for a, b in row) for row in rows.tolist()], sizes
+        def padded(boxes: np.ndarray) -> np.ndarray:
+            """Boxes with ``(0, 1)`` on the axes their arrays do not have."""
+            extra = width - boxes.shape[1]
+            if not extra:
+                return boxes
+            pad = np.zeros((boxes.shape[0], extra, 2), dtype=np.int64)
+            pad[..., 1] = 1
+            return np.concatenate([pad, boxes], axis=1)
 
         for (
             numbers,
@@ -307,11 +395,7 @@ class CopyPlan:
                 where = np.flatnonzero(ok)
                 if where.size:
                     local = part[where] - shift[where] - source_origin[where][..., None]
-                    indices, sizes = pieces(local)
-                    for n, index, size in zip(
-                        numbers[where].tolist(), indices, sizes, strict=True
-                    ):
-                        sends[other].append((n, self._copies[n][0], index, size))
+                    sends.append((numbers[where], other, padded(local)))
             # what this rank receives: the parts of each target it writes, from the senders
             for other in range(self._size):
                 theirs = everyone[other][0][ndim]
@@ -322,33 +406,13 @@ class CopyPlan:
                 where = np.flatnonzero(ok)
                 if where.size:
                     local = part[where] - target_origin[where][..., None]
-                    indices, sizes = pieces(local)
-                    for n, index, size in zip(
-                        numbers[where].tolist(), indices, sizes, strict=True
-                    ):
-                        receives[other].append((n, self._copies[n][2], index, size))
-        for found in (*sends, *receives):
-            found.sort(key=lambda piece: piece[0])  # the order of the copies
-        self._sends = [[(array, index) for _, array, index, _ in to] for to in sends]
-        self._receives = [
-            [(array, index, number) for number, array, index, _ in come]
-            for come in receives
-        ]
-        self._send_counts = [sum(piece[3] for piece in to) for to in sends]
-        self._receive_counts = [sum(piece[3] for piece in come) for come in receives]
+                    receives.append((numbers[where], other, padded(local)))
+        self._pack, self._send_counts = self._layout(sends, 0, width, last=False)
+        self._place, self._receive_counts = self._layout(receives, 2, width, last=True)
         self._send_offsets = [sum(self._send_counts[:r]) for r in range(self._size)]
         self._receive_offsets = [
             sum(self._receive_counts[:r]) for r in range(self._size)
         ]
-        # unpacked in the order of the copies, so that the last one wins
-        order = []
-        for other, come in enumerate(receives):
-            offset = self._receive_offsets[other]
-            for number, target, index, size in come:
-                order.append((number, other, offset, target, index))
-                offset += size
-        order.sort(key=lambda piece: (piece[0], piece[1]))
-        self._unpack = order
 
     def __init__(self, copies: Sequence[Copy], comm: Any = None) -> None:
         """Find where every box goes; collective (one ``allgather``)."""
@@ -394,17 +458,10 @@ class CopyPlan:
     @sp.profile("mpiarray.CopyPlan.execute", tags=PROFILE_TAGS)
     def execute(self) -> None:
         """Copy the boxes. Collective over the plan's communicator."""
-        parts = [
-            xp.ravel(source.local_with_halos[index])
-            for to_rank in self._sends
-            for source, index in to_rank
-        ]
         dtype = self._dtype
-        send = (
-            xp.concatenate(parts).astype(dtype, copy=False)
-            if parts
-            else xp.empty(0, dtype=dtype)
-        )
+        send = xp.empty(sum(self._send_counts), dtype=dtype)
+        for source, flat, at in self._pack:
+            send[at] = _elements(source)[flat]
         if self._size == 1:
             # everything goes to this rank, in the order it is unpacked
             receive = send
@@ -417,11 +474,8 @@ class CopyPlan:
                     [sendbuf, (self._send_counts, self._send_offsets)],
                     [recvbuf, (self._receive_counts, self._receive_offsets)],
                 )
-        for _, _, offset, target, index in self._unpack:
-            shape = tuple(s.stop - s.start for s in index)
-            target.local_with_halos[index] = receive[
-                offset : offset + math.prod(shape)
-            ].reshape(shape)
+        for target, flat, at in self._place:
+            _elements(target)[flat] = receive[at]
 
 
 def copy_boxes(copies: Sequence[Copy], comm: Any = None) -> None:
