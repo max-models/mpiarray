@@ -32,7 +32,7 @@ import cunumpy as xp
 import numpy as np
 import scope_profiler as sp
 
-from mpiarray._exchange import Box, local_index, overlap
+from mpiarray._exchange import Box
 from mpiarray._mpi import check_collective, default_comm
 from mpiarray._profiling import PROFILE_TAGS
 from mpiarray.distributed_array import DistributedArray
@@ -140,84 +140,213 @@ class CopyPlan:
             outside its array, an empty box or boxes of different shapes.
     """
 
-    def _plan(self, everyone: list) -> None:
-        """What this rank sends to and receives from every rank, in order."""
-        rank = self._comm.Get_rank()
-        sends: list[list[tuple[DistributedArray, tuple[slice, ...]]]] = [
-            [] for _ in range(self._size)
-        ]
-        receives: list[list[tuple[DistributedArray, tuple[slice, ...], int]]] = [
-            [] for _ in range(self._size)
-        ]
-        for number, (source, source_box, target, target_box) in enumerate(self._copies):
-            shift = [
-                t0 - s0 for (s0, _), (t0, _) in zip(source_box, target_box, strict=True)
-            ]
+    def _roles(self) -> tuple[dict[int, tuple], set[str]]:
+        """Where this rank sends from and writes to, for every copy, as arrays per dimension.
 
-            def moved(
-                block: Box | None, shift: list[int] = shift, box: Box = source_box
-            ) -> Box | None:
-                """The part of the source box in ``block``, in the target's indices."""
-                part = None if block is None else overlap(block, box)
-                if part is None:
-                    return None
-                return tuple(
-                    (s + d, e + d) for (s, e), d in zip(part, shift, strict=True)
-                )
+        The copies are grouped by the number of axes of their boxes. For each
+        group: the copy numbers, the source and target boxes, the lower corners
+        and halos of the arrays' blocks (for the storage index) and, per copy,
+        the block this rank sends from and the region it writes (with a flag
+        where it does neither). Raises the error of the first bad copy, as the
+        checks of one copy at a time would.
+        """
+        copies = self._copies
+        arrays = {
+            id(array): array
+            for source, _, target, _ in copies
+            for array in (source, target)
+            if array is not None
+        }
+        dtypes = {np.dtype(array.dtype).str for array in arrays.values()}
+        groups: dict[int, list[int]] = {}
+        for number, (_, source_box, _, target_box) in enumerate(copies):
+            if len(source_box) != len(target_box):
+                _boxes(source_box, target_box)  # raises: they differ in shape
+            groups.setdefault(len(source_box), []).append(number)
+        layouts: dict[int, tuple] = {}
 
-            my_send, my_receive = everyone[rank][0][number]
-            outgoing = moved(my_send)
-            # a rank sends from and receives into the arrays it holds
-            if outgoing is not None and source is not None:
-                for other in range(self._size):
-                    region = everyone[other][0][number][1]
-                    part = None if region is None else overlap(outgoing, region)
-                    if part is None:
-                        continue
-                    back = tuple(
-                        (s - d, e - d) for (s, e), d in zip(part, shift, strict=True)
-                    )
-                    layout = source.layout
-                    sends[other].append(
-                        (source, local_index(back, layout.index_bounds, layout.halo))
-                    )
-            if my_receive is not None and target is not None:
-                layout = target.layout
-                for other in range(self._size):
-                    incoming = moved(everyone[other][0][number][0])
-                    part = None if incoming is None else overlap(incoming, my_receive)
-                    if part is None:
-                        continue
-                    receives[other].append(
+        def layout(array: DistributedArray) -> tuple:
+            """Shape, halo, block and the block's sending and writing parts of an array."""
+            found = layouts.get(id(array))
+            if found is None:
+                info = array.layout
+                shape = tuple(info.shape)
+                halo = tuple(info.halo)
+                block = tuple(info.index_bounds)
+                sends = info.distributed or info.rank == 0
+                region = []
+                for (start, end), n, h in zip(block, shape, halo, strict=True):
+                    if not info.distributed:
+                        start, end = 0, n
+                    region.append(
                         (
-                            target,
-                            local_index(part, layout.index_bounds, layout.halo),
-                            number,
+                            start - h if start == 0 else start,
+                            end + h if end == n else end,
                         )
                     )
-        self._sends = sends
-        self._receives = receives
+                found = (shape, halo, block, sends, tuple(region))
+                layouts[id(array)] = found
+            return found
 
-        def counts(pieces: list) -> list[int]:
-            return [
-                sum(math.prod(s.stop - s.start for s in piece[1]) for piece in parts)
-                for parts in pieces
+        roles = {}
+        self._groups = []
+        for ndim, numbers in groups.items():
+            k = len(numbers)
+            sources = np.array([copies[n][1] for n in numbers], dtype=np.int64)
+            targets = np.array([copies[n][3] for n in numbers], dtype=np.int64)
+            sources = sources.reshape(k, ndim, 2)
+            targets = targets.reshape(k, ndim, 2)
+            # per copy: the source's shape, block, halo; the target's
+            zero = ((0, 0),) * ndim
+            source_info = [
+                None if (source := copies[n][0]) is None else layout(source)
+                for n in numbers
             ]
+            target_info = [
+                None if (target := copies[n][2]) is None else layout(target)
+                for n in numbers
+            ]
+            has_source = np.array([info is not None for info in source_info])
+            has_target = np.array([info is not None for info in target_info])
+            source_shape = np.array(
+                [(0,) * ndim if i is None else i[0] for i in source_info],
+                dtype=np.int64,
+            ).reshape(k, ndim)
+            target_shape = np.array(
+                [(0,) * ndim if i is None else i[0] for i in target_info],
+                dtype=np.int64,
+            ).reshape(k, ndim)
+            source_halo = np.array(
+                [(0,) * ndim if i is None else i[1] for i in source_info],
+                dtype=np.int64,
+            ).reshape(k, ndim)
+            target_halo = np.array(
+                [(0,) * ndim if i is None else i[1] for i in target_info],
+                dtype=np.int64,
+            ).reshape(k, ndim)
+            source_block = np.array(
+                [zero if i is None else i[2] for i in source_info], dtype=np.int64
+            ).reshape(k, ndim, 2)
+            target_block = np.array(
+                [zero if i is None else i[2] for i in target_info], dtype=np.int64
+            ).reshape(k, ndim, 2)
+            writes = np.array(
+                [zero if i is None else i[4] for i in target_info], dtype=np.int64
+            ).reshape(k, ndim, 2)
+            sending = has_source & np.array(
+                [i is not None and i[3] for i in source_info], dtype=bool
+            )
+            extent = sources[..., 1] - sources[..., 0]
+            bad = np.any(extent != targets[..., 1] - targets[..., 0], axis=1)
+            bad |= np.any(extent <= 0, axis=1)
+            bad |= has_source & np.any(
+                (sources[..., 0] < 0) | (sources[..., 1] > source_shape), axis=1
+            )
+            bad |= has_target & np.any(
+                (targets[..., 0] < -target_halo)
+                | (targets[..., 1] > target_shape + target_halo),
+                axis=1,
+            )
+            if bad.any():  # the message of the first bad copy, checked alone
+                source, source_box, target, target_box = copies[
+                    numbers[int(np.argmax(bad))]
+                ]
+                source_box, target_box = _boxes(source_box, target_box)
+                _sending_block(source, source_box)
+                _receiving_region(target, target_box)
+            self._groups.append(
+                (
+                    np.array(numbers),
+                    sources,
+                    targets,
+                    source_block[..., 0] - source_halo,
+                    target_block[..., 0] - target_halo,
+                    has_source,
+                    has_target,
+                )
+            )
+            roles[ndim] = (source_block, sending, writes, has_target)
+        return roles, dtypes
 
-        self._send_counts = counts(sends)
-        self._receive_counts = counts(receives)
+    def _plan(self, everyone: list) -> None:
+        """What this rank sends to and receives from every rank, in the order of the copies."""
+        rank = self._comm.Get_rank()
+        sends: list[list[tuple]] = [[] for _ in range(self._size)]
+        receives: list[list[tuple]] = [[] for _ in range(self._size)]
+
+        def intersect(a: np.ndarray, b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            lower = np.maximum(a[..., 0], b[..., 0])
+            upper = np.minimum(a[..., 1], b[..., 1])
+            return np.stack([lower, upper], axis=-1), np.all(lower < upper, axis=-1)
+
+        def pieces(rows: np.ndarray) -> tuple[list[tuple[slice, ...]], list[int]]:
+            """The storage index of every box, and its number of elements."""
+            sizes = np.prod(rows[..., 1] - rows[..., 0], axis=1).tolist()
+            return [tuple(slice(a, b) for a, b in row) for row in rows.tolist()], sizes
+
+        for (
+            numbers,
+            sources,
+            targets,
+            source_origin,
+            target_origin,
+            has_source,
+            has_target,
+        ) in self._groups:
+            ndim = sources.shape[1]
+            shift = (targets[..., 0] - sources[..., 0])[..., None]
+            mine = everyone[rank][0][ndim]
+            # what this rank sends: its block of each source, to the ranks that write it
+            outgoing, sent = intersect(mine[0], sources)
+            sent &= mine[1] & has_source
+            outgoing = outgoing + shift
+            for other in range(self._size):
+                theirs = everyone[other][0][ndim]
+                part, ok = intersect(outgoing, theirs[2])
+                ok &= sent & theirs[3]
+                where = np.flatnonzero(ok)
+                if where.size:
+                    local = part[where] - shift[where] - source_origin[where][..., None]
+                    indices, sizes = pieces(local)
+                    for n, index, size in zip(
+                        numbers[where].tolist(), indices, sizes, strict=True
+                    ):
+                        sends[other].append((n, self._copies[n][0], index, size))
+            # what this rank receives: the parts of each target it writes, from the senders
+            for other in range(self._size):
+                theirs = everyone[other][0][ndim]
+                incoming, ok = intersect(theirs[0], sources)
+                ok &= theirs[1] & mine[3] & has_target
+                part, inside = intersect(incoming + shift, mine[2])
+                ok &= inside
+                where = np.flatnonzero(ok)
+                if where.size:
+                    local = part[where] - target_origin[where][..., None]
+                    indices, sizes = pieces(local)
+                    for n, index, size in zip(
+                        numbers[where].tolist(), indices, sizes, strict=True
+                    ):
+                        receives[other].append((n, self._copies[n][2], index, size))
+        for found in (*sends, *receives):
+            found.sort(key=lambda piece: piece[0])  # the order of the copies
+        self._sends = [[(array, index) for _, array, index, _ in to] for to in sends]
+        self._receives = [
+            [(array, index, number) for number, array, index, _ in come]
+            for come in receives
+        ]
+        self._send_counts = [sum(piece[3] for piece in to) for to in sends]
+        self._receive_counts = [sum(piece[3] for piece in come) for come in receives]
         self._send_offsets = [sum(self._send_counts[:r]) for r in range(self._size)]
         self._receive_offsets = [
             sum(self._receive_counts[:r]) for r in range(self._size)
         ]
         # unpacked in the order of the copies, so that the last one wins
         order = []
-        for other, parts in enumerate(receives):
+        for other, come in enumerate(receives):
             offset = self._receive_offsets[other]
-            for target, index, number in parts:
-                count = math.prod(s.stop - s.start for s in index)
+            for number, target, index, size in come:
                 order.append((number, other, offset, target, index))
-                offset += count
+                offset += size
         order.sort(key=lambda piece: (piece[0], piece[1]))
         self._unpack = order
 
@@ -225,31 +354,25 @@ class CopyPlan:
         """Find where every box goes; collective (one ``allgather``)."""
         self._comm = default_comm() if comm is None else comm
         self._size = self._comm.Get_size()
-        self._copies = []
-        roles = []
-        dtypes = set()
+        self._copies = list(copies)
+        roles: dict[int, tuple] = {}
+        dtypes: set[str] = set()
         error = None
         try:
-            for source, source_box, target, target_box in copies:
-                source_box, target_box = _boxes(source_box, target_box)
-                send = _sending_block(source, source_box)
-                receive = _receiving_region(target, target_box)
-                for array in (source, target):
-                    if array is not None:
-                        dtypes.add(np.dtype(array.dtype).str)
-                self._copies.append((source, source_box, target, target_box))
-                roles.append((send, receive))
+            roles, dtypes = self._roles()
         except ValueError as problem:
             error = str(problem)  # raised on every rank, after the collective
         with sp.region("mpiarray.CopyPlan.plan", tags=PROFILE_TAGS):
-            everyone = self._comm.allgather((roles, sorted(dtypes), error))
-            errors = [their_error for _, _, their_error in everyone if their_error]
+            everyone = self._comm.allgather(
+                (roles, len(self._copies), sorted(dtypes), error)
+            )
+            errors = [their_error for *_, their_error in everyone if their_error]
             if errors:
                 raise ValueError(errors[0])
-            if len({len(their_roles) for their_roles, _, _ in everyone}) != 1:
+            if len({count for _, count, _, _ in everyone}) != 1:
                 raise ValueError("the ranks were given different numbers of copies")
             all_dtypes = {
-                dtype for _, their_dtypes, _ in everyone for dtype in their_dtypes
+                dtype for _, _, their_dtypes, _ in everyone for dtype in their_dtypes
             }
             if len(all_dtypes) > 1:
                 raise ValueError(
