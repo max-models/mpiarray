@@ -333,7 +333,7 @@ class CopyPlan:
             rest = rest // span
         target = owner[piece]
         if last:  # the last write of every element of every array
-            key = target * (int(flat.max()) + 1) + flat
+            key = target * (int(np.max(flat)) + 1) + flat
             _, keep = np.unique(key[::-1], return_index=True)
             keep = np.sort(key.size - 1 - keep)
             flat, at, target = flat[keep], at[keep], target[keep]
