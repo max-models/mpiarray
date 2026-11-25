@@ -321,8 +321,11 @@ class CopyPlan:
             pieces = np.lexsort((others, numbers))
         else:
             pieces = order
-        piece = np.repeat(pieces, sizes[pieces])
-        start = np.repeat(np.cumsum(sizes[pieces]) - sizes[pieces], sizes[pieces])
+        repeats = sizes[pieces].astype(
+            np.intp
+        )  # np.repeat wants intp (int32 on wasm32)
+        piece = np.repeat(pieces, repeats)
+        start = np.repeat(np.cumsum(repeats) - repeats, repeats)
         within = np.arange(piece.size) - start
         at = offsets[piece] + within
         flat = np.zeros(piece.size, dtype=np.int64)
