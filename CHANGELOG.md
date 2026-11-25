@@ -7,6 +7,9 @@ follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Faster `CopyPlan` construction: the boxes, blocks and regions of all copies are intersected
+  as arrays instead of one copy and one rank at a time; 4422 copies (the halos of 392 patches)
+  plan in 43 ms instead of 116 ms. The plans are the same.
 - Faster halo exchanges on host storage: each array keeps the persistent MPI requests of its
   exchanges, made by the first one, so later exchanges only start and wait for them. On 4 ranks
   with 16×32×16 blocks, `update_halos(wait=False)` went from 850 to 65 µs and `update_halos()`
