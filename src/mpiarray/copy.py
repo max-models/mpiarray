@@ -199,10 +199,12 @@ class CopyPlan:
             # per copy: the source's shape, block, halo; the target's
             zero = ((0, 0),) * ndim
             source_info = [
-                None if copies[n][0] is None else layout(copies[n][0]) for n in numbers
+                None if (source := copies[n][0]) is None else layout(source)
+                for n in numbers
             ]
             target_info = [
-                None if copies[n][2] is None else layout(copies[n][2]) for n in numbers
+                None if (target := copies[n][2]) is None else layout(target)
+                for n in numbers
             ]
             has_source = np.array([info is not None for info in source_info])
             has_target = np.array([info is not None for info in target_info])
